@@ -8,17 +8,13 @@ from dataclasses import dataclass
 
 import torch
 
+from hyperflare_recipes.components.vision import vision_math_mode
 from ignition.components.vision_delivery import PreparedFeaturePublication
 from hyperflare_recipes.recipes.qwen38.contract import FEATURE_TOKEN as IMAGE_TOKEN_ID
 from hyperflare_recipes.recipes.qwen38.vision import VisionMetadata
 
 FEATURES = 16384
 PATCHES = 16384
-
-
-def vision_math_mode(device):
-    """Use canonical patch convolution and Torch FlashAttention on SM120."""
-    return "torch_flash" if torch.cuda.get_device_capability(device) == (12, 0) else "flash"
 
 
 @dataclass(frozen=True)

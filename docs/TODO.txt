@@ -351,3 +351,8 @@
     `recipes/qwen38/vision.py` binds checkpoint BF16 projections through
     `UnquantizedProjection`, whose bias keeps them off the SM103 dense GEMM path
     in `hyperflare_recipes/components/linear.py`; SM103 execution is unqualified.
+
+[ ] Run Step-5 speculative CUDA tests for the PreparedCausalDraftRound
+    rotary_offset propagation in hyperflare_recipes/components/causal_draft.py.
+    Only CPU protocol tests have run. Close when Step-5 speculative CUDA tests
+    pass.

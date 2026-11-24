@@ -7,7 +7,7 @@ import torch
 
 from ignition.components.collectives import PreparedAllReduce
 from hyperflare_recipes.components.draft_sampling import PreparedDraftDistribution
-from hyperflare_recipes.components.paged_batch import Metadata, PreparedBatch
+from hyperflare_recipes.components.paged_batch import Metadata, prepare_batch, row_rotary_offsets
 from hyperflare_recipes.components.speculation import (
     DRAFT_RNG_DOMAIN,
     PreparedSpeculativeCommit,
@@ -31,7 +31,7 @@ class PreparedCausalDraftRound:
         device, blocks = o.pool.backing.device, o.inputs.page_tables.shape[1]
         self.rows = torch.arange(b, device=device)
         self.metadata = Metadata.allocate(b * w, b, blocks, device, samples=b * w)
-        self.validator = PreparedBatch(o.inputs, o.requests, Metadata.allocate(b, b, blocks, device),
+        self.validator = prepare_batch(o.inputs, o.requests, Metadata.allocate(b, b, blocks, device),
             mode="decode", shard=o.weights.shard, pool=o.pool, verification_width=w)
         self.validation = PreparedAllReduce(self.validator.validation_input, self.validator.validation_sum,
             runtime=o.collectives["runtime"], coordinator=o.collectives["coordinator"],
@@ -106,6 +106,7 @@ class PreparedCausalDraftRound:
         target, proposals, verify, commit = self.operations
         validation, present = self.validator.validate()
         validated = self.validator.begin(self.validation(validation), present=present)
+        offsets = row_rotary_offsets(validated)
         slots = self.inputs.row_slot_ids[:b].long()
         safe = slots.clamp(0, self.requests.capacity - 1)
         active = validated.lengths > 0
@@ -139,8 +140,10 @@ class PreparedCausalDraftRound:
             self.draft_generation.copy_(torch.where(matches.any(1), self.requests.generation, self.draft_generation))
         self.draft.finish(draft_state, before, states, active)
         candidates[:, 1:].copy_(drafts)
-        metadata = Metadata.allocate(b * w, b, self.blocks, slots.device, samples=b * w)
-        metadata.set(before, limits, states, self.inputs.page_tables[safe], candidates, self.inputs.live_rows)
+        metadata = Metadata.pack(
+            before, limits, states, self.inputs.page_tables[safe], candidates, self.inputs.live_rows,
+            token_capacity=b * w, sample_count=b * w, max_query_tokens=w, rotary_offset=offsets,
+        )
         hidden, logits, auxiliary, records = self.decoder(metadata)
         p = target.run(scratch["target"], logits.view(b, w, -1), candidates=drafts)
         target_valid = scratch["target"]["valid"]

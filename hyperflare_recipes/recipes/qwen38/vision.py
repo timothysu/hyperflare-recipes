@@ -12,6 +12,7 @@ from b12x.preparation import PreparationSession
 
 from hyperflare_recipes.components.linear import QuantizedProjection, UnquantizedProjection
 from hyperflare_recipes.components.varlen_attention import PreparedVarlenAttention
+from hyperflare_recipes.components.vision import TorchFlashAttention as _TorchFlashAttention
 from ignition.preparation.scratch import ScratchArena
 from ignition.preparation.tuning import register_finalizer
 from ignition.preparation.rebuild_manifest import weight_container
@@ -132,24 +133,6 @@ class _Linear(torch.nn.Module):
         output = self.projection(source)
         if self.bias is not None:
             output.add_(self.bias)
-        return output
-
-
-class _TorchFlashAttention:
-    scratch = None
-
-    def __init__(self, capacity):
-        self.capacity = capacity
-
-    def functional(self, *, session):
-        return self
-
-    def __call__(self, query, key, value, cu_seqlens):
-        from torch.nn.attention.varlen import varlen_attn_out
-
-        # Inactive rows are outside the cumulative lengths and need defined output.
-        output = torch.zeros_like(query)
-        varlen_attn_out(output, query, key, value, cu_seqlens, cu_seqlens, self.capacity, self.capacity)
         return output
 
 

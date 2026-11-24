@@ -372,8 +372,11 @@ class RotaryBatch(PreparedBatch):
     token index plus that offset.
     """
 
-    def __init__(self, inputs, requests, metadata, *, pool, **options):
+    def __init__(self, inputs, requests, metadata, *, pool, advance_axis: int | None = None, **options):
+        if advance_axis is not None and (type(advance_axis) is not int or not 0 <= advance_axis < 3):
+            raise ValueError("rotary advance_axis must be None or an axis index in 0..2")
         super().__init__(inputs, requests, metadata, pool=pool, **options)
+        self.advance_axis = advance_axis
         self.rotary_offset = rotary_offset_region(pool)
         if (self.rotary_offset is None or self.rotary_offset.shape[1:] != (1,)
                 or self.rotary_offset.dtype != torch.int64):
@@ -399,17 +402,22 @@ class RotaryBatch(PreparedBatch):
         super().finish(metadata)
 
     def commit_rotary(self, metadata):
-        """Continue each request's rotary positions past the prompt's largest axis.
+        """Continue each request's rotary positions past the prompt's rotary extent.
 
-        Text continues at the token index, so its offset stays zero. Image
-        positions occupy a rectangular grid; the next token continues from the
-        largest axis position plus one.
+        Text continues at the token index, so its offset stays zero. With
+        ``advance_axis is None`` (default), the next token continues from the
+        largest coordinate across all three axes plus one. When ``advance_axis``
+        names one axis (for example ``0`` for centered temporal-step schemes),
+        continuation advances from that axis's maximum plus one.
         """
         if metadata.rotary_positions is None:
             raise ValueError("committing rotary offsets requires per-axis prompt positions")
         offsets = torch.arange(metadata.token_ids.numel(), device=metadata.starts.device)
         live = offsets < metadata.live_counts[0]
-        maximum = torch.where(live[:, None], metadata.rotary_positions, -1).max()
+        if self.advance_axis is None:
+            maximum = torch.where(live[:, None], metadata.rotary_positions, -1).max()
+        else:
+            maximum = torch.where(live, metadata.rotary_positions[:, self.advance_axis], -1).max()
         previous = gather_rotary_offset(self.rotary_offset, metadata.state_rows)
         endpoint = metadata.starts + metadata.lengths
         delta = torch.maximum(metadata.starts + previous, maximum + 1) - endpoint
