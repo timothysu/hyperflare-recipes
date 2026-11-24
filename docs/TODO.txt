@@ -372,3 +372,11 @@
 
 [ ] Obtain a maintainer decision on hosting the Ling-3.2-Air NVFP4 checkpoint
     under an organization namespace instead of `timbuksu/Ling-3.2-Air-NVFP4`.
+
+[ ] Obtain a maintainer decision on keeping `scripts/quantize_ling_3_2_air_nvfp4.py`
+    in this repository.
+
+[ ] Run `scripts/quantize_ling_3_2_air_nvfp4.py` end-to-end on CUDA hardware
+    and verify the generated checkpoint loads and passes parity (only CPU safety,
+    atomicity, and quantization unit tests in `tests/scripts/test_quantize_ling32.py`
+    have run).
