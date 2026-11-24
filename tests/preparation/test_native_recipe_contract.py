@@ -28,7 +28,7 @@ from ignition.preparation.execution import GraphSignature, PreparedExecution
 
 RECIPES = (
     "deepseek41", "deepseek4", "qwen38", "qwen38_dense", "glm53", "mimo_v2",
-    "kimi3", "minimax_m3", "nemotron_h", "step5", "gemma4",
+    "kimi3", "minimax_m3", "nemotron_h", "step5", "gemma4", "hy4_flash",
 )
 
 
@@ -40,6 +40,11 @@ def _vision_buffers(recipe):
 
         capacities = importlib.import_module(f"hyperflare_recipes.recipes.{recipe}.bootstrap").PATCH_CAPACITIES
         inputs = VisionInputs.allocate("cpu", patches=max(capacities))
+    elif recipe == "hy4_flash":
+        from hyperflare_recipes.recipes.hy4_flash.contract import PATCH_CAPACITIES
+        from hyperflare_recipes.recipes.hy4_flash.vision import VisionInputs
+
+        inputs = VisionInputs.allocate("cpu", patches=max(PATCH_CAPACITIES))
     else:
         module = "vision_state" if recipe in ("qwen38", "glm53") else "vision"
         inputs = importlib.import_module(f"hyperflare_recipes.recipes.{recipe}.{module}").VisionInputs.allocate("cpu")
@@ -70,9 +75,14 @@ def _recipe_metadata(recipe, *, all_variants=True, config_options=None, completi
     config = bootstrap.PreparationConfig(**options)
     capacity = config.max_active
     vocabulary = getattr(module, "VOCABULARY", 262144)
-    page_tokens = 256 if recipe == "glm53" else 64 if recipe == "qwen38" else 128
-    inputs = BatchInputs.allocate(config.prefill_chunk_size, config.context // page_tokens,
-        "cpu", capacity=capacity)
+    page_tokens = 256 if recipe in ("glm53", "hy4_flash") else 64 if recipe == "qwen38" else 128
+    if recipe == "hy4_flash":
+        from hyperflare_recipes.components.paged_batch import RotaryBatchInputs
+        inputs = RotaryBatchInputs.allocate(config.prefill_chunk_size, config.context // page_tokens,
+            "cpu", capacity=capacity)
+    else:
+        inputs = BatchInputs.allocate(config.prefill_chunk_size, config.context // page_tokens,
+            "cpu", capacity=capacity)
     buffers = inputs.buffers()
     admission = AdmissionBuffers.allocate("cpu", vocab_size=vocabulary, capacity=capacity)
     buffers.update({name: getattr(admission, name) for name in admission.__dataclass_fields__})
@@ -156,8 +166,8 @@ def _recipe_metadata(recipe, *, all_variants=True, config_options=None, completi
         add("mixed", batch, width, prefill=prefill, enabled=enabled)
     arguments = inspect.signature(module.prepare).parameters
     kwargs = {}
-    for key, value in dict(page_tokens=256 if recipe == "glm53" else 64 if recipe == "qwen38" else 128,
-            draft_lag=0 if recipe in ("deepseek41", "deepseek4", "mimo_v2") else 1,
+    for key, value in dict(page_tokens=256 if recipe in ("glm53", "hy4_flash") else 64 if recipe == "qwen38" else 128,
+            draft_lag=0 if recipe in ("deepseek41", "deepseek4", "mimo_v2", "hy4_flash") else 1,
             rows=None if recipe in ("deepseek41", "deepseek4") else 1,
             vocabulary=vocabulary, mtp=getattr(config, "mtp", True), dspark=True,
             image_slots=getattr(config, "image_concurrency", 4), vision=vision).items():
@@ -213,6 +223,26 @@ def test_kimi_text_only_zero_image_capacity_passes_native_contract_validation(im
     assert contract["vision"] == dict(feature_slots=0, features_per_request=0,
         max_images=0, patches_per_feature=0, patch_capacities=[])
     assert not contract["frontend"].get("image_preparation")
+    assert all(graph["kind"] != "vision" for graph in manifest["graphs"])
+    flare_heliopause.validate_prepared_contract(manifest, json.dumps(contract))
+
+
+def test_hy4_flash_text_only_passes_native_contract_validation():
+    import flare_heliopause
+
+    config, contract, manifest = _recipe_metadata(
+        "hy4_flash", config_options=dict(language_model_only=True)
+    )
+    assert config.language_model_only is True
+    assert contract["vision"] == dict(
+        feature_slots=0,
+        features_per_request=0,
+        max_images=0,
+        patches_per_feature=0,
+        patch_capacities=[],
+    )
+    assert not contract["frontend"].get("image_preparation")
+    assert contract["frontend"]["position_dimensions"] == 3
     assert all(graph["kind"] != "vision" for graph in manifest["graphs"])
     flare_heliopause.validate_prepared_contract(manifest, json.dumps(contract))
 

@@ -1895,6 +1895,39 @@ top-p 0.95, and top-k 64.
 .venv/bin/ignition export gemma-4-12b --gpus 0
 ```
 
+## Hy4-flash
+
+`hy4-flash-nvfp4` prepares `timbuksu/Hy4-flash-NVFP4` (derived from
+`tencent/Hy4-flash`, 42 layers with 12 sparse C4-indexed GLM_NSA layers, 30
+sliding-window-512 BF16 MLA layers, 4 host/NVMe-backed Engram tables, 4-stream
+iHC, LatentMoE with 512 NVFP4 experts, 5-layer KV-share/index-share DFly2
+speculation, and 27-layer SigLIP2 vision encoder) at TP=1 on a single 96 GiB
+SM120 GPU (1,048,576-token native context; exported KV capacity on 96 GiB is
+unmeasured until SM120 qualification).
+
+This recipe requires the companion `NVIDIA/hyperflare-inference` core changes
+(generalized Engram widths/order-3 hashing, Jinja `str.format`,
+`HyThink`/`HyArgumentTags` output parsers and strict tool grammar, and
+`RowNewline` image profile/layout). After those changes merge and `uv.lock` is
+refreshed, export and serve with:
+
+```sh
+.venv/bin/ignition export hy4-flash-nvfp4 --gpus 0
+.venv/bin/ignition convert CACHE_ENTRY --form packed --output hy4-flash.safetensors
+flare run hy4-flash.safetensors --gpus 0
+```
+
+Pass `--language-model-only` to omit the vision tower and serve text-only cores,
+`--no-mtp` to omit DFly2 speculation, or `--online-mxfp8` (default scope `all`,
+optional `--online-mxfp8-scope draft`) to quantize eligible BF16 dense
+projections to MXFP8 at load time for larger KV capacity. Video inputs are
+rejected by the frontend contract.
+
+Qualification: CPU unit, frontend parity, and native-contract validation run
+against the companion core branch. End-to-end SM120 core export, `flare run`
+serving, CUDA parity, measured rank byte costs, and locked-install verification
+are unqualified (tracked in [docs/TODO.txt](TODO.txt)).
+
 ## Storage and graph capacities
 
 Gemma 4 and Muse Spark default to four concurrent requests. Gemma 4's speculative

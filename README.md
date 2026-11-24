@@ -28,9 +28,9 @@ qualification drivers for preparing runtime cores served by
 ## Repository layout
 
 - `hyperflare_recipes/recipes/` — official model recipes (`deepseek4`,
-  `deepseek41`, `gemma4`, `glm53`, `inkling2` including `inkling2_mini`,
-  `kimi3`, `kimi31`, `mimo_v2`, `minimax_m3`, `muse_spark`, `nemotron_h`,
-  `qwen38`, `qwen38_dense`, `step5`).
+  `deepseek41`, `gemma4`, `glm53`, `hy4_flash`, `inkling2` including
+  `inkling2_mini`, `kimi3`, `kimi31`, `mimo_v2`, `minimax_m3`, `muse_spark`,
+  `nemotron_h`, `qwen38`, `qwen38_dense`, `step5`).
 - `hyperflare_recipes/components/` — reusable b12x and Triton model building
   blocks.
 - `hyperflare_recipes/fixtures/` — operator-tuning benchmark fixtures.

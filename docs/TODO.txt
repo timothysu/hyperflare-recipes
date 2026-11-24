@@ -351,3 +351,21 @@
     `recipes/qwen38/vision.py` binds checkpoint BF16 projections through
     `UnquantizedProjection`, whose bias keeps them off the SM103 dense GEMM path
     in `hyperflare_recipes/components/linear.py`; SM103 execution is unqualified.
+
+[ ] Refresh uv.lock (`uv lock --upgrade-package ignition --upgrade-package flare-heliopause`)
+    after the companion NVIDIA/hyperflare-inference Hy4-flash core changes
+    (generalized Engram widths/3-gram hashing, Jinja str.format,
+    HyThink/HyArgumentTags parsers and strict grammar, RowNewline image profile)
+    merge to main, then run Hy4-flash export and tests from a clean locked install.
+
+[ ] Qualify Hy4-flash (`hy4_flash`) end-to-end on SM120 (96 GiB Blackwell):
+    export multimodal and `--language-model-only` cores (with and without
+    `--online-mxfp8`), measure exact `device_bytes`, `draft_bytes`, and
+    `scale_compressed_device_bytes` for `recipe.py`, serve under `flare run`,
+    verify speculative verify mode with partial acceptance, `PreparedRingCommit`,
+    and DFly2 logical-index resolution across prefix-cache restore/preemption,
+    and run `tests/recipes/test_hy4_flash_cuda.py` (including
+    `test_c4_indexer_above_2048_and_dfly_page_relocation_cuda`).
+
+[ ] Obtain a maintainer decision on hosting the Hy4-flash NVFP4 checkpoint under
+    an organization namespace instead of `timbuksu/Hy4-flash-NVFP4`.

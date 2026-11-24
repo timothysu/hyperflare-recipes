@@ -1,0 +1,17 @@
+{
+  "source": {
+    "repository": "tencent/Hy4-flash",
+    "revision": "b2498eba6a1a3f9bbcab4190bc1313a3c7010c2f",
+    "filename": "chat_template.jinja"
+  },
+  "source_sha256": "11b12531403da5726b7e1f6003f479043b05999e6746d39af949cbcdfd715c35",
+  "result_sha256": "7d9d42c9771eaf9ea4cd94db73863d85052765e31cb37611ee0f3fd61c4e27ef",
+  "insertions": [
+    11707,
+    12583,
+    12763,
+    16117,
+    16348,
+    16511
+  ]
+}

@@ -47,6 +47,7 @@ include = ["hyperflare_recipes*"]
 "hyperflare_recipes.recipes.step5" = ["assets/*"]
 "hyperflare_recipes.recipes.muse_spark" = ["assets/*"]
 "hyperflare_recipes.recipes.minimax_m3" = ["assets/*"]
+"hyperflare_recipes.recipes.hy4_flash" = ["assets/*"]
 
 [tool.pytest.ini_options]
 addopts = "--import-mode=importlib"

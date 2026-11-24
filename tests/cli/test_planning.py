@@ -416,6 +416,7 @@ def test_cli_plan_resolves_recipe_configuration_and_flag_defaults(tmp_path, mode
         expected = ((4, 4096, 6) if model.recipe.name == "gemma4" else
                     (4, 4096, 32) if model.recipe.name == "muse_spark" else
                     (8, 8192, 64) if model.recipe.name == "inkling2_mini" else
+                    (8, 4096, 48) if model.recipe.name == "hy4_flash" else
                     (8, 4096, 128) if model.recipe.name == "inkling2" else (32, 4096, 128))
     args = _parser().parse_args(["export", model.checkpoint.alias, *flags])
     selected = preparation.speculation(args, model, configuration)
