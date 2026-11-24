@@ -369,3 +369,11 @@
 
 [ ] Obtain a maintainer decision on hosting the Hy4-flash NVFP4 checkpoint under
     an organization namespace instead of `timbuksu/Hy4-flash-NVFP4`.
+
+[ ] Obtain a maintainer decision on keeping `scripts/quantize_hy4_flash_nvfp4.py`
+    in this repository.
+
+[ ] Run `scripts/quantize_hy4_flash_nvfp4.py` (including `--repack-engram-nvfp4`)
+    end-to-end on CUDA hardware and verify the resulting checkpoint loads and
+    passes parity (only CPU safety and atomicity checks in
+    `tests/scripts/test_quantize_hy4_flash.py` have run).
