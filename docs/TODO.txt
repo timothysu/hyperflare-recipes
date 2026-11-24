@@ -356,3 +356,19 @@
     rotary_offset propagation in hyperflare_recipes/components/causal_draft.py.
     Only CPU protocol tests have run. Close when Step-5 speculative CUDA tests
     pass.
+
+[ ] Refresh uv.lock (`uv lock --upgrade-package ignition --upgrade-package flare-heliopause`)
+    after the companion NVIDIA/hyperflare-inference Qwen image-profile changes
+    (optional channel normalization, QwenPositionScheme, QwenResizeKernel) merge
+    to main, then run multimodal Ling-3.2-Air export and tests from a clean locked
+    install.
+
+[ ] Qualify Ling-3.2-Air (`ling32`) end-to-end on SM120 (96 GiB Blackwell): export
+    multimodal and `--language-model-only` cores, serve under `flare run`, verify
+    upstream `inclusionAI/Ling-3.2-Air` text and image logit parity, run byte-exact
+    BailingMM2ImageProcessor Pillow bicubic fixtures on non-32-multiple image sizes,
+    and run `tests/recipes/test_ling32_cuda.py` (including
+    `test_snapshot_restore_multimodal_rotary_offset_mtp_differential_cuda`).
+
+[ ] Obtain a maintainer decision on hosting the Ling-3.2-Air NVFP4 checkpoint
+    under an organization namespace instead of `timbuksu/Ling-3.2-Air-NVFP4`.

@@ -1895,6 +1895,36 @@ top-p 0.95, and top-k 64.
 .venv/bin/ignition export gemma-4-12b --gpus 0
 ```
 
+## Ling-3.2-Air
+
+The Ling-3.2-Air recipe (`ling32`) prepares TP=1 single-GPU text and multimodal
+image generation for `BailingMoeV3VLForConditionalGeneration` (42-layer hybrid
+35 KDA + 7 Gated MLA backbone with 512-expert NVFP4-CSF MoE, Layer-42 causal
+MTP drafter, and 27-layer `qwen3_moe_vit` vision encoder) at native 262,144-token
+context, 32 concurrent requests, 4,096-token prefill chunks, and 4 image slots.
+
+| Alias | Checkpoint repository |
+|---|---|
+| `ling-3.2-air-nvfp4` | `timbuksu/Ling-3.2-Air-NVFP4` |
+
+Speculation defaults to five draft tokens (`--mtp-draft-tokens` supports zero
+through seven; `--no-mtp` omits the Layer-42 draft; `--draft-head-quantization`
+accepts `mxfp8` or `nvfp4`). Passing `--language-model-only` omits the vision
+encoder and 3D M-RoPE state. Sampling defaults match the `inclusionAI/Ling-3.2-Air`
+model card: temperature 1.0, top-p 0.95, top-k 20.
+
+Qualification: CPU unit, frontend parity, and native-contract validation pass
+against the companion core branch. End-to-end SM120 core export, `flare run`
+serving, CUDA tests, and upstream-model text/image parity remain unqualified
+and are tracked in `docs/TODO.txt`.
+Multimodal export requires the companion `NVIDIA/hyperflare-inference` Qwen
+image-profile extensions (`QwenPositionScheme::CenteredStep`,
+`QwenResizeKernel::PillowBicubic`, and optional channel normalization).
+
+```sh
+.venv/bin/ignition export ling-3.2-air-nvfp4 --gpus 0 --draft-head-quantization mxfp8
+```
+
 ## Storage and graph capacities
 
 Gemma 4 and Muse Spark default to four concurrent requests. Gemma 4's speculative

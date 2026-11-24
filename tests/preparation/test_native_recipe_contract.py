@@ -28,7 +28,7 @@ from ignition.preparation.execution import GraphSignature, PreparedExecution
 
 RECIPES = (
     "deepseek41", "deepseek4", "qwen38", "qwen38_dense", "glm53", "mimo_v2",
-    "kimi3", "minimax_m3", "nemotron_h", "step5", "gemma4",
+    "kimi3", "minimax_m3", "nemotron_h", "step5", "gemma4", "ling32",
 )
 
 
@@ -60,6 +60,8 @@ def _recipe_metadata(recipe, *, all_variants=True, config_options=None, completi
     fields = bootstrap.PreparationConfig.__dataclass_fields__
     if recipe == "qwen38_dense":
         options.update(draft_snapshot=Path("metadata-draft"), max_active=32)
+    if recipe == "ling32":
+        options["image_concurrency"] = 4
     if recipe in ("qwen38", "glm53"):
         options["mtp"] = True
     if recipe == "qwen38":
@@ -71,8 +73,13 @@ def _recipe_metadata(recipe, *, all_variants=True, config_options=None, completi
     capacity = config.max_active
     vocabulary = getattr(module, "VOCABULARY", 262144)
     page_tokens = 256 if recipe == "glm53" else 64 if recipe == "qwen38" else 128
-    inputs = BatchInputs.allocate(config.prefill_chunk_size, config.context // page_tokens,
-        "cpu", capacity=capacity)
+    if recipe == "ling32" and config.image_concurrency > 0:
+        from hyperflare_recipes.components.paged_batch import RotaryBatchInputs
+        inputs = RotaryBatchInputs.allocate(config.prefill_chunk_size, config.context // page_tokens,
+            "cpu", capacity=capacity)
+    else:
+        inputs = BatchInputs.allocate(config.prefill_chunk_size, config.context // page_tokens,
+            "cpu", capacity=capacity)
     buffers = inputs.buffers()
     admission = AdmissionBuffers.allocate("cpu", vocab_size=vocabulary, capacity=capacity)
     buffers.update({name: getattr(admission, name) for name in admission.__dataclass_fields__})
@@ -89,7 +96,8 @@ def _recipe_metadata(recipe, *, all_variants=True, config_options=None, completi
         draft_page_tables=torch.zeros_like(inputs.page_tables))
     completion_capacity = config.completion_token_capacity if completion_capacity is None else completion_capacity
     buffers.update(CompletionOutputs.allocate((2, capacity, 16 + completion_capacity), device="cpu").buffers())
-    vision = getattr(config, "vision", not getattr(config, "language_model_only", False))
+    vision = (config.image_concurrency > 0 if recipe == "ling32"
+        else getattr(config, "vision", not getattr(config, "language_model_only", False)))
     vision_buffers = _vision_buffers(recipe) if vision else {}
     buffers.update(vision_buffers)
     if vision_buffers:
@@ -209,6 +217,18 @@ def test_kimi_text_only_zero_image_capacity_passes_native_contract_validation(im
 
     config, contract, manifest = _recipe_metadata("kimi3", config_options=dict(
         vision=False, image_concurrency=image_concurrency))
+    assert config.image_concurrency == 0
+    assert contract["vision"] == dict(feature_slots=0, features_per_request=0,
+        max_images=0, patches_per_feature=0, patch_capacities=[])
+    assert not contract["frontend"].get("image_preparation")
+    assert all(graph["kind"] != "vision" for graph in manifest["graphs"])
+    flare_heliopause.validate_prepared_contract(manifest, json.dumps(contract))
+
+
+def test_ling32_text_only_passes_native_contract_validation():
+    import flare_heliopause
+
+    config, contract, manifest = _recipe_metadata("ling32", config_options=dict(image_concurrency=0))
     assert config.image_concurrency == 0
     assert contract["vision"] == dict(feature_slots=0, features_per_request=0,
         max_images=0, patches_per_feature=0, patch_capacities=[])

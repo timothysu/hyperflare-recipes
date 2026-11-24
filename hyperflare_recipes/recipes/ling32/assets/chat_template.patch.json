@@ -1,0 +1,13 @@
+{
+  "source": {
+    "repository": "inclusionAI/Ling-3.2-Air",
+    "revision": "1613b1a4dcc6aa0d8f346606628cd9a92061a525",
+    "filename": "chat_template.jinja"
+  },
+  "source_sha256": "dbb08479531af61d736c16f92a8271f66eced23c8f4b403c808352e5b2631875",
+  "result_sha256": "3325089bd5cba10abb61657f1052917502832f050ba61d9bc0021ed68823ec88",
+  "insertions": [
+    4322,
+    8293
+  ]
+}
