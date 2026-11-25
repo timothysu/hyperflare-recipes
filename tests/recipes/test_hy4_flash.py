@@ -759,3 +759,218 @@ def test_collect_disposable_storage_handles_prepared_generation_scored_prefill_a
     ptrs = {start for start, _end in ranges}
     for tensor in (arena_t, scale_t, engram_t, vision_t, gen_scratch, scored_scratch):
         assert tensor.data_ptr() in ptrs
+
+
+def test_c4_select_pools_evicts_lowest_score_and_compacts_physical_tail():
+    """Verify score-based pool eviction past 2,048 tokens and partial-tail compaction."""
+    from hyperflare_recipes.recipes.hy4_flash.indexer import (
+        compact_physical_topk,
+        expand_pooled_topk_to_logical_tokens,
+        select_c4_pools,
+    )
+
+    # Rows cover inactive (-1), pre-cap (0, 3, 2046, 2047), exact-cap partial (2048, 2049, 2050),
+    # exact-cap completing (2051), and post-cap partial/completing (2054, 2055).
+    positions = torch.tensor([-1, 0, 3, 2046, 2047, 2048, 2049, 2050, 2051, 2054, 2055], dtype=torch.int64)
+    rows = positions.numel()
+    prior_pools = torch.full((rows, 512), -1, dtype=torch.int32)
+    prior_scores = torch.full((rows, 512), float("-inf"), dtype=torch.float32)
+
+    for r, pos in enumerate(positions.tolist()):
+        if pos < 0:
+            continue
+        n_prior = min(pos // 4, 512)
+        if n_prior > 0:
+            # Place highest score in column 511 and lowest score in column 7 so fixed-column eviction fails.
+            prior_pools[r, :n_prior] = torch.arange(n_prior, dtype=torch.int32)
+            scores = torch.linspace(1.0, 10.0, n_prior, dtype=torch.float32)
+            if n_prior == 512:
+                scores[7] = -5.0
+                scores[511] = 99.0
+            prior_scores[r, :n_prior] = scores
+
+    pools = select_c4_pools(prior_pools, prior_scores, positions)
+
+    # Inactive row stays all -1.
+    assert torch.all(pools[0] == -1)
+    # Pre-cap rows preserve all prior pools and append completing own group without evicting.
+    assert torch.all(pools[1] == -1)
+    assert pools[2, 0].item() == 0 and torch.all(pools[2, 1:] == -1)
+    assert pools[3, :511].tolist() == list(range(511)) and pools[3, 511].item() == -1
+    assert pools[4].tolist() == list(range(512))
+
+    # At or past position 2048, column 7 (score -5.0) must be evicted while column 511 (score 99.0) survives.
+    for r in (5, 6, 7, 8, 9, 10):
+        pos = int(positions[r].item())
+        completes = (pos % 4) == 3
+        kept_prior = set(pools[r, :511].tolist())
+        assert len(kept_prior) == 511
+        assert 7 not in kept_prior
+        assert 511 in kept_prior
+        assert all(p >= 0 for p in kept_prior)
+        assert pools[r, 511].item() == (pos // 4 if completes else -1)
+
+    # Emulate b12x expand_pooled_topk_to_physical_slots (1:1 identity physical slots) and verify compaction.
+    physical = torch.full((rows, 2051), -1, dtype=torch.int32)
+    raw_lengths = torch.zeros((rows,), dtype=torch.int32)
+    for r, pos in enumerate(positions.tolist()):
+        seq_len = pos + 1
+        complete_pools = seq_len // 4
+        sel_pools = min(complete_pools, 512)
+        for p_idx in range(sel_pools):
+            pid = int(pools[r, p_idx].item())
+            if pid >= 0:
+                for off in range(4):
+                    physical[r, p_idx * 4 + off] = pid * 4 + off
+        tail_start = complete_pools * 4
+        tail_count = seq_len - tail_start
+        for off in range(tail_count):
+            physical[r, sel_pools * 4 + off] = tail_start + off
+        raw_lengths[r] = sel_pools * 4 + tail_count
+
+    compacted, lengths = compact_physical_topk(physical, raw_lengths, positions)
+    logical = expand_pooled_topk_to_logical_tokens(pools, positions)
+
+    expected_lengths = [0, 1, 4, 2047, 2048, 2045, 2046, 2047, 2048, 2047, 2048]
+    assert lengths.tolist() == expected_lengths
+    for r, (pos, exp_len) in enumerate(zip(positions.tolist(), expected_lengths, strict=True)):
+        row_slots = compacted[r]
+        # Valid slots form a contiguous prefix with zero -1 holes and match logical expansion exactly.
+        assert torch.all(row_slots[:exp_len] >= 0)
+        assert torch.all(row_slots[exp_len:] == -1)
+        assert torch.equal(row_slots, logical[r])
+        if pos >= 0:
+            assert pos in row_slots[:exp_len].tolist()
+            tail_start = (pos // 4) * 4
+            expected_tail = list(range(tail_start, pos + 1))
+            assert row_slots[exp_len - len(expected_tail) : exp_len].tolist() == expected_tail
+
+
+def test_dfly_speculative_round_uses_validated_state_rows_and_width_one_lengths():
+    """Verify PreparedDFlySpeculativeRound passes validated state_rows/page_table and width-1 lengths."""
+    from types import SimpleNamespace
+    from hyperflare_recipes.components.paged_batch import Metadata
+    from hyperflare_recipes.recipes.hy4_flash.dfly import PreparedDFlySpeculativeRound
+
+    capacity, b, w, blocks = 4, 2, 2, 2
+    captured = {}
+
+    class _Validator:
+        def validate(self):
+            return torch.zeros((1, 8)), torch.tensor([False, True, False, False])
+
+        def begin(self, totals, *, present):
+            del totals, present
+            # Lane 0 rejected (state_row=0, length=0, pages=-1); lane 1 valid (state_row=2, length=1, page=3).
+            m = Metadata.allocate(b, b, blocks, torch.device("cpu"))
+            m.lengths.copy_(torch.tensor([0, 1], dtype=torch.int32))
+            m.state_rows.copy_(torch.tensor([0, 2], dtype=torch.int64))
+            m.page_table.copy_(torch.tensor([[-1, -1], [3, -1]], dtype=torch.int32))
+            return m
+
+    class _Draft:
+        def encode_block(self, anchor, before, rotary_offsets, state_rows, page_tables, active):
+            del anchor, before, rotary_offsets, active
+            captured["draft_state_rows"] = state_rows.clone()
+            captured["draft_page_tables"] = page_tables.clone()
+            return torch.zeros((b, w, HIDDEN_SIZE), dtype=torch.bfloat16)
+
+        def step_logits(self, slot_hidden, prev_tokens):
+            del slot_hidden, prev_tokens
+            return torch.zeros((b, VOCABULARY), dtype=torch.bfloat16)
+
+    class _Sampler:
+        layout = {"valid": ((b, 1), torch.bool)}
+
+        def run(self, scratch, logits, *, candidates, seed, offset, sampled):
+            del logits, candidates, seed, offset
+            scratch["valid"] = torch.ones((b, 1), dtype=torch.bool)
+            sampled.fill_(5)
+            return torch.zeros((b, 1, VOCABULARY), dtype=torch.float32)
+
+    class _Decoder:
+        def __call__(self, metadata):
+            captured["decoder_state_rows"] = metadata.state_rows.clone()
+            captured["decoder_page_table"] = metadata.page_table.clone()
+            captured["decoder_lengths"] = metadata.lengths.clone()
+            toks = metadata.token_ids.numel()
+            return (
+                torch.zeros((toks, HIDDEN_SIZE), dtype=torch.bfloat16),
+                torch.zeros((toks, VOCABULARY), dtype=torch.bfloat16),
+                None,
+                None,
+            )
+
+        def commit(self, counts, records, metadata):
+            del counts, records, metadata
+
+    class _Target:
+        def __init__(self, width: int):
+            self.width = width
+            self.layout = {"probabilities": ((b, width, VOCABULARY), torch.float32), "valid": ((b, width), torch.bool)}
+
+        def run(self, scratch, logits, *, candidates):
+            del logits, candidates
+            scratch["probabilities"] = torch.zeros((b, self.width, VOCABULARY), dtype=torch.float32)
+            scratch["valid"] = torch.ones((b, self.width), dtype=torch.bool)
+
+    class _Verify:
+        layout = {}
+
+        def run(self, *args, **kwargs):
+            del args, kwargs
+            return torch.zeros((b, rnd.width), dtype=torch.bool)
+
+    def _commit(logits, *, acceptance, inputs):
+        del logits, acceptance, inputs
+        return SimpleNamespace(emitted_count=torch.tensor([0, 1], dtype=torch.int32))
+
+    # Lane 0's raw request_state_rows holds an out-of-range sentinel (999999) that must never reach encode_block.
+    raw_state_rows = torch.zeros((capacity, 8), dtype=torch.int64)
+    raw_state_rows[0, 0] = 999999
+    raw_state_rows[1, 0] = 2
+    raw_pages = torch.tensor([[999, 999], [3, -1], [-1, -1], [-1, -1]], dtype=torch.int32)
+    owner = SimpleNamespace(
+        inputs=SimpleNamespace(
+            row_slot_ids=torch.tensor([0, 1], dtype=torch.int32),
+            query_lengths=torch.tensor([2, 2], dtype=torch.int32),
+            request_state_rows=raw_state_rows,
+            page_tables=raw_pages,
+            live_rows=torch.tensor([2], dtype=torch.int32),
+        ),
+        requests=SimpleNamespace(
+            capacity=capacity,
+            histogram=torch.zeros((1,), dtype=torch.int32),
+            consumed_tokens=torch.tensor([10, 20, 0, 0], dtype=torch.int64),
+            pending_token=torch.tensor([1, 2, 0, 0], dtype=torch.int64),
+            generation=torch.tensor([1, 1, 0, 0], dtype=torch.int64),
+            seed=torch.zeros((capacity,), dtype=torch.int64),
+        ),
+        pool=SimpleNamespace(last_hidden=torch.zeros((4, HIDDEN_SIZE), dtype=torch.bfloat16)),
+        offset=torch.zeros((capacity,), dtype=torch.int64),
+        generation=torch.zeros((capacity,), dtype=torch.int64),
+    )
+
+    rnd = object.__new__(PreparedDFlySpeculativeRound)
+    rnd.owner, rnd.batch, rnd.width = owner, b, w
+    rnd.validator = _Validator()
+    rnd.validation = lambda x: x
+    rnd.draft = _Draft()
+    rnd.decoder = _Decoder()
+    rnd.operations = (_Target(w), (_Sampler(),), _Verify(), _commit)
+    rnd()
+
+    assert captured["draft_state_rows"].tolist() == [0, 2]
+    assert captured["draft_page_tables"].tolist() == [[-1, -1], [3, -1]]
+    assert captured["decoder_state_rows"].tolist() == [0, 2]
+    assert captured["decoder_page_table"].tolist() == [[-1, -1], [3, -1]]
+    assert captured["decoder_lengths"].tolist() == [0, 2]
+
+    # Width-1 speculative rounds must use validated lengths (1) even if raw query_lengths is larger.
+    captured.clear()
+    owner.inputs.query_lengths.fill_(6)
+    rnd.width = 1
+    rnd.draft = None
+    rnd.operations = (_Target(1), (), _Verify(), _commit)
+    rnd()
+    assert captured["decoder_lengths"].tolist() == [0, 1]

@@ -813,8 +813,8 @@ class PreparedDFlySpeculativeRound:
         slots = o.inputs.row_slot_ids[:b].long()
         safe = slots.clamp(0, o.requests.capacity - 1)
         before = o.requests.consumed_tokens[safe]
-        limits = torch.where(active, o.inputs.query_lengths[:b], 0)
-        states = o.inputs.request_state_rows[safe, 0]
+        limits = validated.lengths if w == 1 else torch.where(active, o.inputs.query_lengths[:b], 0)
+        states = validated.state_rows
 
         candidates = torch.zeros((b, w), dtype=torch.int64, device=device)
         drafts = torch.zeros((b, w - 1), dtype=torch.int64, device=device)
@@ -826,7 +826,7 @@ class PreparedDFlySpeculativeRound:
             base_offset = torch.where(o.generation[safe] == o.requests.generation[safe], o.offset[safe], 0)
             seed = o.requests.seed.view(torch.int64)[safe] ^ DRAFT_RNG_DOMAIN
             block_hidden = self.draft.encode_block(
-                candidates[:, 0], before, rotary_offsets, states, o.inputs.page_tables[safe], active
+                candidates[:, 0], before, rotary_offsets, states, validated.page_table, active
             )
             prev_tokens = torch.where(active, candidates[:, 0], 0)
             sampled = torch.zeros(b, dtype=torch.int64, device=device)
@@ -860,7 +860,7 @@ class PreparedDFlySpeculativeRound:
             before,
             limits,
             states,
-            o.inputs.page_tables[safe],
+            validated.page_table,
             candidates,
             o.inputs.live_rows,
             token_capacity=b * w,

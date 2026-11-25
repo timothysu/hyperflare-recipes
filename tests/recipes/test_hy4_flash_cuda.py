@@ -45,7 +45,7 @@ from hyperflare_recipes.recipes.hy4_flash.config import (
 from hyperflare_recipes.recipes.hy4_flash.dfly import DFlyScratch, PreparedDFlyLayer
 from hyperflare_recipes.recipes.hy4_flash.ihc import ihc_post, ihc_pre
 from hyperflare_recipes.recipes.hy4_flash.moe import MoEScratch, PreparedDenseMLP, PreparedLatentMoE
-from hyperflare_recipes.recipes.hy4_flash.pool import ContinuationPool
+from hyperflare_recipes.recipes.hy4_flash.pool import ContinuationPool, PAGE_TOKENS
 from hyperflare_recipes.recipes.hy4_flash.rotary import InterleavedMRoPE
 from hyperflare_recipes.recipes.hy4_flash.vision import (
     VISION_HIDDEN,
@@ -991,3 +991,850 @@ def test_c4_indexer_above_2048_and_dfly_page_relocation_cuda(tmp_path):
 
         assert torch.isfinite(out_relocated[:draft_width]).all()
         assert _relative_error(out_relocated[:draft_width], out_uninterrupted[:draft_width]) < 1e-4
+
+
+@torch.no_grad()
+def test_swa_decode_multistream_inactive_leading_lane_ring_commit_cuda(tmp_path):
+    """Verify width-1 SWA decode ring staging under B>1 when an earlier lane is inactive."""
+    from hyperflare_recipes.components.ring_commit import PreparedRingCommit
+
+    device = torch.device("cuda:0")
+    cfg = _synthetic_config(tmp_path)
+    rotary = InterleavedMRoPE(cfg, device)
+    weights = _random_attention_weights(SWA_HEADS, device, seed=2101)
+
+    # Three distinct streams (one past 512-token ring wraparound) on distinct continuation rows 1, 2, 3.
+    prefix_lens = (19, 520, 67)
+    max_prefill = max(prefix_lens)
+    torch.manual_seed(2102)
+    prefixes = [
+        (torch.randn(n, HIDDEN_SIZE, device=device) * 0.25).to(torch.bfloat16) for n in prefix_lens
+    ]
+    step_x = [
+        (torch.randn(2, HIDDEN_SIZE, device=device) * 0.25).to(torch.bfloat16) for _ in prefix_lens
+    ]
+
+    def _run_isolated(req_idx: int) -> tuple[torch.Tensor, torch.Tensor]:
+        n = prefix_lens[req_idx]
+        pool = ContinuationPool.allocate(cfg, 3, 4, device, dfly=False)
+        arena = ScratchArena(device)
+        p_scratch = AttentionScratch.allocate(n, 1, n, device)
+        d_scratch = AttentionScratch.allocate(1, 1, 1, device)
+        p_meta = _single_request_metadata(list(range(n)), start=0, state_row=1, pages=4, device=device)
+        d_meta = Metadata.pack(
+            starts=torch.tensor([n], dtype=torch.int64, device=device),
+            lengths=torch.tensor([1], dtype=torch.int32, device=device),
+            state_rows=torch.tensor([1], dtype=torch.int64, device=device),
+            pages=torch.arange(4, dtype=torch.int32, device=device).unsqueeze(0),
+            tokens=torch.ones((1, 1), dtype=torch.int64, device=device),
+            live_rows=torch.tensor([1], dtype=torch.int32, device=device),
+            token_capacity=1,
+            sample_count=1,
+            max_query_tokens=1,
+        )
+        with RecordedPreparationSession(
+            device=device, checkpoint=f"hy4-swa-iso-{req_idx}", workload_schema="swa-iso", numerical_policy="default"
+        ) as session:
+            session.register_scratch(arena)
+            prefill = PreparedSlidingAttention(
+                2, weights, prefixes[req_idx], p_scratch, p_meta, pool, rotary,
+                mode="prefill", eps=1e-5, session=session, name="p", workspace=arena,
+            )
+            decode = PreparedSlidingAttention(
+                2, weights, step_x[req_idx][:1], d_scratch, d_meta, pool, rotary,
+                mode="decode", eps=1e-5, session=session, name="d", workspace=arena,
+            )
+            ring_commit = PreparedRingCommit(
+                pool.reserved_backing,
+                [pool.layout.region("layer2.window").offset],
+                d_meta.state_rows,
+                d_meta.starts,
+                token_capacity=1,
+                window_tokens=SWA_WINDOW,
+                record_bytes=576 * 2,
+            )
+            staging_shape = tuple(ring_commit.staging.shape)
+            ring_commit.functional()
+            session.tune()
+
+            pool.clear_for_preparation()
+            prefill(prefixes[req_idx], p_meta)
+            # Step 1: decode + ring commit
+            staging = torch.empty(staging_shape, dtype=torch.uint8, device=device)
+            decode(step_x[req_idx][:1], d_meta, window_cache=staging[0])
+            ring_commit(d_meta.lengths, staging=staging, rows=d_meta.state_rows, starts=d_meta.starts)
+            ring_after_step1 = pool.window(2)[1].clone()
+            # Step 2: verify next-step attention observes the committed ring
+            d_meta2 = Metadata.pack(
+                starts=torch.tensor([n + 1], dtype=torch.int64, device=device),
+                lengths=torch.tensor([1], dtype=torch.int32, device=device),
+                state_rows=torch.tensor([1], dtype=torch.int64, device=device),
+                pages=torch.arange(4, dtype=torch.int32, device=device).unsqueeze(0),
+                tokens=torch.ones((1, 1), dtype=torch.int64, device=device),
+                live_rows=torch.tensor([1], dtype=torch.int32, device=device),
+                token_capacity=1,
+                sample_count=1,
+                max_query_tokens=1,
+            )
+            out_step2, _, _ = decode(step_x[req_idx][1:2], d_meta2, window_cache=staging[0])
+            return ring_after_step1, out_step2.clone()
+
+    iso_rings, iso_out2 = zip(*(_run_isolated(i) for i in range(3)), strict=True)
+
+    # Multi-stream B=3 width-1 decode with lane 0 inactive ([0, 1, 1]) and then ([0, 1, 0]),
+    # testing both eager and CUDA-graph-captured execution.
+    pool = ContinuationPool.allocate(cfg, 5, 12, device, dfly=False)
+    arena = ScratchArena(device)
+    p_scratch = AttentionScratch.allocate(max_prefill, 1, max_prefill, device)
+    d_scratch = AttentionScratch.allocate(3, 3, 1, device)
+    pages_b3 = torch.arange(12, dtype=torch.int32, device=device).view(3, 4)
+    d_meta_cap = Metadata.pack(
+        starts=torch.tensor(prefix_lens, dtype=torch.int64, device=device),
+        lengths=torch.tensor([1, 1, 1], dtype=torch.int32, device=device),
+        state_rows=torch.tensor([1, 2, 3], dtype=torch.int64, device=device),
+        pages=pages_b3,
+        tokens=torch.ones((3, 1), dtype=torch.int64, device=device),
+        live_rows=torch.tensor([3], dtype=torch.int32, device=device),
+        token_capacity=3,
+        sample_count=3,
+        max_query_tokens=1,
+    )
+    p_meta_cap = _single_request_metadata(list(range(max_prefill)), start=0, state_row=1, pages=4, device=device)
+    with RecordedPreparationSession(
+        device=device, checkpoint="hy4-swa-b3-decode", workload_schema="swa-b3-decode", numerical_policy="default"
+    ) as session:
+        session.register_scratch(arena)
+        prefill = PreparedSlidingAttention(
+            2, weights, torch.zeros((max_prefill, HIDDEN_SIZE), dtype=torch.bfloat16, device=device),
+            p_scratch, p_meta_cap, pool, rotary,
+            mode="prefill", eps=1e-5, session=session, name="p3", workspace=arena,
+        )
+        decode = PreparedSlidingAttention(
+            2, weights, torch.zeros((3, HIDDEN_SIZE), dtype=torch.bfloat16, device=device),
+            d_scratch, d_meta_cap, pool, rotary,
+            mode="decode", eps=1e-5, session=session, name="d3", workspace=arena,
+        )
+        ring_commit = PreparedRingCommit(
+            pool.reserved_backing,
+            [pool.layout.region("layer2.window").offset],
+            d_meta_cap.state_rows,
+            d_meta_cap.starts,
+            token_capacity=1,
+            window_tokens=SWA_WINDOW,
+            record_bytes=576 * 2,
+        )
+        staging_shape = tuple(ring_commit.staging.shape)
+        ring_commit.functional()
+        session.tune()
+
+        def _seed_prefixes():
+            pool.clear_for_preparation()
+            for r, n in enumerate(prefix_lens):
+                padded_x = torch.zeros((max_prefill, HIDDEN_SIZE), dtype=torch.bfloat16, device=device)
+                padded_x[:n].copy_(prefixes[r])
+                padded_pos = list(range(n)) + [-1] * (max_prefill - n)
+                pm = _single_request_metadata(padded_pos, start=0, state_row=r + 1, pages=4, device=device)
+                prefill(padded_x, pm)
+
+        for use_graph in (False, True):
+            _seed_prefixes()
+            lane0_ring_before = pool.window(2)[1].clone()
+            # Packed decode step with lengths=[0, 1, 1]: packed idx 0 is req 1, packed idx 1 is req 2, idx 2 is dead.
+            packed_x1 = torch.zeros((3, HIDDEN_SIZE), dtype=torch.bfloat16, device=device)
+            packed_x1[0].copy_(step_x[1][0])
+            packed_x1[1].copy_(step_x[2][0])
+            m1 = Metadata.pack(
+                starts=torch.tensor(prefix_lens, dtype=torch.int64, device=device),
+                lengths=torch.tensor([0, 1, 1], dtype=torch.int32, device=device),
+                state_rows=torch.tensor([1, 2, 3], dtype=torch.int64, device=device),
+                pages=pages_b3,
+                tokens=torch.ones((3, 1), dtype=torch.int64, device=device),
+                live_rows=torch.tensor([2], dtype=torch.int32, device=device),
+                token_capacity=3,
+                sample_count=3,
+                max_query_tokens=1,
+            )
+            if use_graph:
+                saved_backing = pool.backing.clone()
+
+                def _step():
+                    staging = torch.empty(staging_shape, dtype=torch.uint8, device=device)
+                    decode(packed_x1, m1, window_cache=staging[0])
+                    ring_commit(m1.lengths, staging=staging, rows=m1.state_rows, starts=m1.starts)
+
+                compiled = compile_forward(_step)
+                pool.backing.copy_(saved_backing)
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    compiled()
+                pool.backing.copy_(saved_backing)
+                graph.replay()
+                torch.cuda.synchronize(device)
+            else:
+                staging = torch.empty(staging_shape, dtype=torch.uint8, device=device)
+                decode(packed_x1, m1, window_cache=staging[0])
+                ring_commit(m1.lengths, staging=staging, rows=m1.state_rows, starts=m1.starts)
+
+            # Inactive lane 0 and null row 0 must remain untouched; lanes 1 & 2 must match isolated rings.
+            assert not pool.window(2)[0].any()
+            assert torch.equal(pool.window(2)[1], lane0_ring_before)
+            assert _relative_error(pool.window(2)[2], iso_rings[1]) < 1e-3
+            assert _relative_error(pool.window(2)[3], iso_rings[2]) < 1e-3
+
+            # Step 2: run lengths=[0, 1, 0] and confirm lane 1's output matches isolated step 2.
+            packed_x2 = torch.zeros((3, HIDDEN_SIZE), dtype=torch.bfloat16, device=device)
+            packed_x2[0].copy_(step_x[1][1])
+            m2 = Metadata.pack(
+                starts=torch.tensor([prefix_lens[0], prefix_lens[1] + 1, prefix_lens[2] + 1], dtype=torch.int64, device=device),
+                lengths=torch.tensor([0, 1, 0], dtype=torch.int32, device=device),
+                state_rows=torch.tensor([1, 2, 3], dtype=torch.int64, device=device),
+                pages=pages_b3,
+                tokens=torch.ones((3, 1), dtype=torch.int64, device=device),
+                live_rows=torch.tensor([1], dtype=torch.int32, device=device),
+                token_capacity=3,
+                sample_count=3,
+                max_query_tokens=1,
+            )
+            staging2 = torch.empty(staging_shape, dtype=torch.uint8, device=device)
+            out2, _, _ = decode(packed_x2, m2, window_cache=staging2[0])
+            # Same M=3 kernel run on the clean isolated ring must match identically; M=1 vs M=3 BF16 stays within 1 ULP.
+            pool.window(2)[2].copy_(iso_rings[1])
+            out2_iso_ring, _, _ = decode(packed_x2, m2, window_cache=staging2[0])
+            assert _relative_error(out2[0:1], out2_iso_ring[0:1]) < 1e-3
+            assert _relative_error(out2[0:1], iso_out2[1]) < 0.01
+
+
+@torch.no_grad()
+def test_c4_indexer_physical_tail_and_b1_vs_b2_score_eviction_cuda(tmp_path):
+    """Verify >2,048-token physical tail compaction and score-based eviction across fused (M=6) and tiled (M=12)."""
+    from hyperflare_recipes.recipes.hy4_flash.indexer import expand_pooled_topk_to_logical_tokens
+
+    device = torch.device("cuda:0")
+    cfg = _synthetic_config(tmp_path)
+    rotary = InterleavedMRoPE(cfg, device)
+    attn_w = _random_attention_weights(SPARSE_HEADS, device, seed=3101)
+    idx_w = _random_indexer_weights(device, seed=3102)
+
+    # 2,060 tokens = 515 complete C4 groups (> 512) so positions 2047..2059 exercise pre-cap,
+    # exact-cap (512 prior groups), and post-cap partial/completing boundaries.
+    prefix_tokens = 2047
+    verify_width = 6
+    chunk = 512
+    pages_per_req = (prefix_tokens + verify_width + PAGE_TOKENS - 1) // PAGE_TOKENS  # 9 pages
+    total_pages = pages_per_req * 2 + 2
+
+    torch.manual_seed(3103)
+    x_req0 = (torch.randn(prefix_tokens + verify_width, HIDDEN_SIZE, device=device) * 0.25).to(torch.bfloat16)
+    x_req1 = (torch.randn(prefix_tokens + verify_width, HIDDEN_SIZE, device=device) * 0.25).to(torch.bfloat16)
+
+    pool = ContinuationPool.allocate(cfg, 4, total_pages, device, dfly=True)
+    arena = ScratchArena(device)
+    p_scratch = AttentionScratch.allocate(chunk, 1, chunk, device)
+    v1_scratch = AttentionScratch.allocate(verify_width, 1, verify_width, device)
+    v2_scratch = AttentionScratch.allocate(2 * verify_width, 2, verify_width, device)
+
+    # Disjoint shuffled physical pages for request 0 and request 1.
+    pages_r0 = torch.tensor([1, 3, 5, 7, 9, 11, 13, 15, 17], dtype=torch.int32, device=device)
+    pages_r1 = torch.tensor([18, 16, 14, 12, 10, 8, 6, 4, 2], dtype=torch.int32, device=device)
+    assert pages_r0.numel() == pages_per_req and pages_r1.numel() == pages_per_req
+
+    p_meta_cap = _single_request_metadata(list(range(chunk)), start=0, state_row=1, pages=pages_per_req, device=device)
+    v1_meta = Metadata.pack(
+        starts=torch.tensor([prefix_tokens], dtype=torch.int64, device=device),
+        lengths=torch.tensor([verify_width], dtype=torch.int32, device=device),
+        state_rows=torch.tensor([1], dtype=torch.int64, device=device),
+        pages=pages_r0.unsqueeze(0),
+        tokens=torch.ones((1, verify_width), dtype=torch.int64, device=device),
+        live_rows=torch.tensor([1], dtype=torch.int32, device=device),
+        token_capacity=verify_width,
+        sample_count=verify_width,
+        max_query_tokens=verify_width,
+    )
+    v2_meta = Metadata.pack(
+        starts=torch.tensor([prefix_tokens, prefix_tokens], dtype=torch.int64, device=device),
+        lengths=torch.tensor([verify_width, verify_width], dtype=torch.int32, device=device),
+        state_rows=torch.tensor([1, 2], dtype=torch.int64, device=device),
+        pages=torch.stack((pages_r0, pages_r1), dim=0),
+        tokens=torch.ones((2, verify_width), dtype=torch.int64, device=device),
+        live_rows=torch.tensor([2], dtype=torch.int32, device=device),
+        token_capacity=2 * verify_width,
+        sample_count=2 * verify_width,
+        max_query_tokens=verify_width,
+    )
+
+    with RecordedPreparationSession(
+        device=device, checkpoint="hy4-c4-b1-b2", workload_schema="c4-b1-b2", numerical_policy="default"
+    ) as session:
+        session.register_scratch(arena)
+        prefill = PreparedSparseAttention(
+            25, attn_w, idx_w, torch.zeros((chunk, HIDDEN_SIZE), dtype=torch.bfloat16, device=device),
+            p_scratch, p_meta_cap, pool, rotary,
+            mode="prefill", eps=1e-5, session=session, name="sp_p", workspace=arena,
+        )
+        # B=1 verify (6 rows -> paged_fused) vs B=2 verify (12 rows -> paged_tiled)
+        verify1 = PreparedSparseAttention(
+            25, attn_w, idx_w, torch.zeros((verify_width, HIDDEN_SIZE), dtype=torch.bfloat16, device=device),
+            v1_scratch, v1_meta, pool, rotary,
+            mode="verify", eps=1e-5, session=session, name="sp_v1", workspace=arena,
+        )
+        verify2 = PreparedSparseAttention(
+            25, attn_w, idx_w, torch.zeros((2 * verify_width, HIDDEN_SIZE), dtype=torch.bfloat16, device=device),
+            v2_scratch, v2_meta, pool, rotary,
+            mode="verify", eps=1e-5, session=session, name="sp_v2", workspace=arena,
+        )
+        session.tune()
+
+        pool.clear_for_preparation()
+        for r_idx, (x_seq, p_map) in enumerate(((x_req0, pages_r0), (x_req1, pages_r1))):
+            start = 0
+            while start < prefix_tokens:
+                n = min(chunk, prefix_tokens - start)
+                padded_x = torch.zeros((chunk, HIDDEN_SIZE), dtype=torch.bfloat16, device=device)
+                padded_x[:n].copy_(x_seq[start : start + n])
+                padded_pos = list(range(start, start + n)) + [-1] * (chunk - n)
+                pm = _single_request_metadata(padded_pos, start=start, state_row=r_idx + 1, pages=pages_per_req, device=device)
+                pm.page_table[0].copy_(p_map)
+                prefill(padded_x, pm)
+                start += n
+
+        # Inspect physical slots and selected_lengths directly for positions [2047, 2048, 2049, 2050, 2051, 2052].
+        q_res1 = verify1.q_norm(verify1.qkv_a(x_req0[prefix_tokens:])[:, :Q_LORA_RANK].contiguous())
+        phys1, len1, _, pools1 = verify1.indexer(x_req0[prefix_tokens:], q_res1, v1_meta)
+        x_b2 = torch.cat((x_req0[prefix_tokens:], x_req1[prefix_tokens:]), dim=0)
+        q_res2 = verify2.q_norm(verify2.qkv_a(x_b2)[:, :Q_LORA_RANK].contiguous())
+        phys2, len2, _, pools2 = verify2.indexer(x_b2, q_res2, v2_meta)
+
+        expected_lens = [2048, 2045, 2046, 2047, 2048, 2045]
+        assert len1.tolist() == expected_lens
+        assert len2[:verify_width].tolist() == expected_lens
+        assert len2[verify_width:].tolist() == expected_lens
+
+        for tok_i, (pos, exp_len) in enumerate(zip(range(prefix_tokens, prefix_tokens + verify_width), expected_lens, strict=True)):
+            for label, phys_row, pool_row in (("fused", phys1[tok_i], pools1[tok_i]), ("tiled", phys2[tok_i], pools2[tok_i])):
+                # Zero -1 holes before exp_len; all -1 from exp_len onward.
+                assert torch.all(phys_row[:exp_len] >= 0), f"{label} hole at pos={pos}"
+                assert torch.all(phys_row[exp_len:] == -1), f"{label} trailing slot at pos={pos}"
+                # Current token and its full partial/completing group must be present in physical slots.
+                group_start = (pos // INDEX_KPOOL) * INDEX_KPOOL
+                expected_tail_phys = [
+                    int(pages_r0[t // PAGE_TOKENS].item()) * PAGE_TOKENS + (t % PAGE_TOKENS)
+                    for t in range(group_start, pos + 1)
+                ]
+                assert phys_row[exp_len - len(expected_tail_phys) : exp_len].tolist() == expected_tail_phys, (
+                    f"{label} missing partial tail at pos={pos}"
+                )
+                # Logical expansion (DFly2) and physical expansion (target sparse MLA) must represent the exact same slots.
+                logical = expand_pooled_topk_to_logical_tokens(
+                    pool_row.unsqueeze(0), torch.tensor([pos], dtype=torch.int64, device=device)
+                )[0]
+                valid_log = logical[logical >= 0]
+                assert valid_log.numel() == exp_len
+                resolved_log = [
+                    int(pages_r0[t // PAGE_TOKENS].item()) * PAGE_TOKENS + (t % PAGE_TOKENS)
+                    for t in valid_log.tolist()
+                ]
+                assert resolved_log == phys_row[:exp_len].tolist()
+
+            # Fused (M=6) and tiled (M=12) must select the same set of physical slots for request 0.
+            set_fused = set(phys1[tok_i, :exp_len].tolist())
+            set_tiled = set(phys2[tok_i, :exp_len].tolist())
+            assert set_fused == set_tiled, f"fused vs tiled pool mismatch at pos={pos}: diff={set_fused ^ set_tiled}"
+
+        # End-to-end sparse attention output for request 0 must match between B=1 (M=6) and B=2 (M=12).
+        out1, _, _ = verify1(x_req0[prefix_tokens:], v1_meta)
+        out2, _, _ = verify2(x_b2, v2_meta)
+        assert _relative_error(out2[:verify_width], out1) < 0.01
+
+
+@torch.no_grad()
+def test_real_checkpoint_multistream_layers_b1_vs_b2_b4_b8_cuda():
+    """Verify real Hy4-flash-NVFP4 online-MXFP8 + CSF LatentMoE + stream_overlap layers match B=1 across B=2,4,8."""
+    snapshot = _quant_snapshot()
+
+    device = torch.device("cuda:0")
+    shard = TensorParallelShard(0, 1)
+    manifest = inspect_indexed_checkpoint(snapshot)
+    cfg = ModelConfig.load(manifest.metadata_path, manifest=manifest)
+    rotary = InterleavedMRoPE(cfg, device)
+
+    with Hy4WeightLoader(
+        manifest,
+        device,
+        config=cfg,
+        shard=shard,
+        dfly=False,
+        vision=False,
+        expert_scale_compression="csf",
+        online_mxfp8=True,
+        online_mxfp8_scope="all",
+    ) as loader:
+        l0 = loader.load_layer(0)  # sparse + dense FFN
+        l1 = loader.load_layer(1)  # sparse + LatentMoE (CSF)
+        l2 = loader.load_layer(2)  # SWA + LatentMoE (CSF)
+
+    from hyperflare_recipes.components.ring_commit import PreparedRingCommit
+
+    verify_w = 6
+    max_b = 8
+    prefix_lens = tuple(37 + 4 * i for i in range(max_b))  # distinct lengths crossing C4 boundaries
+    max_prefill = max(prefix_lens)
+    total_pages = max_b * 2 + 2
+
+    torch.manual_seed(4101)
+    prefill_streams = [
+        (torch.randn(n, 4, HIDDEN_SIZE, device=device) * 0.2).to(torch.bfloat16) for n in prefix_lens
+    ]
+    verify_streams = [
+        (torch.randn(verify_w, 4, HIDDEN_SIZE, device=device) * 0.2).to(torch.bfloat16) for _ in range(max_b)
+    ]
+    # Disjoint shuffled physical pages (2 pages per request).
+    req_pages = torch.randperm(max_b * 2, generator=torch.Generator().manual_seed(4102), dtype=torch.int32).to(device).view(max_b, 2)
+
+    pool = ContinuationPool.allocate(cfg, max_b + 2, total_pages, device, dfly=False)
+    arena = ScratchArena(device, overlap=True)
+    p_attn_scratch = AttentionScratch.allocate(max_prefill, 1, max_prefill, device)
+    p_moe_scratch = MoEScratch.allocate(max_prefill, device)
+    p_meta_cap = _single_request_metadata(list(range(max_prefill)), start=0, state_row=1, pages=2, device=device)
+
+    batch_sizes = (1, 2, 4, 8)
+    v_scratches = {
+        b: (AttentionScratch.allocate(b * verify_w, b, verify_w, device), MoEScratch.allocate(b * verify_w, device))
+        for b in batch_sizes
+    }
+    v_metas_cap = {
+        b: Metadata.pack(
+            starts=torch.tensor(prefix_lens[:b], dtype=torch.int64, device=device),
+            lengths=torch.full((b,), verify_w, dtype=torch.int32, device=device),
+            state_rows=torch.arange(1, b + 1, dtype=torch.int64, device=device),
+            pages=req_pages[:b],
+            tokens=torch.ones((b, verify_w), dtype=torch.int64, device=device),
+            live_rows=torch.tensor([b], dtype=torch.int32, device=device),
+            token_capacity=b * verify_w,
+            sample_count=b * verify_w,
+            max_query_tokens=verify_w,
+        )
+        for b in batch_sizes
+    }
+
+    def _build_three_layers(session, *, tokens, mode, attn_scratch, moe_scratch, meta, tag):
+        proto_streams = torch.zeros((tokens, 4, HIDDEN_SIZE), dtype=torch.bfloat16, device=device)
+        proto_x = proto_streams[:, 0].contiguous()
+        hc_mixes = torch.zeros((tokens, 8), dtype=torch.float32, device=device)
+        hc_projs = {}
+        for idx, lw in ((0, l0), (1, l1), (2, l2)):
+            hc_projs[(idx, "attn")] = UnquantizedProjection(
+                proto_streams.view(tokens, -1), lw.residual["attn_fn"], hc_mixes,
+                session=session, name=f"{tag}.l{idx}.hc_attn",
+            ).functional(session=session)
+            hc_projs[(idx, "mlp")] = UnquantizedProjection(
+                proto_streams.view(tokens, -1), lw.residual["mlp_fn"], hc_mixes,
+                session=session, name=f"{tag}.l{idx}.hc_mlp",
+            ).functional(session=session)
+        a0 = PreparedSparseAttention(
+            0, l0.attention, l0.indexer, proto_x, attn_scratch, meta, pool, rotary,
+            mode=mode, eps=1e-5, session=session, name=f"{tag}.l0.attn", workspace=arena,
+        )
+        m0 = PreparedDenseMLP(l0.mlp, proto_x, moe_scratch, eps=1e-5, session=session, name=f"{tag}.l0.mlp", workspace=arena)
+        a1 = PreparedSparseAttention(
+            1, l1.attention, l1.indexer, proto_x, attn_scratch, meta, pool, rotary,
+            mode=mode, eps=1e-5, session=session, name=f"{tag}.l1.attn", workspace=arena,
+        )
+        m1 = PreparedLatentMoE(l1.mlp, proto_x, moe_scratch, config=cfg, mode=mode, session=session, name=f"{tag}.l1.moe", workspace=arena)
+        a2 = PreparedSlidingAttention(
+            2, l2.attention, proto_x, attn_scratch, meta, pool, rotary,
+            mode=mode, eps=1e-5, session=session, name=f"{tag}.l2.attn", workspace=arena,
+        )
+        m2 = PreparedLatentMoE(l2.mlp, proto_x, moe_scratch, config=cfg, mode=mode, session=session, name=f"{tag}.l2.moe", workspace=arena)
+        ring_commit = None
+        staging_shape = None
+        if mode == "verify":
+            ring_commit = PreparedRingCommit(
+                pool.reserved_backing,
+                [pool.layout.region("layer2.window").offset],
+                meta.state_rows,
+                meta.starts,
+                token_capacity=verify_w,
+                window_tokens=SWA_WINDOW,
+                record_bytes=576 * 2,
+            )
+            staging_shape = tuple(ring_commit.staging.shape)
+            ring_commit.functional()
+        return hc_projs, ((0, l0, a0, m0), (1, l1, a1, m1), (2, l2, a2, m2)), ring_commit, staging_shape
+
+    def _run_stack(x_streams, meta, bundle, *, capture_trace: bool = False):
+        hc_projs, layers, _, staging_shape = bundle
+        tokens = x_streams.shape[0]
+        h = x_streams
+        ring_staging = None if staging_shape is None else torch.empty(staging_shape, dtype=torch.uint8, device=device)
+        trace = {}
+        for idx, lw, attn_mod, ffn_mod in layers:
+            r = lw.residual
+            attn_mix = hc_projs[(idx, "attn")](h.reshape(tokens, -1))
+            post_a, x_a = ihc_pre(h, r["attn_fn"], r["attn_base"], r["attn_scale"], rms_eps=1e-5, hc_eps=1e-6, hc_magnitude=2.0, mixes=attn_mix)
+            x_a = (x_a.float() * torch.rsqrt(x_a.float().square().mean(-1, keepdim=True) + 1e-5)).to(x_a.dtype) * r["input_norm"]
+            if isinstance(attn_mod, PreparedSlidingAttention) and ring_staging is not None:
+                out_a = attn_mod(x_a, meta, window_cache=ring_staging[0])[0]
+            else:
+                out_a = attn_mod(x_a, meta)[0]
+            h = ihc_post(h, out_a, post_a)
+            mlp_mix = hc_projs[(idx, "mlp")](h.reshape(tokens, -1))
+            post_m, x_m = ihc_pre(h, r["mlp_fn"], r["mlp_base"], r["mlp_scale"], rms_eps=1e-5, hc_eps=1e-6, hc_magnitude=2.0, mixes=mlp_mix)
+            x_m = (x_m.float() * torch.rsqrt(x_m.float().square().mean(-1, keepdim=True) + 1e-5)).to(x_m.dtype) * r["post_attn_norm"]
+            out_m = ffn_mod(x_m)
+            h = ihc_post(h, out_m, post_m)
+            if capture_trace:
+                trace[f"l{idx}.attn"] = out_a.clone()
+                trace[f"l{idx}.mlp"] = out_m.clone()
+                trace[f"l{idx}.h"] = h.clone()
+        return h, trace
+
+    with RecordedPreparationSession(
+        device=device, checkpoint="hy4-real-multistream", workload_schema="real-multistream", numerical_policy="default"
+    ) as session:
+        session.register_scratch(arena)
+        prefill_bundle = _build_three_layers(
+            session, tokens=max_prefill, mode="prefill",
+            attn_scratch=p_attn_scratch, moe_scratch=p_moe_scratch, meta=p_meta_cap, tag="p",
+        )
+        verify_bundles = {
+            b: _build_three_layers(
+                session, tokens=b * verify_w, mode="verify",
+                attn_scratch=v_scratches[b][0], moe_scratch=v_scratches[b][1], meta=v_metas_cap[b], tag=f"v{b}",
+            )
+            for b in batch_sizes
+        }
+        session.tune()
+
+        # Prefill all 8 distinct streams into disjoint continuation rows (1..8) and pages.
+        pool.clear_for_preparation()
+        for r, n in enumerate(prefix_lens):
+            padded_s = torch.zeros((max_prefill, 4, HIDDEN_SIZE), dtype=torch.bfloat16, device=device)
+            padded_s[:n].copy_(prefill_streams[r])
+            padded_pos = list(range(n)) + [-1] * (max_prefill - n)
+            pm = _single_request_metadata(padded_pos, start=0, state_row=r + 1, pages=2, device=device)
+            pm.page_table[0].copy_(req_pages[r])
+            _run_stack(padded_s, pm, prefill_bundle)
+        saved_backing = pool.backing.clone()
+        saved_pages = {k: v.clone() for k, v in pool.pages.items()}
+
+        def _restore_pool():
+            pool.backing.copy_(saved_backing)
+            for k, v in saved_pages.items():
+                pool.pages[k].copy_(v)
+
+        # Baseline isolated B=1 (M=6) outputs + measured MoE reduction repeatability for each request.
+        iso_out = []
+        iso_traces = []
+        max_repeat = 0.0
+        for r in range(max_b):
+            m1 = Metadata.pack(
+                starts=torch.tensor([prefix_lens[r]], dtype=torch.int64, device=device),
+                lengths=torch.tensor([verify_w], dtype=torch.int32, device=device),
+                state_rows=torch.tensor([r + 1], dtype=torch.int64, device=device),
+                pages=req_pages[r : r + 1],
+                tokens=torch.ones((1, verify_w), dtype=torch.int64, device=device),
+                live_rows=torch.tensor([1], dtype=torch.int32, device=device),
+                token_capacity=verify_w,
+                sample_count=verify_w,
+                max_query_tokens=verify_w,
+            )
+            _restore_pool()
+            h1, tr1 = _run_stack(verify_streams[r], m1, verify_bundles[1], capture_trace=True)
+            _restore_pool()
+            h1_rep, _ = _run_stack(verify_streams[r], m1, verify_bundles[1])
+            max_repeat = max(max_repeat, _relative_error(h1_rep, h1))
+            iso_out.append(h1.clone())
+            iso_traces.append(tr1)
+
+        bound = max(0.01, 3.0 * max_repeat + 0.005)
+
+        # Compare B=2 (M=12), B=4 (M=24), and B=8 (M=48) — both eager and CUDA-graph captured — against B=1.
+        for b in (2, 4, 8):
+            x_b = torch.cat(verify_streams[:b], dim=0).contiguous()
+            mb = v_metas_cap[b]
+            _restore_pool()
+            h_b, tr_b = _run_stack(x_b, mb, verify_bundles[b], capture_trace=True)
+            for r in range(b):
+                sl = slice(r * verify_w, (r + 1) * verify_w)
+                for key in ("l0.attn", "l0.mlp", "l1.attn", "l1.mlp", "l2.attn", "l2.mlp", "l2.h"):
+                    err = _relative_error(tr_b[key][sl], iso_traces[r][key])
+                    assert err < bound, f"B={b} req={r} {key} diverged from B=1: rel_err={err:.5f} (bound={bound:.5f})"
+                assert _relative_error(h_b[sl], iso_out[r]) < bound
+
+            # Compiled + CUDA-graph captured replay at B=2 (M=12) and B=8 (M=48).
+            if b in (2, 8):
+                static_out = torch.empty_like(h_b)
+                compiled = compile_forward(lambda: _run_stack(x_b, mb, verify_bundles[b])[0])
+                _restore_pool()
+                compiled()
+                _restore_pool()
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    static_out.copy_(compiled())
+                _restore_pool()
+                graph.replay()
+                torch.cuda.synchronize(device)
+                for r in range(b):
+                    sl = slice(r * verify_w, (r + 1) * verify_w)
+                    assert _relative_error(static_out[sl], iso_out[r]) < bound
+
+        # Also test B=2 with unequal offered lengths [2, 6] and inactive leading lane [0, 6].
+        for lengths_pair in ((2, 6), (0, 6)):
+            x_packed = torch.zeros((2 * verify_w, 4, HIDDEN_SIZE), dtype=torch.bfloat16, device=device)
+            off = 0
+            for r, ln in enumerate(lengths_pair):
+                if ln > 0:
+                    x_packed[off : off + ln].copy_(verify_streams[r][:ln])
+                    off += ln
+            m_var = Metadata.pack(
+                starts=torch.tensor(prefix_lens[:2], dtype=torch.int64, device=device),
+                lengths=torch.tensor(lengths_pair, dtype=torch.int32, device=device),
+                state_rows=torch.tensor([1, 2], dtype=torch.int64, device=device),
+                pages=req_pages[:2],
+                tokens=torch.ones((2, verify_w), dtype=torch.int64, device=device),
+                live_rows=torch.tensor([sum(1 for ln in lengths_pair if ln > 0)], dtype=torch.int32, device=device),
+                token_capacity=2 * verify_w,
+                sample_count=2 * verify_w,
+                max_query_tokens=verify_w,
+            )
+            _restore_pool()
+            h_var, _ = _run_stack(x_packed, m_var, verify_bundles[2])
+            off = 0
+            for r, ln in enumerate(lengths_pair):
+                if ln > 0:
+                    assert _relative_error(h_var[off : off + ln], iso_out[r][:ln]) < bound
+                    off += ln
+
+
+@torch.no_grad()
+def test_multistream_mixed_rotary_offsets_and_interleaved_dead_rows_cuda(tmp_path):
+    """Verify B=4 (M=24) and B=8 (M=48) sparse + SWA verify with mixed rotary offsets and dead rows."""
+    from dataclasses import replace
+    from hyperflare_recipes.components.ring_commit import PreparedRingCommit
+
+    device = torch.device("cuda:0")
+    cfg = _synthetic_config(tmp_path)
+    rotary = InterleavedMRoPE(cfg, device)
+    sp_w = _random_attention_weights(SPARSE_HEADS, device, seed=5101)
+    idx_w = _random_indexer_weights(device, seed=5102)
+    swa_w = _random_attention_weights(SWA_HEADS, device, seed=5103)
+
+    # Stream 0: short text (< 2048), rotary_offset=0
+    # Stream 1: long text at exact C4 cap (pos=2048, partial tail), rotary_offset=0
+    # Stream 2: multimodal image+text (> 2048, 3D M-RoPE prefill, negative rotary_offset=-759)
+    # Stream 3: inactive row (length=0, state_row=0, page_table=-1)
+    prefix_lens = (45, 2048, 2055, 0)
+    rot_offsets = (0, 0, -759, 0)
+    verify_w = 6
+    chunk = 512
+    pages_per_req = (max(prefix_lens) + verify_w + PAGE_TOKENS - 1) // PAGE_TOKENS  # 9
+    total_pages = 3 * pages_per_req + 2
+
+    torch.manual_seed(5104)
+    seqs = [
+        (torch.randn(n + verify_w, HIDDEN_SIZE, device=device) * 0.25).to(torch.bfloat16) if n > 0 else None
+        for n in prefix_lens
+    ]
+    page_maps = [
+        torch.arange(1 + i * pages_per_req, 1 + (i + 1) * pages_per_req, dtype=torch.int32, device=device)
+        for i in range(3)
+    ]
+    page_maps.append(torch.full((pages_per_req,), -1, dtype=torch.int32, device=device))
+
+    pool = ContinuationPool.allocate(cfg, 6, total_pages, device, dfly=True)
+    arena = ScratchArena(device, overlap=True)
+    p_scratch = AttentionScratch.allocate(chunk, 1, chunk, device)
+    v1_scratch = AttentionScratch.allocate(verify_w, 1, verify_w, device)
+    v4_scratch = AttentionScratch.allocate(4 * verify_w, 4, verify_w, device)
+    v8_scratch = AttentionScratch.allocate(8 * verify_w, 8, verify_w, device)
+
+    p_meta_cap = _single_request_metadata(list(range(chunk)), start=0, state_row=1, pages=pages_per_req, device=device)
+    v1_meta_cap = Metadata.pack(
+        starts=torch.tensor([prefix_lens[1]], dtype=torch.int64, device=device),
+        lengths=torch.tensor([verify_w], dtype=torch.int32, device=device),
+        state_rows=torch.tensor([2], dtype=torch.int64, device=device),
+        pages=page_maps[1].unsqueeze(0),
+        tokens=torch.ones((1, verify_w), dtype=torch.int64, device=device),
+        live_rows=torch.tensor([1], dtype=torch.int32, device=device),
+        token_capacity=verify_w,
+        sample_count=verify_w,
+        max_query_tokens=verify_w,
+        rotary_offset=torch.tensor([0], dtype=torch.int64, device=device),
+    )
+    v4_meta = Metadata.pack(
+        starts=torch.tensor(prefix_lens, dtype=torch.int64, device=device),
+        lengths=torch.tensor([verify_w, verify_w, verify_w, 0], dtype=torch.int32, device=device),
+        state_rows=torch.tensor([1, 2, 3, 0], dtype=torch.int64, device=device),
+        pages=torch.stack(page_maps, dim=0),
+        tokens=torch.ones((4, verify_w), dtype=torch.int64, device=device),
+        live_rows=torch.tensor([3], dtype=torch.int32, device=device),
+        token_capacity=4 * verify_w,
+        sample_count=4 * verify_w,
+        max_query_tokens=verify_w,
+        rotary_offset=torch.tensor(rot_offsets, dtype=torch.int64, device=device),
+    )
+    v8_meta = Metadata.pack(
+        starts=torch.tensor([0, prefix_lens[0], 0, prefix_lens[1], prefix_lens[2], 0, 0, 0], dtype=torch.int64, device=device),
+        lengths=torch.tensor([0, verify_w, 0, verify_w, verify_w, 0, 0, 0], dtype=torch.int32, device=device),
+        state_rows=torch.tensor([0, 1, 0, 2, 3, 0, 0, 0], dtype=torch.int64, device=device),
+        pages=torch.stack(
+            [page_maps[3], page_maps[0], page_maps[3], page_maps[1], page_maps[2], page_maps[3], page_maps[3], page_maps[3]],
+            dim=0,
+        ),
+        tokens=torch.ones((8, verify_w), dtype=torch.int64, device=device),
+        live_rows=torch.tensor([5], dtype=torch.int32, device=device),
+        token_capacity=8 * verify_w,
+        sample_count=8 * verify_w,
+        max_query_tokens=verify_w,
+        rotary_offset=torch.tensor([0, 0, 0, 0, -759, 0, 0, 0], dtype=torch.int64, device=device),
+    )
+
+    with RecordedPreparationSession(
+        device=device, checkpoint="hy4-mixed-rope-dead", workload_schema="mixed-rope-dead", numerical_policy="default"
+    ) as session:
+        session.register_scratch(arena)
+        sp_p = PreparedSparseAttention(
+            25, sp_w, idx_w, torch.zeros((chunk, HIDDEN_SIZE), dtype=torch.bfloat16, device=device),
+            p_scratch, p_meta_cap, pool, rotary, mode="prefill", eps=1e-5, session=session, name="sp_p", workspace=arena,
+        )
+        sp_v1 = PreparedSparseAttention(
+            25, sp_w, idx_w, torch.zeros((verify_w, HIDDEN_SIZE), dtype=torch.bfloat16, device=device),
+            v1_scratch, v1_meta_cap, pool, rotary, mode="verify", eps=1e-5, session=session, name="sp_v1", workspace=arena,
+        )
+        sp_v4 = PreparedSparseAttention(
+            25, sp_w, idx_w, torch.zeros((4 * verify_w, HIDDEN_SIZE), dtype=torch.bfloat16, device=device),
+            v4_scratch, v4_meta, pool, rotary, mode="verify", eps=1e-5, session=session, name="sp_v4", workspace=arena,
+        )
+        sp_v8 = PreparedSparseAttention(
+            25, sp_w, idx_w, torch.zeros((8 * verify_w, HIDDEN_SIZE), dtype=torch.bfloat16, device=device),
+            v8_scratch, v8_meta, pool, rotary, mode="verify", eps=1e-5, session=session, name="sp_v8", workspace=arena,
+        )
+        swa_p = PreparedSlidingAttention(
+            2, swa_w, torch.zeros((chunk, HIDDEN_SIZE), dtype=torch.bfloat16, device=device),
+            p_scratch, p_meta_cap, pool, rotary, mode="prefill", eps=1e-5, session=session, name="swa_p", workspace=arena,
+        )
+        swa_v1 = PreparedSlidingAttention(
+            2, swa_w, torch.zeros((verify_w, HIDDEN_SIZE), dtype=torch.bfloat16, device=device),
+            v1_scratch, v1_meta_cap, pool, rotary, mode="verify", eps=1e-5, session=session, name="swa_v1", workspace=arena,
+        )
+        swa_v4 = PreparedSlidingAttention(
+            2, swa_w, torch.zeros((4 * verify_w, HIDDEN_SIZE), dtype=torch.bfloat16, device=device),
+            v4_scratch, v4_meta, pool, rotary, mode="verify", eps=1e-5, session=session, name="swa_v4", workspace=arena,
+        )
+        swa_v8 = PreparedSlidingAttention(
+            2, swa_w, torch.zeros((8 * verify_w, HIDDEN_SIZE), dtype=torch.bfloat16, device=device),
+            v8_scratch, v8_meta, pool, rotary, mode="verify", eps=1e-5, session=session, name="swa_v8", workspace=arena,
+        )
+        rc1 = PreparedRingCommit(
+            pool.reserved_backing, [pool.layout.region("layer2.window").offset],
+            v1_meta_cap.state_rows, v1_meta_cap.starts,
+            token_capacity=verify_w, window_tokens=SWA_WINDOW, record_bytes=576 * 2,
+        )
+        rc4 = PreparedRingCommit(
+            pool.reserved_backing, [pool.layout.region("layer2.window").offset],
+            v4_meta.state_rows, v4_meta.starts,
+            token_capacity=verify_w, window_tokens=SWA_WINDOW, record_bytes=576 * 2,
+        )
+        rc8 = PreparedRingCommit(
+            pool.reserved_backing, [pool.layout.region("layer2.window").offset],
+            v8_meta.state_rows, v8_meta.starts,
+            token_capacity=verify_w, window_tokens=SWA_WINDOW, record_bytes=576 * 2,
+        )
+        rc1_shape, rc4_shape, rc8_shape = tuple(rc1.staging.shape), tuple(rc4.staging.shape), tuple(rc8.staging.shape)
+        rc1.functional()
+        rc4.functional()
+        rc8.functional()
+        session.tune()
+
+        pool.clear_for_preparation()
+        for r in range(3):
+            n = prefix_lens[r]
+            start = 0
+            while start < n:
+                cnt = min(chunk, n - start)
+                px = torch.zeros((chunk, HIDDEN_SIZE), dtype=torch.bfloat16, device=device)
+                px[:cnt].copy_(seqs[r][start : start + cnt])
+                ppos = list(range(start, start + cnt)) + [-1] * (chunk - cnt)
+                pm = _single_request_metadata(ppos, start=start, state_row=r + 1, pages=pages_per_req, device=device)
+                pm.page_table[0].copy_(page_maps[r])
+                if r == 2:
+                    rope3 = torch.full((chunk, 3), -1, dtype=torch.int64, device=device)
+                    for k in range(cnt):
+                        p_abs = start + k
+                        if 10 <= p_abs < 802:
+                            rel = p_abs - 10
+                            rope3[k, 0] = 10
+                            rope3[k, 1] = 10 + rel // 33
+                            rope3[k, 2] = 10 + rel % 33
+                        else:
+                            rope3[k] = p_abs if p_abs < 10 else p_abs - 759
+                    pm = replace(pm, rotary_positions=rope3)
+                sp_p(px, pm)
+                swa_p(px, pm)
+                start += cnt
+
+        saved_backing = pool.backing.clone()
+        saved_pages = {k: v.clone() for k, v in pool.pages.items()}
+
+        def _restore():
+            pool.backing.copy_(saved_backing)
+            for k, v in saved_pages.items():
+                pool.pages[k].copy_(v)
+
+        iso_sp, iso_swa, iso_rings = [], [], []
+        for r in range(3):
+            _restore()
+            m1 = Metadata.pack(
+                starts=torch.tensor([prefix_lens[r]], dtype=torch.int64, device=device),
+                lengths=torch.tensor([verify_w], dtype=torch.int32, device=device),
+                state_rows=torch.tensor([r + 1], dtype=torch.int64, device=device),
+                pages=page_maps[r].unsqueeze(0),
+                tokens=torch.ones((1, verify_w), dtype=torch.int64, device=device),
+                live_rows=torch.tensor([1], dtype=torch.int32, device=device),
+                token_capacity=verify_w,
+                sample_count=verify_w,
+                max_query_tokens=verify_w,
+                rotary_offset=torch.tensor([rot_offsets[r]], dtype=torch.int64, device=device),
+            )
+            o_sp, _, _ = sp_v1(seqs[r][prefix_lens[r] :], m1)
+            st1 = torch.empty(rc1_shape, dtype=torch.uint8, device=device)
+            o_swa, _, _ = swa_v1(seqs[r][prefix_lens[r] :], m1, window_cache=st1[0])
+            rc1(m1.lengths, staging=st1, rows=m1.state_rows, starts=m1.starts)
+            iso_sp.append(o_sp.clone())
+            iso_swa.append(o_swa.clone())
+            iso_rings.append(pool.window(2)[r + 1].clone())
+
+        # B=4 verify (M=24, 3 active + 1 trailing dead row) + ring commit.
+        _restore()
+        x4 = torch.zeros((4 * verify_w, HIDDEN_SIZE), dtype=torch.bfloat16, device=device)
+        for r in range(3):
+            x4[r * verify_w : (r + 1) * verify_w].copy_(seqs[r][prefix_lens[r] :])
+        o4_sp, _, _ = sp_v4(x4, v4_meta)
+        st4 = torch.empty(rc4_shape, dtype=torch.uint8, device=device)
+        o4_swa, _, _ = swa_v4(x4, v4_meta, window_cache=st4[0])
+        rc4(v4_meta.lengths, staging=st4, rows=v4_meta.state_rows, starts=v4_meta.starts)
+        assert torch.isfinite(o4_sp).all() and torch.isfinite(o4_swa).all()
+        assert not pool.window(2)[0].any()
+        for r in range(3):
+            sl = slice(r * verify_w, (r + 1) * verify_w)
+            assert _relative_error(o4_sp[sl], iso_sp[r]) < 0.01
+            assert _relative_error(o4_swa[sl], iso_swa[r]) < 0.01
+            assert _relative_error(pool.window(2)[r + 1], iso_rings[r]) < 1e-3
+
+        # B=8 verify (M=48, leading dead + middle dead + 3 trailing dead) + ring commit.
+        _restore()
+        x8 = torch.zeros((8 * verify_w, HIDDEN_SIZE), dtype=torch.bfloat16, device=device)
+        for r in range(3):
+            x8[r * verify_w : (r + 1) * verify_w].copy_(seqs[r][prefix_lens[r] :])
+        o8_sp, _, _ = sp_v8(x8, v8_meta)
+        st8 = torch.empty(rc8_shape, dtype=torch.uint8, device=device)
+        o8_swa, _, _ = swa_v8(x8, v8_meta, window_cache=st8[0])
+        rc8(v8_meta.lengths, staging=st8, rows=v8_meta.state_rows, starts=v8_meta.starts)
+        assert torch.isfinite(o8_sp).all() and torch.isfinite(o8_swa).all()
+        assert not pool.window(2)[0].any()
+        for r in range(3):
+            sl = slice(r * verify_w, (r + 1) * verify_w)
+            assert _relative_error(o8_sp[sl], iso_sp[r]) < 0.01
+            assert _relative_error(o8_swa[sl], iso_swa[r]) < 0.01
+            assert _relative_error(pool.window(2)[r + 1], iso_rings[r]) < 1e-3
+

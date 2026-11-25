@@ -776,13 +776,12 @@ class PreparedSlidingAttention:
 
         if window_cache is not None:
             # Stage only this step's new records for batched PreparedRingCommit across all 30 SWA layers.
+            # Active tokens are packed contiguously at the front of kv_record, so decode and verify must
+            # both scatter by request-indexed ring_write_slots rather than copying by row index.
             wc_bf16 = window_cache.view(torch.bfloat16).view(
                 rows, SWA_WINDOW + self.max_query_tokens, SWA_RECORD_WIDTH
             )
-            if self.mode == "decode":
-                wc_bf16[:, SWA_WINDOW].copy_(kv_record)
-            else:
-                scatter_rows(kv_record, ring_write_slots, wc_bf16.view(-1, SWA_RECORD_WIDTH), live)
+            scatter_rows(kv_record, ring_write_slots, wc_bf16.view(-1, SWA_RECORD_WIDTH), live)
             commit_record = None
         else:
             commit_record = kv_record

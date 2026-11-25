@@ -41,6 +41,7 @@ class IndexScratch:
     token_keys: torch.Tensor
     pool_lengths: torch.Tensor
     prior_pools: torch.Tensor
+    prior_scores: torch.Tensor
     pools: torch.Tensor
     physical: torch.Tensor
     physical_topk: torch.Tensor
@@ -57,6 +58,7 @@ class IndexScratch:
             token_keys=zeros(tokens, INDEX_HEAD_DIM),
             pool_lengths=zeros(tokens, dtype=torch.int32),
             prior_pools=torch.full((tokens, GROUP_TOPK), -1, dtype=torch.int32, device=device),
+            prior_scores=zeros(tokens, GROUP_TOPK, dtype=torch.float32),
             pools=torch.full((tokens, GROUP_TOPK), -1, dtype=torch.int32, device=device),
             physical=torch.full((tokens, PHYSICAL_WIDTH), -1, dtype=torch.int32, device=device),
             physical_topk=torch.full((tokens, INDEX_TOPK), -1, dtype=torch.int32, device=device),
@@ -70,6 +72,7 @@ class IndexScratch:
             token_keys=self.token_keys[:tokens],
             pool_lengths=self.pool_lengths[:tokens],
             prior_pools=self.prior_pools[:tokens],
+            prior_scores=self.prior_scores[:tokens],
             pools=self.pools[:tokens],
             physical=self.physical[:tokens],
             physical_topk=self.physical_topk[:tokens],
@@ -127,6 +130,82 @@ def expand_pooled_topk_to_logical_tokens(
     existing = out.gather(1, tail_col)
     out.scatter_(1, tail_col, torch.where(tail_valid, tail_tok, existing))
     return out
+
+
+def select_c4_pools(
+    prior_pools: torch.Tensor,
+    prior_scores: torch.Tensor,
+    positions: torch.Tensor,
+    *,
+    group_topk: int = GROUP_TOPK,
+    pool_size: int = INDEX_KPOOL,
+) -> torch.Tensor:
+    """Keep at most ``group_topk - 1`` highest-scoring prior pools plus the completing own group.
+
+    Because b12x radix top-k routes emit unsorted candidates, rows at or past ``group_topk``
+    complete groups evict a minimum-score prior pool rather than a fixed column, moving the
+    trailing column into the evicted slot so columns ``0 .. group_topk - 2`` remain compact.
+    Column ``group_topk - 1`` receives the own group on completing tokens (``pos % 4 == 3``)
+    and ``-1`` otherwise so partial-tail expansion fits within ``INDEX_TOPK`` tokens.
+    """
+    live = positions >= 0
+    safe_pos = positions.clamp_min(0)
+    group_id = safe_pos // pool_size
+    completes = live & ((safe_pos & (pool_size - 1)) == (pool_size - 1))
+    evict = live & (group_id >= group_topk)
+
+    pools = prior_pools.clone()
+    safe_scores = torch.where(pools >= 0, prior_scores, float("-inf"))
+    min_col = safe_scores.argmin(dim=1, keepdim=True)
+    last_pool = pools[:, group_topk - 1 : group_topk]
+    existing_min = pools.gather(1, min_col)
+    pools.scatter_(1, min_col, torch.where(evict[:, None], last_pool, existing_min))
+
+    own_col = group_id.clamp(max=group_topk - 1).unsqueeze(1)
+    replace_val = torch.where(
+        completes,
+        group_id.to(torch.int32),
+        torch.full_like(group_id, -1, dtype=torch.int32),
+    ).unsqueeze(1)
+    existing_col = pools.gather(1, own_col)
+    should_write = (completes | evict).unsqueeze(1)
+    pools.scatter_(1, own_col, torch.where(should_write, replace_val, existing_col))
+    return pools
+
+
+def compact_physical_topk(
+    physical: torch.Tensor,
+    selected_lengths: torch.Tensor,
+    positions: torch.Tensor,
+    *,
+    topk: int = INDEX_TOPK,
+    pool_size: int = INDEX_KPOOL,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fold partial-tail physical slots into ``[0, topk)`` when ``pools[:, -1]`` is a ``-1`` hole.
+
+    ``expand_pooled_topk_to_physical_slots`` places the ``1..pool_size-1`` live partial-group
+    tokens at columns ``topk .. topk + pool_size - 2`` whenever ``group_id >= topk // pool_size``
+    and ``pos % pool_size != pool_size - 1``, leaving four ``-1`` holes at
+    ``topk - pool_size .. topk - 1``. Move those resolved tail slots into the hole prefix and
+    adjust ``selected_lengths`` so sparse MLA attends every valid prior pool plus the live tail.
+    """
+    live = positions >= 0
+    safe_pos = positions.clamp_min(0)
+    group_id = safe_pos // pool_size
+    completes = live & ((safe_pos & (pool_size - 1)) == (pool_size - 1))
+    overflow_tail = live & (group_id >= topk // pool_size) & ~completes
+
+    tail_block = torch.cat(
+        (
+            physical[:, topk : topk + pool_size - 1],
+            torch.full((physical.shape[0], 1), -1, dtype=physical.dtype, device=physical.device),
+        ),
+        dim=1,
+    )
+    last_block = torch.where(overflow_tail[:, None], tail_block, physical[:, topk - pool_size : topk])
+    physical_topk = torch.cat((physical[:, : topk - pool_size], last_block), dim=1).contiguous()
+    lengths = torch.where(overflow_tail, selected_lengths - pool_size, selected_lengths)
+    return physical_topk, lengths
 
 
 class PreparedCompressedIndexer:
@@ -242,6 +321,7 @@ class PreparedCompressedIndexer:
                 name=f"{name}.select" if e - s == tokens else f"{name}.select{s}",
                 workspace=workspace,
                 topk=GROUP_TOPK,
+                scores=scratch.prior_scores[s:e],
                 head_weight_scale=None,
                 hadamard=False,
                 key_power_of_two=False,
@@ -384,7 +464,9 @@ class PreparedCompressedIndexer:
         pool_lengths = torch.where(live, group_id, 0).to(torch.int32)
 
         if len(self.selectors) == 1:
-            prior_pools = self.selectors[0](rotated_q, head_weights, m.token_page_table, pool_lengths, None, cache=self.index_cache)
+            prior_pools, prior_scores = self.selectors[0](
+                rotated_q, head_weights, m.token_page_table, pool_lengths, None, cache=self.index_cache
+            )
         else:
             chunks = [
                 selector(
@@ -397,20 +479,12 @@ class PreparedCompressedIndexer:
                 )
                 for selector, (s, e) in zip(self.selectors, self.slices, strict=True)
             ]
-            prior_pools = torch.cat(chunks, dim=0)
+            prior_pools = torch.cat([c[0] for c in chunks], dim=0)
+            prior_scores = torch.cat([c[1] for c in chunks], dim=0)
 
-        # 4. Keep at most 511 prior groups plus the own group (when completing at pos % 4 == 3)
-        # so expanded selection never exceeds 2048 tokens and matches HYV4FlashCompressedIndexer.
-        pools = prior_pools.clone()
-        own_col = group_id.clamp(max=GROUP_TOPK - 1).unsqueeze(1)
-        replace_val = torch.where(
-            completes,
-            group_id.to(torch.int32),
-            torch.full_like(group_id, -1, dtype=torch.int32),
-        ).unsqueeze(1)
-        existing_col = pools.gather(1, own_col)
-        should_write = (completes | (group_id >= GROUP_TOPK)).unsqueeze(1)
-        pools.scatter_(1, own_col, torch.where(should_write, replace_val, existing_col))
+        # 4. Evict the lowest-scoring prior pool at or past 512 groups and place the own group
+        # (or -1 for an incomplete partial tail) in column 511 so prior pools stay compact.
+        pools = select_c4_pools(prior_pools, prior_scores, pos)
 
         physical = torch.full((tokens, PHYSICAL_WIDTH), -1, dtype=torch.int32, device=device)
         selected_lengths = torch.zeros((tokens,), dtype=torch.int32, device=device)
@@ -424,11 +498,12 @@ class PreparedCompressedIndexer:
             **self.expand_options,
             plan=self.expand_plan,
         )
-        # At most 511 prior groups plus the own group are active, so all valid slots
-        # fit inside the first INDEX_TOPK (2048) columns required by GLM_NSA sparse MLA.
+        # Fold partial-tail physical slots from columns 2048..2050 into the 2044..2047 hole so
+        # all valid slots fit inside the first INDEX_TOPK (2048) columns required by GLM_NSA.
         # Return logical pooled group IDs alongside physical slots so continuation state
         # persists page-table-independent logical token positions for DFly2 reuse.
-        return physical[:, :INDEX_TOPK].contiguous(), selected_lengths, pending_record, pools
+        physical_topk, selected_lengths = compact_physical_topk(physical, selected_lengths, pos)
+        return physical_topk, selected_lengths, pending_record, pools
 
     def commit(
         self,
