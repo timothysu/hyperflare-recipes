@@ -405,6 +405,7 @@ def prepare_rank(
             buffers.update(vision_inputs.buffers(), **vision_prefill.buffers())
 
         speculation = None
+        grammar_exchange = None
         if dfly_active:
             speculation = SimpleNamespace(
                 weights=weights,
@@ -429,6 +430,18 @@ def prepare_rank(
                 offset=torch.zeros(slots, dtype=torch.int64, device=device),
                 generation=torch.zeros(slots, dtype=torch.int64, device=device),
             )
+            if max_verify_w > 1:
+                from hyperflare_recipes.components.grammar_exchange import GrammarExchange
+
+                grammar_exchange = GrammarExchange.allocate(
+                    slots,
+                    verification_width=max_verify_w,
+                    vocab_size=requests.vocab_size,
+                    device=device,
+                    host_allocator=None if core_storage is None else core_storage.host_allocate,
+                )
+                speculation.grammar_exchange = grammar_exchange
+                buffers.update(grammar_exchange.buffers())
 
     scoring = PromptScoring.allocate(
         config,
@@ -687,7 +700,7 @@ def prepare_rank(
         "device": config.devices[0],
         "weights_bytes": weights.allocated_bytes,
         "expert_scale_compression": config.expert_scale_compression,
-        "mapped_host_bytes": 0,
+        "mapped_host_bytes": 0 if grammar_exchange is None else grammar_exchange.mailbox.host_view.nbytes,
         "offloaded_bytes": sum(src.nbytes for pair in tables.sources.values() for src in pair),
         "continuation_bytes": pool.backing.nbytes,
         "state_rows": state_rows,
@@ -735,12 +748,14 @@ def prepare_rank(
             *(() if scoring is None else scoring.zero_ranges()),
             *storage_ranges(disposable),
             *completion.zero_ranges(),
+            *(() if grammar_exchange is None else grammar_exchange.zero_ranges()),
         ),
-        export_events=tables.events(),
+        export_events={**tables.events(), **({} if grammar_exchange is None else grammar_exchange.events())},
         embedding_catalog=tables.resident_catalog(),
         core_data=tables,
         resources=(
             scoring,
+            grammar_exchange,
             weights,
             tables,
             pool,
@@ -760,7 +775,7 @@ def prepare_rank(
             vision_prefill,
             feature_pool,
         ),
-        close_resources=((scoring,) if scoring is not None else ()),
+        close_resources=(*(() if scoring is None else (scoring,)), *(() if grammar_exchange is None else (grammar_exchange,))),
     )
 
 

@@ -732,10 +732,13 @@ class PreparedDFlySpeculativeRound:
         o, b, w = self.owner, self.batch, self.width
         args = (o.requests, o.inputs.row_slot_ids[:b], o.inputs.row_generations[:b], o.inputs.live_rows)
 
+        ge = getattr(o, "grammar_exchange", None) if w > 1 else None
         target = PreparedSpeculativeDistributions(
             self.decoder.scratch.logits.view(b, w, -1),
             *args,
             self.drafts,
+            grammar_masks=None if ge is None else ge.masks,
+            grammar_mask_count=None if ge is None else ge.mask_count,
             workspace=None,
         )
         target.prepare()
@@ -856,6 +859,9 @@ class PreparedDFlySpeculativeRound:
             o.offset.copy_(torch.where(matches.any(1), base + 4 * (w - 1), o.offset))
             o.generation.copy_(torch.where(matches.any(1), o.requests.generation, o.generation))
 
+        ge = getattr(o, "grammar_exchange", None) if w > 1 else None
+        if ge is not None:
+            ge.publish(drafts, slots, active, o.sequence, candidates)
         metadata = Metadata.pack(
             before,
             limits,
@@ -869,6 +875,15 @@ class PreparedDFlySpeculativeRound:
             rotary_offset=rotary_offsets,
         )
         hidden, logits, _, records = self.decoder(metadata)
+        if ge is not None:
+            ge.wait(logits)
+            query_limits = o.inputs.query_lengths[:b]
+            gram_en = o.requests.grammar_enabled[safe] != 0
+            v_limits = torch.where(gram_en, torch.minimum(query_limits, ge.verify_extent[safe]), query_limits)
+            e_limits = torch.where(gram_en, torch.minimum(query_limits, ge.emit_cap[safe]), query_limits)
+            r_limits = torch.where(gram_en, torch.minimum(query_limits, ge.mask_count[safe]), query_limits)
+        else:
+            v_limits = e_limits = r_limits = None
         target_scratch = {
             name: torch.empty(shape, dtype=dtype, device=device)
             for name, (shape, dtype) in target.layout.items()
@@ -886,8 +901,16 @@ class PreparedDFlySpeculativeRound:
             disjoint=True,
             drafts=drafts,
             draft_valid=valid,
+            token_limits=v_limits,
+            real_target_limits=r_limits,
         )
-        committed = commit(logits.view(b, w, -1), acceptance=acceptance, inputs=candidates)
+        committed = commit(
+            logits.view(b, w, -1),
+            acceptance=acceptance,
+            inputs=candidates,
+            token_limits=e_limits,
+            survival_limits=v_limits,
+        )
         counts = committed.emitted_count
         if w > 1:
             self.decoder.commit(counts, records, metadata)
