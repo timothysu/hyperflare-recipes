@@ -185,8 +185,11 @@ class PreparedParallelDraftRound:
             self._prepare_vocabulary_parallel()
             return
         args = (o.requests, o.inputs.row_slot_ids[:b], o.inputs.row_generations[:b], o.inputs.live_rows)
+        ge = getattr(o, "grammar_exchange", None) if w > 1 else None
         target = None if self.proposal_only else PreparedSpeculativeDistributions(
             self.decoder.scratch.logits.view(b, w, -1), *args, self.drafts,
+            grammar_masks=None if ge is None else ge.masks,
+            grammar_mask_count=None if ge is None else ge.mask_count,
             workspace=None
         )
         head = getattr(getattr(o.weights, "draft", None), "markov_head", None)
@@ -445,6 +448,21 @@ class PreparedParallelDraftRound:
             draft_logits, selector_features = result[:2]
             features = result[2] if len(result) == 3 else None
             draft_logits = draft_logits.view(b, -1, draft_logits.shape[-1])
+            ge = getattr(o, "grammar_exchange", None) if w > 1 else None
+            if ge is not None and self.selector is not None and not self.vocabulary_parallel:
+                gram_en = active & (o.requests.grammar_enabled[safe] != 0)
+                tokens = torch.arange(o.requests.vocab_size, device=device)
+                bits = (o.requests.grammar_mask[safe][:, tokens >> 5] >> (tokens & 31)) & 1
+                pos0 = draft_logits[:, o.logit_offset]
+                masked_pos0 = torch.where(
+                    gram_en[:, None] & (bits == 0),
+                    torch.full((), float("-inf"), dtype=pos0.dtype, device=device),
+                    pos0,
+                )
+                draft_logits = torch.cat(
+                    (draft_logits[:, :o.logit_offset], masked_pos0[:, None, :], draft_logits[:, o.logit_offset + 1:]),
+                    dim=1,
+                )
             unary = shortlist_ids = None
             if self.shortlisted_selector is not None:
                 unary, shortlist_ids = self.shortlisted_selector.prepare_shortlists(draft_logits, features=selector_features)
@@ -541,10 +559,22 @@ class PreparedParallelDraftRound:
         active = proposal.active if proposal_valid is None else proposal.active & proposal_valid
         limits = torch.where(active, o.inputs.query_lengths[:b], 0)
         states = o.inputs.request_state_rows[safe, 0]
+        ge = getattr(o, "grammar_exchange", None) if w > 1 else None
+        if ge is not None:
+            ge.publish(proposal.drafts, slots, active, o.sequence, proposal.candidates)
         metadata = Metadata.pack(proposal.before, limits, states, o.inputs.page_tables[safe],
             proposal.candidates, o.inputs.live_rows, token_capacity=self.target_token_capacity,
             sample_count=b * w, max_query_tokens=w, rotary_offset=proposal.rotary_offsets)
         hidden, logits, auxiliary, records = self.decoder(metadata)
+        if ge is not None:
+            ge.wait(logits)
+            query_limits = o.inputs.query_lengths[:b]
+            gram_en = o.requests.grammar_enabled[safe] != 0
+            v_limits = torch.where(gram_en, torch.minimum(query_limits, ge.verify_extent[safe]), query_limits)
+            e_limits = torch.where(gram_en, torch.minimum(query_limits, ge.emit_cap[safe]), query_limits)
+            r_limits = torch.where(gram_en, torch.minimum(query_limits, ge.mask_count[safe]), query_limits)
+        else:
+            v_limits = e_limits = r_limits = None
         if self.vocabulary_parallel:
             target_tile_masses = torch.empty(self.target_mass_shape, dtype=torch.float32, device=logits.device)
             query_limits = o.inputs.query_lengths[:b]
@@ -567,10 +597,12 @@ class PreparedParallelDraftRound:
                               for name, (shape, dtype) in verify.layout.items()}
             target.run(target_scratch, logits.view(b, w, -1), candidates=proposal.drafts)
             acceptance = verify.run(verify_scratch, probabilities, target_scratch["probabilities"],
-                target_scratch["valid"], disjoint=True, drafts=proposal.drafts, draft_valid=proposal.valid)
+                target_scratch["valid"], disjoint=True, drafts=proposal.drafts, draft_valid=proposal.valid,
+                token_limits=v_limits, real_target_limits=r_limits)
         if proposal_valid is not None:
             acceptance.valid.logical_and_(proposal_valid)
-        committed = commit(logits.view(b, w, -1), acceptance=acceptance, inputs=proposal.candidates)
+        committed = commit(logits.view(b, w, -1), acceptance=acceptance, inputs=proposal.candidates,
+            token_limits=e_limits, survival_limits=v_limits)
         counts = committed.emitted_count
         if w > 1:
             self.decoder.commit(counts, records, metadata)

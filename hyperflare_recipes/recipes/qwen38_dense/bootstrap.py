@@ -297,10 +297,23 @@ def prepare(snapshot, config, *, progress=None, core_storage):
             submission_sequence=sequence, **completion.buffers(),
             **({} if not patches else {**vision_inputs.buffers(), **vision_prefill.buffers()}))
         speculation = None
+        grammar_exchange = None
         if config.mtp and config.speculative_round_shapes:
             speculation = SpeculativePreparation(weights, pool, requests, inputs, decode_storage,
                 completion=completion, frame=frame, sequence=sequence, session=session, workspace=arena,
                 verification_width=config.verification_width)
+            if config.verification_width > 1 and config.benchmark_selection is None:
+                from hyperflare_recipes.components.grammar_exchange import GrammarExchange
+
+                grammar_exchange = GrammarExchange.allocate(
+                    slots,
+                    verification_width=config.verification_width,
+                    vocab_size=vocabulary,
+                    device=device,
+                    host_allocator=None if core_storage is None else core_storage.host_allocate,
+                )
+                speculation.grammar_exchange = grammar_exchange
+                buffers.update(grammar_exchange.buffers())
         study_owners = {}
         for study_width in study_widths:
             study_owners[study_width] = SpeculativePreparation(weights, pool, requests, inputs, decode_storage,
@@ -463,7 +476,7 @@ def prepare(snapshot, config, *, progress=None, core_storage):
         torch.cuda.synchronize(device)
     free, total = torch.cuda.mem_get_info(device)
     memory = dict(rank=0, world_size=1, device=config.device, weights_bytes=weights.allocated_bytes,
-        mapped_host_bytes=0, offloaded_bytes=0, continuation_bytes=pool.backing.nbytes, state_rows=state_rows,
+        mapped_host_bytes=0 if grammar_exchange is None else grammar_exchange.mailbox.host_view.nbytes, offloaded_bytes=0, continuation_bytes=pool.backing.nbytes, state_rows=state_rows,
         preparation_state_rows=int(pool.memory_capacity[0].item()),
         preparation_state_bytes=int(pool.memory_capacity[0].item()) * layout.row_bytes,
         pages=pages, page_bytes=page_bytes(weights.config, mtp=config.mtp), page_tokens=PAGE_TOKENS,
@@ -498,14 +511,16 @@ def prepare(snapshot, config, *, progress=None, core_storage):
         benchmark_observers=None if observers is None else observers.observers,
         benchmark_rounds=None if state is None else {name: forward for name, forward in forwards.items()
             if signatures[name].kind == "speculative"},
-        close_resources=(() if scoring is None else (scoring,)),
+        close_resources=(*(() if scoring is None else (scoring,)), *(() if grammar_exchange is None else (grammar_exchange,))),
         graph_resources=(() if observers is None else (observers,)),
+        export_events=None if grammar_exchange is None else grammar_exchange.events(),
         export_zero_ranges=(*(() if scoring is None else scoring.zero_ranges()),
                            *storage_ranges([arena.tensor,
                                             [f.scratch_tensors() for f in forwards.values() if hasattr(f, "scratch_tensors")],
                                             *(() if vision_state is None else (vision_state.arena,))]),
-                           *completion.zero_ranges()),
-        resources=(scoring, weights, pool, requests, inputs, admission, commands, arena, forwards, compiled, stream, graph_pool, session, coordinator,
+                           *completion.zero_ranges(),
+                           *(() if grammar_exchange is None else grammar_exchange.zero_ranges())),
+        resources=(scoring, grammar_exchange, weights, pool, requests, inputs, admission, commands, arena, forwards, compiled, stream, graph_pool, session, coordinator,
                    speculation, studies, observers, vision_state, vision_inputs, vision_prefill, vision_owners))
 
     if studies:

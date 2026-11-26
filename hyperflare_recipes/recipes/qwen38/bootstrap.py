@@ -366,6 +366,7 @@ def _prepare_model(snapshot: Path, config: PreparationConfig | None = None, *, t
         headroom_bytes=config.headroom_bytes, benchmark_storage=core_storage)
     session.__enter__()
     graphs = {}
+    grammar_exchange = None
     try:
         with phase(progress, "Allocate model state"):
             speculative_tokens = 7 if config.mtp else 0
@@ -431,6 +432,18 @@ def _prepare_model(snapshot: Path, config: PreparationConfig | None = None, *, t
                     sampling_workspace=sampling_workspace,
                     verification_width=max(config.speculative_widths), **collectives)
                 buffers.update(speculation.buffers())
+                if has_dflash and max(config.speculative_widths) > 1 and shard.world_size == 1:
+                    from hyperflare_recipes.components.grammar_exchange import GrammarExchange
+
+                    grammar_exchange = GrammarExchange.allocate(
+                        slots,
+                        verification_width=max(config.speculative_widths),
+                        vocab_size=requests.vocab_size,
+                        device=device,
+                        host_allocator=None if core_storage is None else core_storage.host_allocate,
+                    )
+                    speculation.grammar_exchange = grammar_exchange
+                    buffers.update(grammar_exchange.buffers())
         scoring = PromptScoring.allocate(config, device, buffers, frame=frame, group=group, ipc=ipc,
             runtime=collective, coordinator=coordinator)
         graph_modes = serving_modes(config.mtp, config.mtp_only)
@@ -639,6 +652,7 @@ def _prepare_model(snapshot: Path, config: PreparationConfig | None = None, *, t
         session.freeze()
         free, total = device_memory_info(device)
         memory = {"weights_bytes": weights.allocated_bytes, "ngram_request_bytes": table.mailbox.host_view.nbytes,
+            "grammar_exchange_host_bytes": 0 if grammar_exchange is None else grammar_exchange.mailbox.host_view.nbytes,
             "hybrid_state_bytes": state.backing.nbytes, "state_rows": state_rows,
             "preparation_state_bytes": state.backed_slots * layout.row_bytes,
             "preparation_state_rows": state.backed_slots,
@@ -684,7 +698,7 @@ def _prepare_model(snapshot: Path, config: PreparationConfig | None = None, *, t
             server_config.update(speculative_widths=config.speculative_widths,
             speculative_token_capacity=speculative_token_capacity(config.max_active, max(config.speculative_widths), config.speculative_token_capacity),
                 speculative_fixed_width=config.speculative_fixed_width)
-        resources = (scoring, weights, table, session, state, requests, inputs, workspaces, rotary,
+        resources = (scoring, grammar_exchange, weights, table, session, state, requests, inputs, workspaces, rotary,
             cache, final_cache, admission, transfer, features, vision_inputs,
             functions, compiled_functions, decoders, owners, stream, graph_pool, speculation, mtp_weights, draft_weights, draft_head, draft_config, collective, vocabulary_collective, hidden_gather_collective, coordinator)
         report(f"prepared {len(graphs)} graphs with {page_capacity} preparation KV pages")
@@ -701,10 +715,13 @@ def _prepare_model(snapshot: Path, config: PreparationConfig | None = None, *, t
         'draft_head': 'head',
     }, layers=('layers', 'tree.model.language_model.layers')), device=device.index, max_active=config.max_active, graphs=graphs, buffers=buffers, signatures=signatures,
             export_zero_ranges=(*export_zero_ranges, *(() if scoring is None else scoring.zero_ranges()), *completion.zero_ranges(),
-                                *((t.data_ptr(), t.nbytes) for t in table.buffers().values())),
-            export_events=table.events(), core_data=table if rank == 0 else None,
+                                *((t.data_ptr(), t.nbytes) for t in table.buffers().values()),
+                                *(() if grammar_exchange is None else grammar_exchange.zero_ranges())),
+            export_events={**table.events(), **({} if grammar_exchange is None else grammar_exchange.events())},
+            core_data=table if rank == 0 else None,
             resources=resources, server_config=server_config, memory_report=memory, session=session,
-            close_resources=(table, *((scoring,) if scoring is not None else ()),
+            close_resources=(table, *((grammar_exchange,) if grammar_exchange is not None else ()),
+                             *((scoring,) if scoring is not None else ()),
                              *((hidden_gather_collective,) if hidden_gather_collective is not None
                                and hidden_gather_collective is not collective else ()),
                              *((vocabulary_collective, collective) if collective is not None else ())))
@@ -714,4 +731,6 @@ def _prepare_model(snapshot: Path, config: PreparationConfig | None = None, *, t
             graph.reset()
         session.close()
         table.close()
+        if grammar_exchange is not None:
+            grammar_exchange.close()
         raise
