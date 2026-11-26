@@ -33,7 +33,7 @@ class LatentMoEWeights:
     experts: object
     shared: MLPWeights
     combine_norm: torch.Tensor
-    experts_a4_prefill: bool = True
+    experts_a4_prefill: bool = False
 
 
 @weight_container(("mlp", "post_fc2_norm"))
@@ -92,7 +92,7 @@ class ModelWeights:
     embedding: torch.Tensor
     norm: torch.Tensor
     hc_head: dict[str, torch.Tensor]
-    head: torch.Tensor
+    head: object
     layers: tuple[LayerWeights, ...]
     draft: DFlyWeights | None
     vision: dict[str, torch.Tensor] | None
@@ -145,9 +145,12 @@ class ModelWeights:
             online_mxfp8=online_mxfp8,
             online_mxfp8_scope=online_mxfp8_scope,
         ) as loader:
+            quantize_head = online_mxfp8 and online_mxfp8_scope == "all"
             embedding, norm = loader.load_tensors(("model.embed_tokens.weight", "model.norm.weight"))
-            head = loader.load_padded_tensor(
-                "lm_head.weight", rows=shard.padded_partition(VOCABULARY, alignment=64)
+            head_bf16 = loader.load_padded_tensor(
+                "lm_head.weight",
+                rows=shard.padded_partition(VOCABULARY, alignment=64),
+                temporary=quantize_head,
             )
             hc_head = {
                 "fn": loader.load_tensor("model.hc_head.hc_head_fn", dtype=torch.float32),
@@ -156,9 +159,16 @@ class ModelWeights:
             }
             layers = tuple(loader.load_layer(i) for i in range(config.layers))
             draft = loader.load_dfly() if load_dfly else None
+            head: object = mxfp8_draft_head(head_bf16) if quantize_head else head_bf16
             if draft is not None and draft_head_quantization is not None:
-                converters = {"nvfp4": nvfp4_draft_head, "mxfp8": mxfp8_draft_head}
-                draft = replace(draft, draft_head=converters[draft_head_quantization](head))
+                if quantize_head and draft_head_quantization == "mxfp8":
+                    draft_head = head
+                else:
+                    converters = {"nvfp4": nvfp4_draft_head, "mxfp8": mxfp8_draft_head}
+                    draft_head = converters[draft_head_quantization](head_bf16)
+                draft = replace(draft, draft_head=draft_head)
+            if quantize_head:
+                del head_bf16
             vis = loader.load_vision() if load_vision else None
             scale_scratch = loader.scale_scratch
         return cls(
@@ -372,7 +382,7 @@ class Hy4WeightLoader(DirectWeightLoader):
                 intermediate_size=inter_dim,
                 format="nvfp4",
                 activation_mode="a16",
-                a4_prefill=True,
+                a4_prefill=False,
                 swiglu_limit=limit,
                 swiglu_clamp_after_silu=False,
                 scale_compression=self.expert_scale_compression,
@@ -431,7 +441,7 @@ class Hy4WeightLoader(DirectWeightLoader):
                     self._load_opt_mxfp8(f"{p}.mlp.shared_experts.down_proj", allow=allow_dense),
                 ),
                 combine_norm=self.load_tensor(f"{p}.mlp.combine_output_norm.weight"),
-                experts_a4_prefill=True,
+                experts_a4_prefill=False,
             )
 
         residual = {

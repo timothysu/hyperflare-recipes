@@ -208,7 +208,8 @@ class _FunctionalPromptReduction:
 
 class PreparedPromptScoring:
     def __init__(self, source, weight, outputs, frame, *, vocabulary, rank=0,
-                 runtime=None, session, coordinator=None, name, logits_dtype=torch.bfloat16):
+                 runtime=None, session, coordinator=None, name, logits_dtype=torch.bfloat16,
+                 activation_mode="auto"):
         local = weight.shape[0] if isinstance(weight, torch.Tensor) else weight.out_features
         def zeros(shape, dtype):
             return torch.zeros(shape, dtype=dtype, device=source.device)
@@ -218,7 +219,7 @@ class PreparedPromptScoring:
         self.offset = persistent_copy(torch.tensor([rank * local], dtype=torch.int32, device=source.device))
         self.parts = []
         projection_type = UnquantizedProjection if isinstance(weight, torch.Tensor) else QuantizedProjection
-        options = {} if isinstance(weight, torch.Tensor) else dict(activation_mode="auto")
+        options = {} if isinstance(weight, torch.Tensor) else dict(activation_mode=activation_mode)
         for start in range(0, source.shape[0], rows):
             count = min(rows, source.shape[0] - start)
             view = source[start:start + count]
@@ -287,10 +288,10 @@ class PromptScoring:
         return storage_ranges(self.outputs.buffers())
 
     def prepare(self, source, weight, *, vocabulary, session, coordinator, name,
-                logits_dtype=torch.bfloat16):
+                logits_dtype=torch.bfloat16, activation_mode="auto"):
         operation = PreparedPromptScoring(source, weight, self.outputs, self.frame, vocabulary=vocabulary,
             rank=self.rank, runtime=self.runtime, session=session, coordinator=coordinator,
-            name=name, logits_dtype=logits_dtype)
+            name=name, logits_dtype=logits_dtype, activation_mode=activation_mode)
         return operation.functional(session=session)
 
 

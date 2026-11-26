@@ -245,6 +245,9 @@ def prepare_rank(
             online_mxfp8=config.online_mxfp8,
             online_mxfp8_scope=config.online_mxfp8_scope,
         )
+        from ignition.preparation.host_memory import release_page_cache
+
+        release_page_cache(manifest.shard_paths)
         release_unused()
 
     transient = contextlib.ExitStack()
@@ -310,6 +313,9 @@ def prepare_rank(
             (2, slots, VECTOR_TOKENS_FIELD + config.completion_token_capacity),
             device=device,
         )
+        target_logits_dtype = (
+            torch.bfloat16 if not isinstance(weights.head, torch.Tensor) else torch.float32
+        )
         identity_payload = {
             "config": json.loads((metadata_path / "config.json").read_text()),
             "headers": [s.header_sha256 for s in manifest.shards],
@@ -317,11 +323,14 @@ def prepare_rank(
             "contract": "hy4_flash.graph-inputs.v1",
             "vision": weights.vision is not None,
             "draft_head_quantization": config.draft_head_quantization,
+            "experts_a4_prefill": False,
         }
         if config.online_mxfp8:
             identity_payload["online_mxfp8"] = True
             if config.online_mxfp8_scope != "all":
                 identity_payload["online_mxfp8_scope"] = config.online_mxfp8_scope
+            else:
+                identity_payload["target_head_quantization"] = "mxfp8"
         identity = hashlib.sha256(
             json.dumps(identity_payload, sort_keys=True).encode()
         ).hexdigest()
@@ -350,7 +359,13 @@ def prepare_rank(
 
         max_verify_w = max((w for _, w in config.speculative_shapes), default=1) if dfly_active else 1
         prefill_storage = Scratch.allocate(
-            config.prefill_chunk_size, 1, 1, config.prefill_chunk_size, device, shard=shard
+            config.prefill_chunk_size,
+            1,
+            1,
+            config.prefill_chunk_size,
+            device,
+            shard=shard,
+            logits_dtype=target_logits_dtype,
         )
         decode_storage = Scratch.allocate(
             config.decode_tokens,
@@ -360,6 +375,7 @@ def prepare_rank(
             device,
             shard=shard,
             ring_layers=len(weights.config.swa_layers),
+            logits_dtype=target_logits_dtype,
         )
 
         vision_state = vision_inputs = vision_prefill = vision_storage = feature_pool = None
@@ -563,7 +579,7 @@ def prepare_rank(
                     coordinator=None,
                     session=session,
                     name=name,
-                    logits_dtype=torch.float32,
+                    logits_dtype=target_logits_dtype,
                     workspace=arena,
                 )
                 add(name, resume, "resume", capacity, 1, (*row_inputs, "sampling_grammar_mask"), enabled=enabled)

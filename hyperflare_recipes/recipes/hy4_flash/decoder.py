@@ -68,10 +68,12 @@ class Scratch:
         *,
         shard,
         ring_layers: int = 0,
+        logits_dtype: torch.dtype | None = None,
     ) -> Scratch:
         def zeros(*shape, dtype=torch.bfloat16):
             return torch.zeros(shape, dtype=dtype, device=device)
 
+        resolved_logits_dtype = cls.logits_dtype if logits_dtype is None else logits_dtype
         _, local_vocab = shard.padded_partition(VOCABULARY, alignment=64)
         ring_staging = (
             zeros(
@@ -96,8 +98,8 @@ class Scratch:
             moe=MoEScratch.allocate(tokens, device),
             collapsed=zeros(samples, HIDDEN_SIZE),
             hidden=zeros(samples, HIDDEN_SIZE),
-            local_logits=zeros(samples, local_vocab, dtype=cls.logits_dtype),
-            logits=zeros(samples, VOCABULARY, dtype=cls.logits_dtype),
+            local_logits=zeros(samples, local_vocab, dtype=resolved_logits_dtype),
+            logits=zeros(samples, VOCABULARY, dtype=resolved_logits_dtype),
             ring_staging=ring_staging,
         )
 
@@ -473,7 +475,8 @@ class PreparedDecoder:
                 session=session,
                 coordinator=coordinator,
                 name=f"{name}.prompt",
-                logits_dtype=torch.float32,
+                logits_dtype=scratch.logits.dtype,
+                activation_mode="a16" if not isinstance(weights.head, torch.Tensor) else "auto",
             )
         )
         self.head = PreparedVocabularyProjection(

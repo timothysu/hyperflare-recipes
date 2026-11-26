@@ -783,6 +783,7 @@ def test_online_mxfp8_loader_scopes_and_vision_cuda():
         assert isinstance(l0.mlp.mlp.gate_up, MXFP8LinearWeight)
         assert isinstance(l1.mlp.down_proj, MXFP8LinearWeight)
         assert isinstance(l1.mlp.shared.gate_up, MXFP8LinearWeight)
+        assert l1.mlp.experts_a4_prefill is False
         assert isinstance(l1.engram["kv_proj"], MXFP8LinearWeight)
         b0 = vis_mx["blocks"][0]
         assert isinstance(b0["qkv_w"], MXFP8LinearWeight)
@@ -1837,4 +1838,103 @@ def test_multistream_mixed_rotary_offsets_and_interleaved_dead_rows_cuda(tmp_pat
             assert _relative_error(o8_sp[sl], iso_sp[r]) < 0.01
             assert _relative_error(o8_swa[sl], iso_swa[r]) < 0.01
             assert _relative_error(pool.window(2)[r + 1], iso_rings[r]) < 1e-3
+
+
+@torch.no_grad()
+def test_mxfp8_target_head_and_prompt_scoring_cuda():
+    """Verify MXFP8 target lm_head with BF16 logits and A16 prompt-logprob scoring on SM120."""
+    from b12x.gemm._shared.wo_mxfp8 import dequantize_mxfp8_rows_torch
+    from b12x.preparation.types import require_prepared
+    from hyperflare_recipes.components.prompt_logprobs import PromptScoring
+    from hyperflare_recipes.components.vocabulary import PreparedVocabularyProjection, mxfp8_draft_head
+    from hyperflare_recipes.recipes.hy4_flash.config import VOCABULARY
+    from hyperflare_recipes.recipes.hy4_flash.decoder import Scratch
+
+    device = torch.device("cuda:0")
+    shard = TensorParallelShard(0, 1)
+    torch.manual_seed(20261126)
+    head_bf16 = (torch.randn(VOCABULARY, HIDDEN_SIZE, device=device, dtype=torch.float32) * 0.04).to(torch.bfloat16)
+    head_mx = mxfp8_draft_head(head_bf16)
+    head_dequant = dequantize_mxfp8_rows_torch(
+        head_mx.weight.values, head_mx.weight.scale_rows
+    )[:, : head_mx.in_features].float()
+
+    scratch_v = Scratch.allocate(6, 1, 6, 6, device, shard=shard, logits_dtype=torch.bfloat16)
+    assert scratch_v.local_logits.dtype == torch.bfloat16
+    assert scratch_v.logits.dtype == torch.bfloat16
+
+    h_verify = (torch.randn(6, HIDDEN_SIZE, device=device, dtype=torch.float32) * 0.5).to(torch.bfloat16)
+    h_prompt = (torch.randn(64, HIDDEN_SIZE, device=device, dtype=torch.float32) * 0.5).to(torch.bfloat16)
+    frame = torch.zeros(1, dtype=torch.int32, device=device)
+    scoring = PromptScoring(64, device, frame=frame)
+    targets = torch.randint(0, VOCABULARY, (64,), dtype=torch.int32, device=device)
+    scoring.outputs.targets.copy_(targets)
+
+    arena = ScratchArena(device)
+    with RecordedPreparationSession(
+        device=device, checkpoint="hy4-mxfp8-head-unit", workload_schema="mxfp8-head", numerical_policy="default"
+    ) as session:
+        session.register_scratch(arena)
+        vocab_proj = PreparedVocabularyProjection(
+            scratch_v.hidden,
+            head_mx,
+            scratch_v.local_logits,
+            scratch_v.logits,
+            runtime=None,
+            coordinator=None,
+            session=session,
+            name="target_head",
+            workspace=arena,
+        ).functional(session=session)
+        prompt_op = scoring.prepare(
+            h_prompt,
+            head_mx,
+            vocabulary=VOCABULARY,
+            session=session,
+            coordinator=None,
+            name="target_prompt",
+            logits_dtype=torch.bfloat16,
+            activation_mode="a16",
+        )
+        session.tune()
+
+        # Verify both target generation and T=64 prompt scoring prepared in A16 mode (not A8).
+        for proj, src in ((vocab_proj.projection, h_verify), (prompt_op.parts[0][2], h_prompt)):
+            state = require_prepared(proj.plan, "gemm.blockscaled_precision", device)
+            if hasattr(state, "resolve"):
+                state = state.resolve(src)
+            assert state.config.mode == "a16", state.config.mode
+
+        # Verify generation logits (BF16 output, A16 activation mode) against dequantized MXFP8 and BF16 refs.
+        logits = vocab_proj(h_verify)
+        assert logits.dtype == torch.bfloat16 and logits.shape == (6, VOCABULARY)
+        assert torch.isfinite(logits).all()
+        ref_v_mx = F.linear(h_verify.float(), head_dequant)
+        ref_v_bf16 = F.linear(h_verify.float(), head_bf16.float())
+        assert _relative_error(logits, ref_v_mx) < 0.008
+        assert _relative_error(logits, ref_v_bf16) < 0.035
+        p_ref = F.softmax(ref_v_bf16, dim=-1)
+        kl = float((p_ref * (F.log_softmax(ref_v_bf16, dim=-1) - F.log_softmax(logits.float(), dim=-1))).sum(-1).mean())
+        assert kl < 0.005
+        assert torch.equal(logits.argmax(dim=-1), ref_v_mx.argmax(dim=-1))
+
+        # Verify blocked prompt scoring at T=64 against exact dequantized MXFP8 log-softmax.
+        prompt_op(h_prompt)
+        torch.cuda.synchronize(device)
+        out = scoring.outputs.values[0]
+        assert torch.equal(out[:, 0], targets)
+        actual_lp = out[:, 1].view(torch.float32)
+        actual_top1_id = out[:, 3]
+        actual_top1_lp = out[:, 4].view(torch.float32)
+        assert torch.isfinite(actual_lp).all() and torch.isfinite(actual_top1_lp).all()
+
+        ref_p_mx = F.log_softmax(F.linear(h_prompt.float(), head_dequant), dim=-1)
+        ref_target_lp = ref_p_mx[torch.arange(64, device=device), targets.long()]
+        ref_top1_lp, ref_top1_id = ref_p_mx.max(dim=-1)
+        assert float((actual_lp - ref_target_lp).abs().max()) < 0.02
+        assert float((actual_top1_lp - ref_top1_lp).abs().max()) < 0.02
+        # Every selected top-1 token must match the FP32 dequantized maximum within BF16 logit rounding.
+        actual_top1_ref_lp = ref_p_mx[torch.arange(64, device=device), actual_top1_id.long()]
+        assert float((ref_top1_lp - actual_top1_ref_lp).abs().max()) < 0.02
+
 
