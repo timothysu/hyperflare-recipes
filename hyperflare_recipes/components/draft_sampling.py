@@ -225,7 +225,7 @@ def _draft_score_values(Logits, Bias, Histogram, Candidates, Slots, Params, Gram
         score = tl.where(count > 0, adjusted, score)
         score = score - (count > 0).to(tl.float32) * presence - count.to(tl.float32) * frequency
     score = tl.math.div_rn(score, tl.where(temperature > 0, temperature, 1.))
-    if tl.load(GrammarEnabled + safe) != 0:
+    if PREFIX == 0 and tl.load(GrammarEnabled + safe) != 0:
         word = tl.load(GrammarMask + safe * mask_stride + token // 32, mask=inside, other=0)
         score = tl.where(((word >> (token % 32)) & 1) != 0, score, -float("inf"))
     return token, inside, score

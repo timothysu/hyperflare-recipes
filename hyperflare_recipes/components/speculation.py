@@ -549,7 +549,7 @@ class PreparedStochasticVerification:
             self.broadcast.functional(session=session)
         return self
 
-    def run(self, scratch, draft_probs, target_probs, target_valid, *, drafts=None, draft_valid=None, disjoint=False, slots=None, generations=None, live_rows=None, token_limits=None):
+    def run(self, scratch, draft_probs, target_probs, target_valid, *, drafts=None, draft_valid=None, disjoint=False, slots=None, generations=None, live_rows=None, token_limits=None, real_target_limits=None):
         if not self._prepared:
             raise RuntimeError("chain verification requires prepare() before capture")
         functional = getattr(self, "_functional", False)
@@ -573,11 +573,13 @@ class PreparedStochasticVerification:
             valid &= ((drafts >= 0) & (drafts < self.state.vocab_size)).all(-1)
             ids = drafts
         else:
-            target_used = columns[None, :] < token_limits[:, None]
+            real_target_limits = token_limits if real_target_limits is None else real_target_limits
+            target_used = columns[None, :] < real_target_limits[:, None]
             draft_used = columns[None, :-1] < token_limits[:, None] - 1
             valid = live & (draft_valid | ~draft_used).all(-1) & (target_valid | ~target_used).all(-1)
             valid &= (((drafts >= 0) & (drafts < self.state.vocab_size)) | ~draft_used).all(-1)
             valid &= (token_limits >= 1) & (token_limits <= target_probs.shape[1])
+            valid &= (real_target_limits >= (token_limits - 1).clamp_min(1)) & (real_target_limits <= token_limits)
             draft_probs = torch.where(draft_used[:, :, None], draft_probs, dummy)
             target_probs = torch.where(target_used[:, :, None], target_probs, dummy)
             ids = torch.where(draft_used, drafts, 0)
@@ -588,10 +590,11 @@ class PreparedStochasticVerification:
             valid &= (entries & torch.isfinite(mass) & ((mass - 1).abs() <= 1e-4)).all(-1)
         out.valid.copy_(valid)
         if disjoint or functional:
+            target_mask_limits = token_limits if real_target_limits is None else real_target_limits
             self.probability_masks[0].run_disjoint(draft_source, scratch["safe_draft_probs"],
                 out.valid, token_limits, dummy)
             self.probability_masks[1].run_disjoint(target_source, scratch["safe_target_probs"],
-                out.valid, token_limits, dummy)
+                out.valid, target_mask_limits, dummy)
         else:
             if token_limits is not None:
                 for mask in self.probability_masks:
@@ -615,15 +618,19 @@ class PreparedStochasticVerification:
             # tail. Only the real prefix belongs to the commit contract.
             out.offered_drafts.copy_((token_limits - 1).clamp(0, drafts.shape[1]))
             accepted = torch.minimum(accepted, out.offered_drafts)
+        if drafts.shape[1]:
+            indices = scratch["safe_ids"].long().unsqueeze(-1)
+            draft = scratch["safe_draft_probs"].gather(-1, indices).squeeze(-1)
+            target = scratch["safe_target_probs"][:, :-1].gather(-1, indices).squeeze(-1)
+            zero_accepted = ((columns[None, :-1] < accepted[:, None]) & (target <= 0)).any(-1)
+            valid = valid & ~zero_accepted
+            out.valid.copy_(valid)
         out.token_ids.copy_(tokens)
         out.accepted_drafts.copy_(torch.where(valid, accepted, 0))
         out.proposed_count.copy_(torch.where(valid, accepted + 1, 0))
         out.rng_increment.copy_(torch.where(valid, self.draw_reservation, 0))
         out.token_ids.masked_fill_(~valid[:, None], -1)
         if drafts.shape[1]:
-            indices = scratch["safe_ids"].long().unsqueeze(-1)
-            draft = scratch["safe_draft_probs"].gather(-1, indices).squeeze(-1)
-            target = scratch["safe_target_probs"][:, :-1].gather(-1, indices).squeeze(-1)
             ratio = torch.where(draft > 0, (target / draft).clamp(max=1.), (target > 0).float())
             # Serial products preserve monotonicity despite FP32 rounding at unit ratios.
             prefixes = [ratio[:, 0]]
@@ -764,7 +771,7 @@ class PreparedSpeculativeStateCommit:
         return self
 
     def __call__(self, logits=None, *, acceptance=None, inputs=None, copy_offered_mask=None,
-                 slots=None, generations=None, live_rows=None, token_limits=None):
+                 slots=None, generations=None, live_rows=None, token_limits=None, survival_limits=None):
         functional = getattr(self, "_functional", False)
         state = self.state
         slots = self.slots if slots is None else slots
@@ -899,8 +906,9 @@ class PreparedSpeculativeStateCommit:
         owned, source = owner >= 0, owner.clamp_min(0)
         if survival_output is not None:
             logical = torch.minimum(offered, (remaining - 1).clamp_min(0))
-            if token_limits is not None:
-                logical = torch.minimum(logical, (token_limits[row] - 1).clamp_min(0))
+            survival_bound = token_limits if survival_limits is None else survival_limits
+            if survival_bound is not None:
+                logical = torch.minimum(logical, (survival_bound[row] - 1).clamp_min(0))
             extent = torch.minimum(logical, torch.where(emitted > emitted_drafts, logical, emitted_drafts))
             observed = owned[:, None] & live[source, None] & (survival_columns < extent[source, None])
             values = torch.cat((acceptance.survival[row][source],
