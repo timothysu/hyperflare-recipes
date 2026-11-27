@@ -247,6 +247,9 @@ class PreparedDFlyLayer:
         ).functional(session=session)
 
         absorb_w, expand_w, batched_cls = split_kv_b_weights(a["kv_b"], SPARSE_HEADS)
+        from hyperflare_recipes.components.linear import BatchedUnquantizedProjection
+
+        self._batched_unquantized = batched_cls is BatchedUnquantizedProjection
         self.query_absorption = batched_cls(
             scratch.q_raw[:, :, :QK_NOPE_HEAD_DIM].transpose(0, 1),
             absorb_w,
@@ -371,9 +374,9 @@ class PreparedDFlyLayer:
         normed = self.input_norm(hidden)
         projected = self.qkv_a(normed)
         base_end = Q_LORA_RANK + KV_LORA_RANK + QK_ROPE_HEAD_DIM
-        q_resid = self.q_norm(projected[:, :Q_LORA_RANK].contiguous())
-        kv_nope = self.kv_norm(projected[:, Q_LORA_RANK : Q_LORA_RANK + KV_LORA_RANK].contiguous())
-        k_rope = projected[:, Q_LORA_RANK + KV_LORA_RANK : base_end].contiguous()
+        q_resid = self.q_norm(projected[:, :Q_LORA_RANK])
+        kv_nope = self.kv_norm(projected[:, Q_LORA_RANK : Q_LORA_RANK + KV_LORA_RANK])
+        k_rope = projected[:, Q_LORA_RANK + KV_LORA_RANK : base_end]
         gate = projected[:, base_end : base_end + SPARSE_HEADS * V_HEAD_DIM] if self.fused_gate else None
 
         q_raw = self.q_b(q_resid).view(tokens, SPARSE_HEADS, QK_HEAD_DIM)
@@ -381,8 +384,16 @@ class PreparedDFlyLayer:
         q_rope = self.rotary.apply(q_rope, cos, sin)
         k_rope = self.rotary.apply(k_rope, cos, sin)
 
-        q_abs_nope = self.query_absorption(q_nope.transpose(0, 1).contiguous()).transpose(0, 1)
-        q_absorbed = torch.cat((q_abs_nope, q_rope), dim=-1).contiguous()
+        if self._batched_unquantized:
+            q_absorbed = torch.empty((tokens, SPARSE_HEADS, SWA_RECORD_WIDTH), dtype=dtype, device=hidden.device)
+            q_absorbed[:, :, KV_LORA_RANK:].copy_(q_rope)
+            self.query_absorption(
+                q_nope.transpose(0, 1),
+                output=q_absorbed[:, :, :KV_LORA_RANK].transpose(0, 1),
+            )
+        else:
+            q_abs_nope = self.query_absorption(q_nope.transpose(0, 1).contiguous()).transpose(0, 1)
+            q_absorbed = torch.cat((q_abs_nope, q_rope), dim=-1).contiguous()
 
         # 1. Sparse history attention over the reused target KV cache (no target mutation).
         out_hist, lse_hist = self.history_attention(
@@ -403,7 +414,8 @@ class PreparedDFlyLayer:
         # 3. Exact 3-way LogSumExp combine of target history, causal draft block, and learnable sink.
         attended = combine_three_way_lse(out_hist, lse_hist, out_blk, lse_blk, self.sink, selected_lengths)
 
-        expanded = self.value_expansion(attended.transpose(0, 1).contiguous()).transpose(0, 1).reshape(tokens, -1)
+        attended_t = attended.transpose(0, 1) if self._batched_unquantized else attended.transpose(0, 1).contiguous()
+        expanded = self.value_expansion(attended_t).transpose(0, 1).reshape(tokens, -1)
         if gate is None:
             gate = self.gate_proj(normed)
         gated = (expanded * torch.sigmoid(gate)).contiguous()
@@ -621,12 +633,14 @@ class PreparedDFlyDraft:
         cos, sin = self.rotary.cos_sin(rope_pos, indexed=True, dtype=embeds.dtype)
 
         visible = torch.where(active[:, None], before[:, None].clamp_min(0), 0).expand(b, w).reshape(-1).to(torch.int32)
+        all_slots = resolve_logical_slots(
+            saved_logical.reshape(b, -1), page_tables, active
+        ).view(b, len(self.layers), self.topk)
+        all_sel_len = (all_slots >= 0).sum(dim=-1, dtype=torch.int32)  # [B, 5]
         hidden = embeds
         for d, layer in enumerate(self.layers):
-            layer_slots = resolve_logical_slots(saved_logical[:, d, :], page_tables, active)
-            sel_len = (layer_slots >= 0).sum(dim=-1, dtype=torch.int32)  # [B]
-            slots_rep = layer_slots[:, None, :].expand(b, w, self.topk).reshape(b * w, self.topk).contiguous()
-            len_rep = sel_len[:, None].expand(b, w).reshape(b * w).contiguous()
+            slots_rep = all_slots[:, d, None, :].expand(b, w, self.topk).reshape(b * w, self.topk).contiguous()
+            len_rep = all_sel_len[:, d, None].expand(b, w).reshape(b * w).contiguous()
             hidden = layer(hidden, cos, sin, slots_rep, visible, len_rep, self.causal_mask)
 
         return self.final_norm(hidden).view(b, w, HIDDEN_SIZE)

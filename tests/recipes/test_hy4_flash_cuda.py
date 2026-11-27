@@ -777,9 +777,11 @@ def test_online_mxfp8_loader_scopes_and_vision_cuda():
         l1 = loader.load_layer(1)
         vis_mx = loader.load_vision()
         assert isinstance(l0.attention["qkv_a"], MXFP8LinearWeight)
+        assert l0.attention["fused_gate"] is True
         assert isinstance(l0.attention["kv_b"], torch.Tensor)
         assert l0.attention["fused_indexer_projs"] is False
-        assert isinstance(l0.indexer["token_key_projection"], torch.Tensor)
+        assert isinstance(l0.indexer["token_key_head_weight_proj"], torch.Tensor)
+        assert l0.indexer["token_key_head_weight_proj"].shape == (144, 3072)
         assert isinstance(l0.mlp.mlp.gate_up, MXFP8LinearWeight)
         assert isinstance(l1.mlp.down_proj, MXFP8LinearWeight)
         assert isinstance(l1.mlp.shared.gate_up, MXFP8LinearWeight)

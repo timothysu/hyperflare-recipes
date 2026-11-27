@@ -411,11 +411,17 @@ def test_hy4_export_geometry_passes_native_bootstrap_validation(tmp_path, langua
     if not (snapshot / "tokenizer.json").is_file() or not (snapshot / "chat_template.jinja").is_file():
         pytest.skip(f"Hy4-flash snapshot assets not present at {snapshot}")
 
+    from dataclasses import replace
+
     cfg = ModelConfig.load(snapshot)
+    params = replace(
+        RECIPE.parameters,
+        vision=replace(RECIPE.parameters.vision, language_model_only=language_model_only),
+    )
     config, contract, manifest = _recipe_metadata(
         "hy4_flash",
         all_variants=False,
-        config_options=dict(language_model_only=language_model_only),
+        config_options=dict(parameters=params),
     )
     fe = prepare_frontend(
         snapshot,

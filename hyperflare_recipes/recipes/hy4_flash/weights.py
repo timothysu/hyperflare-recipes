@@ -12,8 +12,9 @@ import torch
 
 from hyperflare_recipes.components.vocabulary import mxfp8_draft_head, nvfp4_draft_head
 from hyperflare_recipes.components.weights import DirectWeightLoader, MLPWeights, quantize_bf16_linear_as_mxfp8
-from ignition.preparation.persistent import allocated_tensor_bytes, persistent_cat, persistent_copy
+from ignition.preparation.persistent import allocated_tensor_bytes, persistent_cat, persistent_copy, persistent_empty, persistent_zeros
 from ignition.preparation.rebuild_manifest import weight_container
+from ignition.preparation.tensor_metadata import record_numeric_tensor
 
 from .config import (
     ENGRAM_HEADS,
@@ -236,8 +237,83 @@ class Hy4WeightLoader(DirectWeightLoader):
             and tensor.shape[0] % 8 == 0
         )
 
+    def _load_mxfp8_mixed_group(self, prefixes: Sequence[str]):
+        """Pack BF16 (quantized online) and stored MXFP8 rows into one MXFP8 weight without requantizing stored MXFP8."""
+        from b12x.gemm._shared.wo_mxfp8 import quantize_mxfp8_rows_torch
+        from b12x.gemm.blockscaled._linear import (
+            MXFP8LinearWeight,
+            MXFP8Rows,
+            pack_mxfp8_scales_for_dense_gemm,
+        )
+
+        prefixes = tuple(prefixes)
+        cols = int(self._sources[f"{prefixes[0]}.weight"].shape[1])
+        total_rows = sum(int(self._sources[f"{p}.weight"].shape[0]) for p in prefixes)
+        padded_cols = (cols + 127) // 128 * 128
+        padded_scale_k = padded_cols // 32
+        values = (persistent_empty if cols == padded_cols else persistent_zeros)(
+            (total_rows, padded_cols), dtype=torch.float8_e4m3fn, device=self.device
+        )
+        scales = torch.full((total_rows, padded_scale_k), 127, dtype=torch.uint8, device=self.device)
+        offset = 0
+        for p in prefixes:
+            fmt = self.linear_format(p)
+            src_w = self._sources[f"{p}.weight"]
+            rows = int(src_w.shape[0])
+            if int(src_w.shape[1]) != cols:
+                raise ValueError(f"{p}: packed MXFP8 projections must share input width")
+            if fmt == "bfloat16":
+                w_bf16 = self.load_linear(p, temporary=True)
+                if not bool(torch.isfinite(w_bf16).all()):
+                    raise ValueError(f"{p}: MXFP8 conversion requires finite BF16 weights")
+                source = w_bf16 if cols == padded_cols else torch.nn.functional.pad(w_bf16, (0, padded_cols - cols))
+                q = quantize_mxfp8_rows_torch(source, retain_scale_rows=True)
+                values[offset : offset + rows].copy_(q.values)
+                scales[offset : offset + rows].copy_(q.scale_rows.reshape(rows, padded_scale_k).view(torch.uint8))
+                del w_bf16, source, q
+            elif fmt == "mxfp8":
+                src_s = self._sources[f"{p}.weight_scale"]
+                if src_w.ndim != 2 or src_w.dtype != torch.float8_e4m3fn:
+                    raise ValueError(f"{p}: MXFP8 weight must be a float8_e4m3fn matrix")
+                if (
+                    src_s.ndim != 2
+                    or src_s.dtype not in (torch.uint8, torch.float8_e8m0fnu)
+                    or src_s.shape[0] < rows
+                    or src_s.shape[1] < cols // 32
+                ):
+                    raise ValueError(f"{p}: MXFP8 block scale geometry mismatch")
+                self._copy(values[offset : offset + rows, :cols], src_w, numeric=False)
+                self._copy(
+                    scales[offset : offset + rows, : cols // 32],
+                    src_s[:rows, : cols // 32].view(torch.uint8),
+                    numeric=False,
+                )
+                self._session.flush()
+            else:
+                raise ValueError(f"{p}: unsupported format {fmt!r} in mixed MXFP8 group")
+            offset += rows
+        scale_mma = pack_mxfp8_scales_for_dense_gemm(
+            scales.view(torch.float8_e8m0fnu),
+            m=total_rows,
+            k=padded_cols,
+            num_groups=1,
+            allocate=persistent_empty,
+        )
+        del scales
+        record_numeric_tensor(values)
+        record_numeric_tensor(scale_mma)
+        return MXFP8LinearWeight(
+            weight=MXFP8Rows(values=values, scale_rows=None, scale_mma=scale_mma),
+            in_features=cols,
+            padded_in_features=padded_cols,
+            out_features=total_rows,
+        )
+
     def _load_opt_mxfp8(self, prefix: str, *, allow: bool):
-        if allow and self.linear_format(prefix) == "bfloat16":
+        fmt = self.linear_format(prefix)
+        if fmt == "mxfp8":
+            return self._load_mxfp8_mixed_group((prefix,))
+        if allow and fmt == "bfloat16":
             src = self._sources[f"{prefix}.weight"]
             if src.ndim == 2 and src.shape[1] % 32 == 0 and src.shape[0] % 8 == 0:
                 weight = self.load_linear(prefix, temporary=True)
@@ -245,13 +321,23 @@ class Hy4WeightLoader(DirectWeightLoader):
         return self.load_linear(prefix)
 
     def _load_opt_mxfp8_group(self, prefixes: Sequence[str], *, allow: bool):
-        if allow and self._same_linear_format(prefixes) and self.linear_format(prefixes[0]) == "bfloat16":
-            rows = sum(self._sources[f"{p}.weight"].shape[0] for p in prefixes)
-            cols = self._sources[f"{prefixes[0]}.weight"].shape[1]
-            if cols % 32 == 0 and rows % 8 == 0:
-                weight = self.load_linear_group(tuple(prefixes), temporary=True)
-                return quantize_bf16_linear_as_mxfp8(weight, retain_scale_rows=False)
-        return self.load_linear_group(tuple(prefixes))
+        prefixes = tuple(prefixes)
+        formats = tuple(self.linear_format(p) for p in prefixes)
+        if all(f == "mxfp8" for f in formats):
+            return self._load_mxfp8_mixed_group(prefixes)
+        if allow and all(f in ("bfloat16", "mxfp8") for f in formats):
+            cols = int(self._sources[f"{prefixes[0]}.weight"].shape[1])
+            rows = sum(int(self._sources[f"{p}.weight"].shape[0]) for p in prefixes)
+            if (
+                cols % 32 == 0
+                and rows % 8 == 0
+                and all(int(self._sources[f"{p}.weight"].shape[1]) == cols for p in prefixes)
+            ):
+                if all(f == "bfloat16" for f in formats):
+                    weight = self.load_linear_group(prefixes, temporary=True)
+                    return quantize_bf16_linear_as_mxfp8(weight, retain_scale_rows=False)
+                return self._load_mxfp8_mixed_group(prefixes)
+        return self.load_linear_group(prefixes)
 
     def _selected_names(self) -> set[str]:
         selected = set()
@@ -294,8 +380,15 @@ class Hy4WeightLoader(DirectWeightLoader):
     ) -> dict:
         group = [f"{prefix}.q_a_proj", f"{prefix}.kv_a_proj_with_mqa"]
         fused_gate = False
-        if fuse_gate and self._same_linear_format((*group, f"{prefix}.linear_gate")):
-            group.append(f"{prefix}.linear_gate")
+        gate_prefix = f"{prefix}.linear_gate"
+        if fuse_gate and (
+            self._same_linear_format((*group, gate_prefix))
+            or (
+                allow_mxfp8
+                and all(self.linear_format(p) in ("bfloat16", "mxfp8") for p in (*group, gate_prefix))
+            )
+        ):
+            group.append(gate_prefix)
             fused_gate = True
         fused_indexer = False
         if indexer_prefix is not None and not allow_mxfp8:
@@ -323,10 +416,14 @@ class Hy4WeightLoader(DirectWeightLoader):
     def _load_indexer(self, prefix: str, *, fused_inputs: bool = False) -> dict:
         kv_w = self.load_tensor(f"{prefix}.key_value_projection.weight", temporary=True).float()
         kg_w = self.load_tensor(f"{prefix}.key_gate_projection.weight", temporary=True).float()
+        tk_prefix = f"{prefix}.token_key_projection"
+        hw_prefix = f"{prefix}.head_weight_projection"
+        pack_idx = not fused_inputs and self._same_linear_format((tk_prefix, hw_prefix))
         return {
             "query_projection": self.load_linear(f"{prefix}.query_projection"),
-            "head_weight_projection": None if fused_inputs else self.load_linear(f"{prefix}.head_weight_projection"),
-            "token_key_projection": None if fused_inputs else self.load_linear(f"{prefix}.token_key_projection"),
+            "token_key_head_weight_proj": self.load_linear_group((tk_prefix, hw_prefix)) if pack_idx else None,
+            "head_weight_projection": None if (fused_inputs or pack_idx) else self.load_linear(hw_prefix),
+            "token_key_projection": None if (fused_inputs or pack_idx) else self.load_linear(tk_prefix),
             "token_key_norm": self.load_tensor(f"{prefix}.token_key_norm.weight"),
             "key_vg_projection": persistent_cat((kv_w, kg_w), dim=0),
             "intra_group_ape": persistent_copy(

@@ -108,17 +108,23 @@ def expand_pooled_topk_to_logical_tokens(
     live = positions >= 0
     safe_pos = positions.clamp_min(0)
     raw_valid = live[:, None] & (pools >= 0)
-    # Compact valid pools into the leading columns so the partial tail never overwrites a valid pool.
-    order = raw_valid.to(torch.int64).argsort(dim=1, descending=True, stable=True)
-    compacted_pools = pools.gather(1, order)
-    valid_pool = raw_valid.gather(1, order)
+    # Compact valid pools into the leading columns via a collision-free prefix-sum bijection
+    # (preserving exact left-to-right order without radix argsort) so the partial tail never
+    # overwrites a valid pool.
+    valid_i64 = raw_valid.to(torch.int64)
+    num_valid_pools = valid_i64.sum(dim=1)
+    valid_dest = valid_i64.cumsum(dim=1) - 1
+    invalid_dest = num_valid_pools[:, None] + (1 - valid_i64).cumsum(dim=1) - 1
+    dest = torch.where(raw_valid, valid_dest, invalid_dest)
+    compacted_pools = torch.empty_like(pools)
+    compacted_pools.scatter_(1, dest, torch.where(raw_valid, pools, -1))
+    valid_pool = torch.arange(pools.shape[1], dtype=torch.int64, device=device)[None, :] < num_valid_pools[:, None]
     offsets = torch.arange(pool_size, dtype=torch.int32, device=device)[None, None, :]
     pool_tokens = torch.where(
         valid_pool[:, :, None],
         compacted_pools[:, :, None].to(torch.int32) * pool_size + offsets,
         -1,
     ).reshape(tokens, -1)[:, :width]
-    num_valid_pools = valid_pool.sum(dim=1, dtype=torch.int64)
     seq_len = safe_pos + 1
     tail_start = (seq_len // pool_size) * pool_size
     tail_len = seq_len - tail_start
@@ -259,9 +265,22 @@ class PreparedCompressedIndexer:
             workspace=workspace,
             activation_mode="auto",
         ).functional(session=session)
+        self.token_key_head_weight_proj = (
+            None
+            if weights.get("token_key_head_weight_proj") is None
+            else prepare_projection(
+                source,
+                weights["token_key_head_weight_proj"],
+                torch.zeros((tokens, INDEX_HEAD_DIM + INDEX_HEADS), dtype=source.dtype, device=device),
+                session=session,
+                name=f"{name}.token_key_head_weight",
+                workspace=workspace,
+                activation_mode="auto",
+            ).functional(session=session)
+        )
         self.head_weight_projection = (
             None
-            if weights.get("head_weight_projection") is None
+            if self.token_key_head_weight_proj is not None or weights.get("head_weight_projection") is None
             else prepare_projection(
                 source,
                 weights["head_weight_projection"],
@@ -274,7 +293,7 @@ class PreparedCompressedIndexer:
         )
         self.token_key_projection = (
             None
-            if weights.get("token_key_projection") is None
+            if self.token_key_head_weight_proj is not None or weights.get("token_key_projection") is None
             else prepare_projection(
                 source,
                 weights["token_key_projection"],
@@ -389,9 +408,13 @@ class PreparedCompressedIndexer:
         dtype = source.dtype
 
         # 1. Project & normalize per-token keys and gather partial-group state.
+        if token_keys_raw is None and head_weights_raw is None and self.token_key_head_weight_proj is not None:
+            packed_idx = self.token_key_head_weight_proj(source)
+            token_keys_raw = packed_idx[:, :INDEX_HEAD_DIM]
+            head_weights_raw = packed_idx[:, INDEX_HEAD_DIM : INDEX_HEAD_DIM + INDEX_HEADS]
         if token_keys_raw is None:
             token_keys_raw = self.token_key_projection(source)
-        token_keys = self.token_key_norm(token_keys_raw.contiguous())  # [T, 128] BF16
+        token_keys = self.token_key_norm(token_keys_raw)  # [T, 128] BF16 (PreparedRMSNorm accepts strided rows)
         pending_keys = torch.zeros((rows, INDEX_KPOOL - 1, INDEX_HEAD_DIM), dtype=dtype, device=device)
         pending_pos = torch.zeros((rows, 3), dtype=torch.int64, device=device)
         gather_rows(self.pending_keys_region, m.state_rows, pending_keys)
