@@ -1,0 +1,13 @@
+{
+  "source": {
+    "repository": "nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4",
+    "revision": "ae1368329b1fc76b71534c5d04b87b35d9cc6e15",
+    "filename": "chat_template.jinja"
+  },
+  "source_sha256": "1369e90b19976f99ce2070eb21ade8fcb4af640f008e14e82af5c5e89a9cc816",
+  "result_sha256": "f23cbf60741845f89f2fba8b0d32db1f79c0da01b8db7b3bef1bd28f49c36f9f",
+  "insertions": [
+    8054,
+    12699
+  ]
+}

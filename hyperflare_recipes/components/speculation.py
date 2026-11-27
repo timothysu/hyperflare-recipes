@@ -107,10 +107,10 @@ def _selected_row(Slots, Generations, Generation, live_rows, row, CAPACITY: tl.c
 @triton.jit
 def _target_scores_finish(
     BlockMax, Candidates, Slots, Generations, LiveRows, Generation, Status, TopK,
-    Params, GrammarEnabled, GrammarMaskCount, Maximum, Valid, PackedTopK, PackedTopP,
+    Params, GrammarEnabled, GrammarMaskCount, TokenLimits, Maximum, Valid, PackedTopK, PackedTopP,
     candidate_stride, CAPACITY: tl.constexpr, BATCH: tl.constexpr, WIDTH: tl.constexpr,
     V: tl.constexpr, PREFIX_OFFSET: tl.constexpr, MAX_PREFIX: tl.constexpr,
-    HAS_3D_GRAMMAR: tl.constexpr, GRAMMAR_ROWS: tl.constexpr,
+    HAS_3D_GRAMMAR: tl.constexpr, GRAMMAR_ROWS: tl.constexpr, HAS_TOKEN_LIMITS: tl.constexpr,
     BLOCKS: tl.constexpr, BLOCK_COUNT: tl.constexpr, RUNNING_STATE: tl.constexpr,
 ):
     pid0 = tl.program_id(0)
@@ -135,6 +135,8 @@ def _target_scores_finish(
             prefix_valid &= (cand >= 0) & (cand < V)
     finite = (maximum == maximum) & (tl.abs(maximum) < float("inf"))
     valid = live & prefix_valid & finite
+    if HAS_TOKEN_LIMITS:
+        valid &= col < tl.load(TokenLimits + row)
     gram_en = tl.load(GrammarEnabled + safe) != 0
     if HAS_3D_GRAMMAR:
         cnt = tl.load(GrammarMaskCount + safe)
@@ -263,7 +265,7 @@ class PreparedSpeculativeDistributions:
             top_p_workspace=((probability_filter_workspace_size(batch * width, vocab),), torch.uint8))
 
     def __init__(self, logits, requests, slots, generations, live_rows, candidate_prefix_ids,
-                 *, prefix_offset=0, grammar_masks=None, grammar_mask_count=None, workspace=None):
+                 *, prefix_offset=0, grammar_masks=None, grammar_mask_count=None, token_limits=None, workspace=None):
         batch, width, vocab = logits.shape
         _geometry(batch, width)
         device = logits.device
@@ -277,6 +279,10 @@ class PreparedSpeculativeDistributions:
             raise ValueError("prefix_offset must keep every conditional prefix within candidate IDs")
         self.logits, self.state, self.slots, self.generations, self.live_rows = logits, requests, slots, generations, live_rows
         self.candidates, self.prefix_offset = candidate_prefix_ids, prefix_offset
+        if token_limits is not None:
+            _tensor(token_limits, (batch,), torch.int32, device, "token_limits")
+        self.token_limits = token_limits
+        self._has_token_limits = token_limits is not None
         if (grammar_masks is None) != (grammar_mask_count is None):
             raise ValueError("conditional grammar masks and counts must be provided together")
         if grammar_masks is not None:
@@ -303,12 +309,15 @@ class PreparedSpeculativeDistributions:
     def prepare_scores(self):
         return self._prepare_scores({name: getattr(self, name) for name in self.layout}, self.logits)
 
-    def _prepare_scores(self, scratch, logits, *, candidates=None, slots=None, generations=None, live_rows=None):
+    def _prepare_scores(self, scratch, logits, *, candidates=None, slots=None, generations=None, live_rows=None, token_limits=None):
         state = self.state
         candidates = self.candidates if candidates is None else candidates
         slots = self.slots if slots is None else slots
         generations = self.generations if generations is None else generations
         live_rows = self.live_rows if live_rows is None else live_rows
+        token_limits = self.token_limits if token_limits is None else token_limits
+        if (token_limits is not None) != self._has_token_limits:
+            raise ValueError("distribution token limits must match the prepared contract")
         if logits.device.type == "cuda":
             batch, width, vocab = logits.shape
             blocks = triton.cdiv(vocab, _SCORE_BLOCK)
@@ -334,11 +343,13 @@ class PreparedSpeculativeDistributions:
                 block_max, candidates, slots, generations, live_rows,
                 state.generation, state.status, state.top_k, state.parameters,
                 state.grammar_enabled, gcount,
+                slots if token_limits is None else token_limits,
                 scratch["maximum"], scratch["valid"],
                 scratch["packed_top_k"], scratch["packed_top_p"],
                 candidates.stride(0), CAPACITY=state.capacity, BATCH=batch,
                 WIDTH=width, V=vocab, PREFIX_OFFSET=self.prefix_offset,
                 MAX_PREFIX=max_prefix, HAS_3D_GRAMMAR=has_3d, GRAMMAR_ROWS=g_rows,
+                HAS_TOKEN_LIMITS=token_limits is not None,
                 BLOCKS=blocks, BLOCK_COUNT=block_count, RUNNING_STATE=RUNNING,
             )
             safe = slots.long().clamp(0, state.capacity - 1)
@@ -373,6 +384,8 @@ class PreparedSpeculativeDistributions:
         scratch["scores"].copy_(torch.where(allowed, scores, -torch.inf))
         scratch["maximum"].copy_(_sliced(scratch["scores"]).amax(-1).amax(-1))
         scratch["valid"].copy_(live[:, None] & prefix_valid & torch.isfinite(scratch["maximum"]))
+        if token_limits is not None:
+            scratch["valid"].logical_and_(columns[None, :] < token_limits[:, None])
         if self.grammar_masks is not None:
             count = self.grammar_mask_count[safe, None]
             scratch["valid"].logical_and_(~state.grammar_enabled[safe, None].bool()
@@ -410,15 +423,15 @@ class PreparedSpeculativeDistributions:
     def functional(self, *, session=None, dynamic_inputs=False):
         self.release_scratch()
         if dynamic_inputs:
-            self.slots = self.generations = self.live_rows = None
+            self.slots = self.generations = self.live_rows = self.token_limits = None
         self.normalization.functional()
         self.candidates = self.rows = self.columns = None
         return self
 
-    def run(self, scratch, logits, *, candidates=None, slots=None, generations=None, live_rows=None):
+    def run(self, scratch, logits, *, candidates=None, slots=None, generations=None, live_rows=None, token_limits=None):
         if not self._prepared:
             raise RuntimeError("probability filtering requires prepare() before capture")
-        _, params = self._prepare_scores(scratch, logits, candidates=candidates, slots=slots, generations=generations, live_rows=live_rows)
+        _, params = self._prepare_scores(scratch, logits, candidates=candidates, slots=slots, generations=generations, live_rows=live_rows, token_limits=token_limits)
         scores, valid = scratch["scores"], scratch["valid"]
         probabilities = scratch["probabilities"]
         if logits.device.type == "cuda":

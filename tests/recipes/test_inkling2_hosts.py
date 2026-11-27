@@ -3,6 +3,7 @@
 
 """Inkling 2 TP4 host placement and channels preserve the local preparation contract."""
 
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -14,6 +15,29 @@ from hyperflare_recipes.recipes.inkling2 import bootstrap, decoder, recipe
 HOSTS = ("hertz", "maxwell", "ampere", "faraday")
 HIDDEN, LOCAL_VOCABULARY, DRAFT_BLOCK = 4608, 201024 // 4, 8
 GEOMETRY = dict(hidden=HIDDEN, local_vocabulary=LOCAL_VOCABULARY, draft_block=DRAFT_BLOCK)
+
+
+def _cfg(**kwargs):
+    params = bootstrap.PreparationConfig().parameters
+    param_updates = {}
+    if "max_active" in kwargs:
+        param_updates["max_concurrency"] = kwargs.pop("max_active")
+    if "prefill_chunk_size" in kwargs:
+        param_updates["prefill_chunk"] = kwargs.pop("prefill_chunk_size")
+    if "roce_ring" in kwargs:
+        param_updates["roce_ring"] = kwargs.pop("roce_ring")
+    if "roce_chain" in kwargs:
+        param_updates["roce_chain"] = kwargs.pop("roce_chain")
+    drafting = kwargs.pop("drafting", None)
+    cap = kwargs.pop("speculative_token_capacity", None)
+    if drafting is not None:
+        param_updates["speculation"] = recipe.RECIPE.speculation if drafting else None
+    if cap is not None:
+        spec = param_updates.get("speculation", params.speculation)
+        param_updates["speculation"] = replace(spec, token_capacity=cap)
+    if param_updates:
+        params = replace(params, **param_updates)
+    return bootstrap.PreparationConfig(parameters=params, **kwargs)
 
 
 def test_four_hosts_may_each_use_their_own_gpu_zero():
@@ -31,11 +55,11 @@ def test_four_hosts_may_each_use_their_own_gpu_zero():
 
 def test_ring_and_chain_need_hosts_in_rank_order():
     with pytest.raises(ValueError, match="--roce-ring"):
-        bootstrap.PreparationConfig(roce_ring=True)
+        _cfg(roce_ring=True)
     with pytest.raises(ValueError, match="exclude each other"):
-        bootstrap.PreparationConfig(devices=(0,) * 4, hosts=HOSTS, roce_ring=True, roce_chain=True)
-    assert bootstrap.PreparationConfig(devices=(0,) * 4, hosts=HOSTS, roce_ring=True).roce_ring
-    assert bootstrap.PreparationConfig(devices=(0,) * 4, hosts=HOSTS, roce_chain=True).roce_chain
+        _cfg(devices=(0,) * 4, hosts=HOSTS, roce_ring=True, roce_chain=True)
+    assert _cfg(devices=(0,) * 4, hosts=HOSTS, roce_ring=True).roce_ring
+    assert _cfg(devices=(0,) * 4, hosts=HOSTS, roce_chain=True).roce_chain
 
 
 def _gb10(count):
@@ -44,9 +68,9 @@ def _gb10(count):
 
 @pytest.mark.parametrize("concurrency, chunk", [(8, 4096), (32, 8192)])
 def test_four_gb10_hosts_fit_the_declared_and_the_largest_configuration(concurrency, chunk):
+    params = replace(recipe.RECIPE.parameters, max_concurrency=concurrency, prefill_chunk=chunk)
     plan = planning.plan(recipe.RECIPE, recipe.RECIPE.checkpoints[0], _gb10(4), selected=(0, 1, 2, 3),
-                         concurrency=concurrency, reserve_bytes=4 << 30, speculation=recipe.RECIPE.speculation,
-                         prefill_chunk=chunk)
+                         parameters=params, reserve_bytes=4 << 30)
     assert plan.fits and plan.world_size == 4
     assert (plan.concurrency, plan.prefill_chunk, plan.speculative_token_capacity) == (concurrency, chunk, 128)
     assert plan.guaranteed_tokens >= planning.MINIMUM_REQUEST_TOKENS
@@ -55,22 +79,23 @@ def test_four_gb10_hosts_fit_the_declared_and_the_largest_configuration(concurre
 def test_request_capacity_is_bounded_by_thirty_two():
     from ignition.errors import UsageError
 
-    assert bootstrap.PreparationConfig(max_active=32, prefill_chunk_size=8192).max_active == 32
+    assert _cfg(max_active=32, prefill_chunk_size=8192).max_active == 32
     with pytest.raises(ValueError, match=r"\[1, 32\]"):
-        bootstrap.PreparationConfig(max_active=33)
+        _cfg(max_active=33)
     with pytest.raises(UsageError, match="must be 1 through 32"):
+        params = replace(recipe.RECIPE.parameters, max_concurrency=33)
         planning.plan(recipe.RECIPE, recipe.RECIPE.checkpoints[0], _gb10(4), selected=(0, 1, 2, 3),
-                      concurrency=33, reserve_bytes=4 << 30, speculation=recipe.RECIPE.speculation)
+                      parameters=params, reserve_bytes=4 << 30)
 
 
 def test_thirty_two_requests_size_rounds_scratch_rows_and_prefill_graphs():
-    default_eight = bootstrap.PreparationConfig(max_active=8)
-    legacy_eight = bootstrap.PreparationConfig(max_active=8, speculative_token_capacity=64)
+    default_eight = _cfg(max_active=8)
+    legacy_eight = _cfg(max_active=8, speculative_token_capacity=64)
     # At concurrency 8, 8 * 8 = 64 <= 128, so the 128-token default preserves the exact 8-request graph catalog.
     assert default_eight.speculative_round_shapes == legacy_eight.speculative_round_shapes
     assert (default_eight.decode_tokens, default_eight.decode_samples) == (64, 64)
 
-    config = bootstrap.PreparationConfig(max_active=32, prefill_chunk_size=8192)
+    config = _cfg(max_active=32, prefill_chunk_size=8192)
     shapes = config.speculative_round_shapes
     assert {batch for batch, _, _ in shapes} == {1, 2, 4, 8, 16, 32}
     assert all(packed <= 128 for _, _, packed in shapes) and (32, 8, 128) in shapes and (32, 1, 32) in shapes
@@ -86,8 +111,8 @@ def test_recipe_dispatches_the_complete_plan_to_the_rank_group(monkeypatch, remo
     from ignition.preparation import rank_group
 
     ring = ring and remote
-    plan = planning.fit(recipe.RECIPE, recipe.RECIPE.checkpoints[0], _gb10(4), concurrency=8,
-                        reserve_bytes=4 << 30, speculation=recipe.RECIPE.speculation, roce_ring=ring)
+    params = replace(recipe.RECIPE.parameters, max_concurrency=8, roce_ring=ring, multi_host=remote)
+    plan = planning.fit(recipe.RECIPE, recipe.RECIPE.checkpoints[0], _gb10(4), parameters=params, reserve_bytes=4 << 30)
     ranks = SimpleNamespace(hosts=HOSTS) if remote else None
     calls, result, storage = [], object(), object()
     monkeypatch.setattr(rank_group, "prepare_group", lambda *args, **kwargs: calls.append((args, kwargs)) or result)
@@ -105,7 +130,7 @@ def test_recipe_dispatches_the_complete_plan_to_the_rank_group(monkeypatch, remo
 
 
 def test_remote_capacities_follow_thirty_two_requests_and_8192_token_chunks(monkeypatch):
-    config = bootstrap.PreparationConfig(devices=(0,) * 4, hosts=HOSTS, max_active=32, prefill_chunk_size=8192)
+    config = _cfg(devices=(0,) * 4, hosts=HOSTS, max_active=32, prefill_chunk_size=8192)
     calls = []
     monkeypatch.setattr(bootstrap, "create_roce_runtime", lambda group, device, **kwargs: calls.append(kwargs))
     bootstrap._collective_runtimes(config, None, None, coordinator=SimpleNamespace(spans_hosts=True),
@@ -123,8 +148,7 @@ def test_remote_channels_share_one_roce_runtime_without_pcie(monkeypatch, drafti
     from hyperflare_recipes.components.vocabulary_logprobs import _SUMMARY
     from hyperflare_recipes.components.vocabulary_sampling import SUMMARY_WORDS
 
-    config = bootstrap.PreparationConfig(devices=(0,) * 4, hosts=HOSTS, max_active=8, drafting=drafting,
-                                         roce_chain=chain)
+    config = _cfg(devices=(0,) * 4, hosts=HOSTS, max_active=8, drafting=drafting, roce_chain=chain)
     calls, runtime, storage = [], object(), object()
     monkeypatch.setattr(bootstrap, "create_roce_runtime",
                         lambda group, device, **kwargs: calls.append(kwargs) or runtime)
@@ -156,7 +180,7 @@ def test_remote_channels_share_one_roce_runtime_without_pcie(monkeypatch, drafti
 
 @pytest.mark.parametrize("drafting", [False, True])
 def test_local_channels_are_unchanged(monkeypatch, drafting):
-    config = bootstrap.PreparationConfig(max_active=8, drafting=drafting, collective_tuning="runtime")
+    config = _cfg(max_active=8, drafting=drafting)
     gathers, reductions = [], []
     monkeypatch.setattr(bootstrap, "create_all_gather_runtime",
                         lambda group, device, **kwargs: gathers.append(kwargs) or object())
@@ -169,8 +193,7 @@ def test_local_channels_are_unchanged(monkeypatch, drafting):
         coordinator=SimpleNamespace(spans_hosts=False), core_storage=SimpleNamespace(peer_storage=ipc), **GEOMETRY)
     present = [channel for channel in channels if channel is not None]
     assert len(present) == (4 if drafting else 2) and len({id(channel) for channel in present}) == len(present)
-    assert reductions == [dict(max_tokens=1024, hidden_size=HIDDEN, element_bytes=4, ipc=ipc,
-                               collective_tuning="runtime")]
+    assert reductions == [dict(max_tokens=1024, hidden_size=HIDDEN, element_bytes=4, ipc=ipc)]
     samples = config.decode_samples
     assert gathers[0] == dict(max_rows=max(samples, 8), columns=2 * 201024, ipc=ipc)
     assert gathers[1:] == ([dict(max_rows=samples, columns=64 * 4, ipc=ipc),

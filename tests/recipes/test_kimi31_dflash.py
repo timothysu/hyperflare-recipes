@@ -67,15 +67,20 @@ def test_sharded_draft_preserves_target_pages(world, draft_tokens):
 
 @pytest.mark.parametrize("embedded", [False, True])
 def test_preparation_selects_dflash_without_loading_inferact(monkeypatch, tmp_path, embedded):
+    from ignition import planning
     from hyperflare_recipes.recipes import resolve
     from hyperflare_recipes.recipes.kimi31.dflash_config import REPOSITORY, REVISION
-    from .test_declarations import fitted
 
     model = resolve("kimi-k3.1-pro")
-    plan = fitted(model, 16, concurrency=4,
-                  online_mxfp8=model.recipe.online_mxfp8,
-                  online_mxfp8_scope=model.recipe.online_mxfp8_scope,
-                  speculation=replace(model.recipe.speculation, method="dflash2"))
+    devices = tuple(planning.Gpu(index, "NVIDIA RTX PRO 6000 Blackwell", f"GPU-{index}", 96 << 30, 95 << 30, (12, 0))
+                    for index in range(16))
+    params = replace(
+        model.recipe.parameters,
+        max_concurrency=4,
+        online_mxfp8=replace(model.recipe.parameters.online_mxfp8, enabled=True),
+        speculation=replace(model.recipe.speculation, method="dflash2"),
+    )
+    plan = planning.fit(model.recipe, model.checkpoint, devices, parameters=params, reserve_bytes=0)
     # An available DSpark must not shadow the explicitly selected DFlash checkpoint.
     (tmp_path / "dspark").mkdir()
     if embedded:
@@ -102,14 +107,25 @@ def test_preparation_selects_dflash_without_loading_inferact(monkeypatch, tmp_pa
 def test_dflash_body_and_head_precision_reach_config_and_rebuild_metadata(
         monkeypatch, tmp_path, online, scope):
     from google.protobuf import json_format
+    from ignition import planning
     from ignition.preparation import rebuild_manifest, runtime_core_pb2 as proto
     from hyperflare_recipes.recipes import resolve
-    from .test_declarations import fitted
 
     model = resolve("kimi-k3.1-pro")
-    plan = fitted(model, 16, concurrency=4, online_mxfp8=online, online_mxfp8_scope=scope,
-        speculation=replace(model.recipe.speculation, method="dflash2",
-                            draft_body_quantization="mxfp8", draft_head_quantization="nvfp4"))
+    devices = tuple(planning.Gpu(index, "NVIDIA RTX PRO 6000 Blackwell", f"GPU-{index}", 96 << 30, 95 << 30, (12, 0))
+                    for index in range(16))
+    params = replace(
+        model.recipe.parameters,
+        max_concurrency=4,
+        online_mxfp8=replace(model.recipe.parameters.online_mxfp8, enabled=online, scope=scope),
+        speculation=replace(model.recipe.speculation, method="dflash2"),
+        draft_quantization=replace(
+            model.recipe.parameters.draft_quantization,
+            draft_body_quantization="mxfp8",
+            draft_head_quantization="nvfp4",
+        ),
+    )
+    plan = planning.fit(model.recipe, model.checkpoint, devices, parameters=params, reserve_bytes=0)
     (tmp_path / "dflash2").mkdir()
     monkeypatch.setattr("ignition.preparation.rank_group.prepare_group",
                         lambda snapshot, config, prepare, **kwargs: config)
@@ -119,11 +135,12 @@ def test_dflash_body_and_head_precision_reach_config_and_rebuild_metadata(
     assert prepared.draft_body_quantization == "mxfp8"
     assert prepared.draft_head_quantization == "nvfp4"
     manifest = rebuild_manifest.from_plan(SimpleNamespace(directory=None), plan, compiled_forwards=True)
-    encoded = proto.RebuildManifest()
+    encoded = proto.PreparationManifest()
     json_format.ParseDict(manifest, encoded)
-    assert encoded.speculation.draft_body_quantization == "mxfp8"
-    assert encoded.speculation.draft_head_quantization == "nvfp4"
-    assert encoded.online_mxfp8_scope == (scope or "all")
+    values = {p.key: p.value for p in encoded.parameters}
+    assert values["speculation.draft_body_quantization"].string_value == "mxfp8"
+    assert values["speculation.draft_head_quantization"].string_value == "nvfp4"
+    assert values["online_mxfp8_scope"].string_value == (scope or "all")
 
 
 @pytest.mark.parametrize("change", [dict(is_causal=False),dict(mla_use_nope=True),dict(sliding_window=1000),

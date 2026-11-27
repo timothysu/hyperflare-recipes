@@ -99,7 +99,7 @@ def rank_main(rank, world, rendezvous, options):
         with RecordedPreparationSession(device=device, checkpoint=str(checkpoint),
                 workload_schema=f"dflash-mla-tp{world}", numerical_policy="a16-fp8-kv",
                 coordinator=coordinator, compile_workers=16,
-                benchmark_storage=storage, collective_tuning="static") as session:
+                benchmark_storage=storage) as session:
             arena = ScratchArena(device)
             session.register_scratch(arena)
             scratch = DraftScratch.allocate(config, shard, batch*block, block, device, GraphBufferPool(device))

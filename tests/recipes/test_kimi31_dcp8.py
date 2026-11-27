@@ -2,6 +2,7 @@
 
 """Hybrid TP16/DCP8 planning and context geometry preserve the DCP16 default."""
 
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -12,6 +13,7 @@ import torch
 
 from ignition import planning
 from ignition.errors import UsageError
+from hyperflare_recipes.parameters import HybridContextParallelParameters
 from hyperflare_recipes.recipes.kimi3.bootstrap import PreparationConfig, target_tuning_identity
 from hyperflare_recipes.recipes.kimi3.dcp import ContextShards
 from ignition.preparation.collectives import CollectivePreparation
@@ -25,32 +27,39 @@ def _gpu(index):
 
 def test_plan_supports_only_hybrid_dcp8_and_preserves_dcp16_default():
     gpus = tuple(_gpu(index) for index in range(16))
-    default = planning.fit(RECIPE, RECIPE.checkpoints[0], gpus,
-                           concurrency=4, reserve_bytes=0, speculation=None)
-    dcp8 = planning.fit(RECIPE, RECIPE.checkpoints[0], gpus,
-                        concurrency=4, reserve_bytes=0, speculation=None, context_parallel_size=8)
-    assert default.context_parallel_size is None and default.page_tokens == 2048
+    base = replace(RECIPE.parameters, max_concurrency=4, speculation=None)
+    default = planning.fit(RECIPE, RECIPE.checkpoints[0], gpus, parameters=base, reserve_bytes=0)
+    dcp8_params = replace(base, context_parallel=replace(base.context_parallel, size=8))
+    dcp8 = planning.fit(RECIPE, RECIPE.checkpoints[0], gpus, parameters=dcp8_params, reserve_bytes=0)
+    assert default.parameters.context_parallel.size is None and default.page_tokens == 2048
     assert default.to_dict()["context_parallel_size"] == 16
-    assert dcp8.world_size == 16 and dcp8.context_parallel_size == 8 and dcp8.page_tokens == 1024
+    assert dcp8.world_size == 16 and dcp8.parameters.context_parallel.size == 8 and dcp8.page_tokens == 1024
     assert dcp8.to_dict()["context_parallel_size"] == 8
     assert dcp8.context == 1048576 and dcp8.tokens > 1048576
     assert dcp8.pages - default.pages == 64
+    with pytest.raises(UsageError, match="supported values"):
+        bad = replace(base, context_parallel=replace(base.context_parallel, size=2))
+        planning.fit(RECIPE, RECIPE.checkpoints[0], gpus, parameters=bad, reserve_bytes=0)
     with pytest.raises(UsageError, match="hybrid context parallelism"):
-        planning.fit(RECIPE, RECIPE.checkpoints[0], gpus,
-                     concurrency=4, reserve_bytes=0, speculation=None, context_parallel_size=4)
+        bad_topo = replace(base, context_parallel=replace(base.context_parallel, size=4, hybrid_topologies=((16, 8),)))
+        planning.fit(RECIPE, RECIPE.checkpoints[0], gpus, parameters=bad_topo, reserve_bytes=0)
 
 
 def test_preparation_pages_and_tuning_identity_follow_dcp_size():
+    base = PreparationConfig().parameters
     dcp16 = PreparationConfig(context=1048576)
-    dcp8 = PreparationConfig(context=1048576, context_parallel_size=8)
+    dcp8 = PreparationConfig(
+        context=1048576,
+        parameters=replace(base, context_parallel=HybridContextParallelParameters(size=8)),
+    )
     assert dcp16.page_tokens == 2048 and dcp16.preparation_pages == 10
     assert dcp8.page_tokens == 1024 and dcp8.preparation_pages == 12
     config = SimpleNamespace(text={}, vision=False)
     legacy = target_tuning_identity(config, [], 16)
     assert target_tuning_identity(config, [], 16, context_parallel_size=16) == legacy
     assert target_tuning_identity(config, [], 16, context_parallel_size=8) != legacy
-    with pytest.raises(ValueError, match="DCP8 or DCP16"):
-        PreparationConfig(context_parallel_size=4)
+    with pytest.raises(ValueError, match="DCP4, DCP8 or DCP16"):
+        PreparationConfig(parameters=replace(base, context_parallel=HybridContextParallelParameters(size=2)))
 
 
 @pytest.mark.parametrize("dcp_size", [None, 8, 16])
@@ -61,13 +70,19 @@ def test_rebuild_manifest_preserves_context_group_size(monkeypatch, dcp_size):
     from ignition.preparation import source_identity
 
     monkeypatch.setattr(source_identity, "source_identity", lambda: "test-source-identity")
+    params = replace(
+        RECIPE.parameters,
+        max_concurrency=4,
+        speculation=None,
+        context_parallel=replace(RECIPE.parameters.context_parallel, size=dcp_size),
+    )
     plan = planning.fit(RECIPE, RECIPE.checkpoints[0], tuple(_gpu(index) for index in range(16)),
-        concurrency=4, reserve_bytes=0, speculation=None, context_parallel_size=dcp_size)
+        parameters=params, reserve_bytes=0)
     manifest = ParseDict(from_plan(SimpleNamespace(directory=None), plan, compiled_forwards=True),
-                         proto.RebuildManifest())
-    restored = proto.RebuildManifest.FromString(manifest.SerializeToString())
-    assert restored.context_parallel_size == (dcp_size or plan.world_size)
-    assert proto.RebuildManifest().context_parallel_size == 0
+                         proto.PreparationManifest())
+    restored = proto.PreparationManifest.FromString(manifest.SerializeToString())
+    values = {p.key: p.value for p in restored.parameters}
+    assert values["context_parallel_size"].uint_value == (dcp_size or plan.world_size)
 
 
 @pytest.mark.parametrize("dcp_size", [8, 16])
@@ -84,8 +99,14 @@ def test_benchmark_configuration_records_context_group_size(monkeypatch, tmp_pat
         def __exit__(self, *args):
             pass
 
+    params = replace(
+        RECIPE.parameters,
+        max_concurrency=4,
+        speculation=None,
+        context_parallel=replace(RECIPE.parameters.context_parallel, size=dcp_size),
+    )
     plan = planning.fit(RECIPE, RECIPE.checkpoints[0], tuple(_gpu(index) for index in range(16)),
-        concurrency=4, reserve_bytes=0, speculation=None, context_parallel_size=dcp_size)
+        parameters=params, reserve_bytes=0)
     tokenizer = Tokenizer(models.WordLevel())
     prepared = Resource(memory_report={"rank": 0, "tuning": {"selections": []}},
         server_config={"assets": {"tokenizer": {"text": tokenizer.to_str()}}})
@@ -104,12 +125,21 @@ def test_benchmark_configuration_records_context_group_size(monkeypatch, tmp_pat
 
 
 def test_dcp8_reduction_capacity_covers_packed_selected_ids_not_hidden_activations():
-    config = PreparationConfig(context_parallel_size=8, draft_checkpoint=Path("draft"),
-        speculative_token_capacity=32, speculative_graph_budget=16)
+    base = PreparationConfig().parameters
+    config = PreparationConfig(
+        parameters=replace(
+            base,
+            context_parallel=HybridContextParallelParameters(size=8),
+            speculation=replace(base.speculation, token_capacity=32, graph_budget=16),
+        ),
+        draft_checkpoint=Path("draft"),
+    )
     assert config.decode_tokens == 32
     assert config.dcp_reduction_elements * 2 == 32 * 2048 * 4 * 2 == 512 * 1024
     assert config.dcp_reduction_elements * 2 < 1024 * 7168 * 2
-    assert PreparationConfig(context_parallel_size=8).dcp_reduction_elements >= 8
+    assert PreparationConfig(
+        parameters=replace(base, context_parallel=HybridContextParallelParameters(size=8))
+    ).dcp_reduction_elements >= 8
 
 
 def test_dcp8_context_shards_use_group_local_rank():

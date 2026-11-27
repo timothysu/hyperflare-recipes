@@ -129,31 +129,49 @@ def test_recipe_layout_bytes_match_declared_rank_costs(tmp_path):
     assert RECIPE.costs(1, None).state_row_bytes == _PLAIN_STATE_ROW_BYTES
     assert RECIPE.costs(1, RECIPE.speculation).state_row_bytes == _DFLY_STATE_ROW_BYTES
     assert RECIPE.costs(1, RECIPE.speculation).page_bytes == _PAGE_BYTES
-    assert RECIPE.draft_head_quantizations == ("nvfp4", "mxfp8")
-    assert RECIPE.online_mxfp8 is True
-    assert RECIPE.online_mxfp8_scope == "all"
-    assert RECIPE.online_mxfp8_scopes == ("all", "draft")
+    assert RECIPE.parameters.draft_quantization.draft_head_choices == ("nvfp4", "mxfp8")
+    assert RECIPE.parameters.online_mxfp8.enabled is True
+    assert RECIPE.parameters.online_mxfp8.effective_scope == "all"
+    assert RECIPE.parameters.online_mxfp8.supported_scopes == ("all", "draft")
     assert resolve("hy4-flash-nvfp4").recipe is RECIPE
 
 
 def test_draft_head_quantization_config_validation():
+    from dataclasses import replace
     from hyperflare_recipes.recipes.hy4_flash.bootstrap import PreparationConfig
 
+    base = RECIPE.parameters
     for fmt in (None, "nvfp4", "mxfp8"):
-        cfg = PreparationConfig(draft_head_quantization=fmt)
+        cfg = PreparationConfig(
+            parameters=replace(base, draft_quantization=replace(base.draft_quantization, draft_head_quantization=fmt))
+        )
         assert cfg.draft_head_quantization == fmt
     with pytest.raises(ValueError, match="draft head quantization"):
-        PreparationConfig(draft_head_quantization="fp8")
+        PreparationConfig(
+            parameters=replace(base, draft_quantization=replace(base.draft_quantization, draft_head_quantization="fp8"))
+        )
     with pytest.raises(ValueError, match="--draft-head-quantization requires"):
-        PreparationConfig(dfly=False, draft_head_quantization="nvfp4")
+        PreparationConfig(
+            parameters=replace(
+                base,
+                speculation=None,
+                draft_quantization=replace(base.draft_quantization, draft_head_quantization="nvfp4"),
+            )
+        )
 
     for scope in ("all", "draft"):
-        cfg = PreparationConfig(online_mxfp8=True, online_mxfp8_scope=scope)
+        cfg = PreparationConfig(
+            parameters=replace(base, online_mxfp8=replace(base.online_mxfp8, enabled=True, scope=scope))
+        )
         assert cfg.online_mxfp8 is True and cfg.online_mxfp8_scope == scope
     with pytest.raises(ValueError, match="online MXFP8 scope"):
-        PreparationConfig(online_mxfp8=True, online_mxfp8_scope="other")
+        PreparationConfig(
+            parameters=replace(base, online_mxfp8=replace(base.online_mxfp8, enabled=True, scope="other"))
+        )
     with pytest.raises(ValueError, match="--online-mxfp8-scope requires"):
-        PreparationConfig(online_mxfp8=False, online_mxfp8_scope="draft")
+        PreparationConfig(
+            parameters=replace(base, online_mxfp8=replace(base.online_mxfp8, enabled=False, scope="draft"))
+        )
 
 
 def test_ihc_matches_reference_fp32_hyper_connection():

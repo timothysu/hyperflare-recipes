@@ -21,7 +21,7 @@ HUB = Path.home() / ".cache/huggingface/hub"
 def test_declarations_import_without_model_dependencies():
     result = subprocess.run(
         [sys.executable, "-c", "import sys; from hyperflare_recipes.recipes import aliases; from ignition import planning;"
-         " import ignition.cli.preparation; assert aliases() == ('qwen3.8-flash', 'qwen3.8-27b', 'qwen3.8-27b-qad', 'glm-5.3-flash', 'glm-5.3-flash-nvfp4', 'deepseek-v4.1-flash', 'deepseek-v4-flash', 'mimo-v2.6-pro-mopd', 'mimo-v2.6-flash-rl', 'kimi-k3-mxfp4-csf', 'kimi-k3', 'kimi-k3-dspark', 'kimi-k3.1-pro', 'step5-preview-nvfp4', 'nemotron-bolt-24gb', 'minimax-m3-1-flash', 'gemma-4-e2b', 'gemma-4-e4b', 'gemma-4-12b', 'gemma-4-26b-a4b', 'gemma-4-31b', 'gemma-4-e4b-nvfp4', 'gemma-4-12b-nvfp4', 'gemma-4-26b-a4b-nvfp4', 'gemma-4-31b-nvfp4', 'muse-spark-open-nvfp4', 'inkling-2-mini', 'inkling-2-small-nvfp4', 'hy4-flash-nvfp4');"
+         " import ignition.cli.preparation; assert aliases() == ('qwen3.8-flash', 'qwen3.8-27b', 'qwen3.8-27b-qad', 'glm-5.3-flash', 'glm-5.3-flash-nvfp4', 'deepseek-v4.1-flash', 'deepseek-v4-flash', 'mimo-v2.6-pro-mopd', 'mimo-v2.6-flash-rl', 'kimi-k3-mxfp4-csf', 'kimi-k3', 'kimi-k3-dspark', 'kimi-k3.1-pro', 'step5-preview-nvfp4', 'nemotron-bolt-24gb', 'nemotron-3.5-super-vl-nvfp4', 'minimax-m3-1-flash', 'gemma-4-e2b', 'gemma-4-e4b', 'gemma-4-12b', 'gemma-4-26b-a4b', 'gemma-4-31b', 'gemma-4-e4b-nvfp4', 'gemma-4-12b-nvfp4', 'gemma-4-26b-a4b-nvfp4', 'gemma-4-31b-nvfp4', 'muse-spark-open-nvfp4', 'inkling-2-mini', 'inkling-2-small-nvfp4', 'hy4-flash-nvfp4');"
          " assert not {'torch', 'transformers', 'flare_heliopause'} & set(sys.modules)"],
         cwd=ROOT, check=False, capture_output=True, text=True)
     assert result.returncode == 0, result.stderr

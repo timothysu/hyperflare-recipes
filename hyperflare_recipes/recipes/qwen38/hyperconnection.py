@@ -212,7 +212,8 @@ class PreparedHyperconnection:
             "eps": following.eps, "zero_centered": False, "weight_dtype": "float32",
             "output_mode": "provided"}))
         arguments = (priming_state, self.scratch.block_input, self.scratch.injection_logits,
-                     following.norm_gain, self.scratch.gate_workspace, following.scratch.normalized)
+                     following.norm_gain, self.scratch.gate_workspace,
+                     following.scratch.normalized[:self.tokens])
         kwargs = {"eps": following.eps}
         declare(session, (plan.request(name=name,
             prepare_call=lambda state: PreparedCall(run=lambda: state.launch(*arguments, **kwargs)),
@@ -245,10 +246,12 @@ class PreparedHyperconnection:
         return self.gate(bottleneck, normalized), injection
 
     def combine_runtime(self, residual, block_output, injection):
-        return hc.run_combine(residual, block_output, injection, plan=self.plans["combine"], out=residual)
+        combined = torch.empty_like(residual)
+        return hc.run_combine(residual, block_output, injection, plan=self.plans["combine"], out=combined)
 
     def combine_norm_runtime(self, residual, block_output, injection):
+        combined = torch.empty_like(residual)
         normalized = torch.empty_like(residual)
         return hc.run_combine_norm(residual, block_output, injection, self.following.norm_gain,
             eps=self.following.eps, zero_centered=False, plan=self.plans["combine_norm"],
-            out=(residual, normalized))
+            out=(combined, normalized))

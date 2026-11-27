@@ -32,8 +32,11 @@ def prepare(signatures, buffers, pool, *, vocabulary, image_slots=0):
                for name, tensor in pool.pages.items()]
     graphs = c.graph_contracts(signatures, inputs, continuation=continuation, pending=pending, cursor=cursor)
     if vision:
+        prefill_kinds = (p.PREFILL, p.SCORED_PREFILL) + (
+            (p.TERMINAL_PREFILL,) if hasattr(p, "TERMINAL_PREFILL") else ()
+        )
         missing = [graph["graph"] for graph in graphs
-                   if graph["kind"] in (p.PREFILL, p.SCORED_PREFILL)
+                   if graph["kind"] in prefill_kinds
                    and not any(value["source"] == p.PROMPT_POSITION for value in graph["inputs"])]
         if missing:
             raise ValueError("three-axis prefill graphs must bind prompt positions: " + ", ".join(missing))

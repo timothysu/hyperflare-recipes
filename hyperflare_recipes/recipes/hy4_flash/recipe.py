@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 from types import MappingProxyType
 
@@ -15,7 +15,21 @@ from ignition.declaration import (
     RankUsage,
     Recipe,
     SamplingDefaults,
-    Speculation,
+)
+from ignition.parameters import (
+    PromptLogprobsParameters,
+    RecipeParameters,
+    SpeculationParameters,
+    VisionParameters,
+)
+from ignition.preparation.bootstrap import common_preparation_kwargs
+
+from hyperflare_recipes.parameters import (
+    DraftQuantizationParameters,
+    ExpertScaleCompressionParameters,
+    NativeDenseActivationsParameters,
+    OnlineMXFP8Parameters,
+    StreamOverlapParameters,
 )
 
 # 12 sparse indexed layers x (256 * 656 B GLM_NSA latent + 64 * 132 B C4 index) per 256-token page.
@@ -30,6 +44,24 @@ _DFLY_STATE_ROW_BYTES = 19_871_488
 _GRAPH_BYTES = 3 << 30
 _VISION_BYTES = 933 << 20
 _VISION_SLOT_BYTES = 16384 * 3072 * 2
+
+
+@dataclass(frozen=True)
+class Hy4FlashParameters(RecipeParameters):
+    """Preparation parameters for Hy4-flash."""
+
+    native_dense_activations: NativeDenseActivationsParameters = NativeDenseActivationsParameters()
+    stream_overlap: StreamOverlapParameters = StreamOverlapParameters()
+    expert_scale_compression: ExpertScaleCompressionParameters = ExpertScaleCompressionParameters(encoding="csf")
+    online_mxfp8: OnlineMXFP8Parameters = OnlineMXFP8Parameters(
+        enabled=True,
+        default_scope="all",
+        supported_scopes=("all", "draft"),
+        inherit_dflash2_draft_body=False,
+    )
+    draft_quantization: DraftQuantizationParameters = DraftQuantizationParameters(
+        draft_head_choices=("nvfp4", "mxfp8"),
+    )
 
 
 def prepare(
@@ -49,45 +81,15 @@ def prepare(
     if plan.world_size != 1 or ranks is not None:
         raise ValueError("Hy4-flash recipe requires TP=1 on a single host")
 
-    speculation = plan.speculation
-    drafting = (
-        {}
-        if speculation is None
-        else {
-            "speculative_widths": speculation.widths,
-            "speculative_token_capacity": plan.speculative_token_capacity,
-            "speculative_fixed_width": speculation.fixed_width,
-            "draft_head_quantization": speculation.draft_head_quantization,
-        }
-    )
     config = PreparationConfig(
-        mtp_only=speculation is not None and speculation.mtp_only,
-        collective_tuning=plan.collective_tuning,
-        collective_ladder=plan.collective_ladder,
-        prompt_logprobs=plan.prompt_logprobs,
-        compile_workers=plan.compile_workers,
-        autotune_effort=plan.autotune_effort,
-        tuning_replica=plan.tuning_replica,
-        native_dense_activations=plan.native_dense_activations,
-        lock_gpu_clocks=plan.lock_gpu_clocks and plan.autotune_effort != "off",
+        **common_preparation_kwargs(
+            plan,
+            compile_forwards=compile_forwards,
+            kernel_cache=kernel_cache,
+            retain_graphs=retain_graphs,
+        ),
         devices=(0,),
-        compile_decoder=compile_forwards,
-        retain_graphs=retain_graphs,
-        image_concurrency=plan.image_concurrency,
-        language_model_only=plan.language_model_only,
-        online_mxfp8=plan.online_mxfp8,
-        online_mxfp8_scope=plan.online_mxfp8_scope,
-        max_active=plan.concurrency,
-        stream_overlap=plan.stream_overlap,
-        context=plan.recipe.context,
-        prefill_chunk_size=plan.prefill_chunk,
         minimum_pages=plan.minimum_pages,
-        snapshot_budget_bytes=plan.snapshots * plan.costs.state_row_bytes,
-        headroom_bytes=plan.headroom_bytes + plan.reserve_bytes,
-        kernel_cache=kernel_cache,
-        expert_scale_compression=plan.expert_scale_compression,
-        dfly=speculation is not None,
-        **drafting,
     )
     config = replace(config, chat_template=chat_template_asset(Path(snapshot).resolve()))
     return prepare_rank(snapshot, config, rank=0, group=None, progress=progress, core_storage=core_storage)
@@ -103,11 +105,6 @@ RECIPE = Recipe(
     served_model_name="Hy4-Flash",
     prepare=prepare,
     usage=usage,
-    expert_scale_compression="csf",
-    draft_head_quantizations=("nvfp4", "mxfp8"),
-    online_mxfp8=True,
-    online_mxfp8_scope="all",
-    online_mxfp8_scopes=("all", "draft"),
     # Sampling defaults from Tencent Hy4-flash model card quickstart
     # (https://huggingface.co/tencent/Hy4-flash#quickstart: temperature=0.9, top_p=1.0).
     sampling_defaults=SamplingDefaults(temperature=0.9, top_p=1.0, top_k=-1),
@@ -126,16 +123,17 @@ RECIPE = Recipe(
     ),
     context=1048576,
     page_tokens=256,
-    concurrency=8,
-    max_concurrency=16,
-    prefill_chunk=4096,
-    speculation=Speculation(draft_tokens=5, adaptive=True, token_capacity=48),
-    max_draft_tokens=7,
+    parameters=Hy4FlashParameters(
+        max_concurrency=8,
+        max_concurrency_limit=16,
+        prefill_chunk=4096,
+        speculation=SpeculationParameters(draft_tokens=5, max_draft_tokens=7, token_capacity=48),
+        vision=VisionParameters(separable_encoder=True),
+        prompt_logprobs=PromptLogprobsParameters(),
+    ),
     verification_rows=0,
-    stream_overlap=True,
     max_images=4,
     image_bytes=32 << 20,
-    language_model_only=True,
     ranks=MappingProxyType(
         {
             1: RankCosts(

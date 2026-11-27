@@ -4,6 +4,9 @@
 
 """DeepSeek V4 Flash Vision checkpoint with integrated DSpark proposals."""
 
+from __future__ import annotations
+
+from dataclasses import dataclass
 from types import MappingProxyType
 
 from ignition.declaration import (
@@ -12,8 +15,33 @@ from ignition.declaration import (
     RankUsage,
     Recipe,
     SamplingDefaults,
-    Speculation,
 )
+from ignition.parameters import (
+    PromptLogprobsParameters,
+    RecipeParameters,
+    SpeculationParameters,
+    VisionParameters,
+)
+from ignition.preparation.bootstrap import common_preparation_kwargs
+
+from hyperflare_recipes.parameters import (
+    DraftQuantizationParameters,
+    NativeDenseActivationsParameters,
+    StreamOverlapParameters,
+)
+
+
+@dataclass(frozen=True)
+class DeepSeek4Parameters(RecipeParameters):
+    """Preparation parameters for DeepSeek V4 Flash Vision."""
+
+    native_dense_activations: NativeDenseActivationsParameters = NativeDenseActivationsParameters()
+    stream_overlap: StreamOverlapParameters = StreamOverlapParameters()
+    draft_quantization: DraftQuantizationParameters = DraftQuantizationParameters(
+        draft_head_choices=("nvfp4",),
+        markov_head_choices=("nvfp4",),
+    )
+
 
 def prepare(
     snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_graphs=False, core_storage=None,
@@ -24,36 +52,14 @@ def prepare(
     With `ranks`, rank zero's multi-host rendezvous, each rank uses its own host's GPU 0.
     """
     from ignition.preparation.rank_group import prepare_group
-
     from .bootstrap import PreparationConfig, prepare_rank
 
-    speculation = plan.speculation
-    drafting = (
-        {}
-        if speculation is None
-        else {"speculative_widths": speculation.widths, "speculative_token_capacity": plan.speculative_token_capacity,
-              "speculative_graph_budget": speculation.graph_budget or 64, "speculative_fixed_width": speculation.fixed_width,
-              "draft_head_quantization": speculation.draft_head_quantization,
-              "markov_head_quantization": speculation.markov_head_quantization}
-    )
-    config = PreparationConfig(mtp_only=plan.speculation is not None and plan.speculation.mtp_only,
-        collective_tuning=plan.collective_tuning, collective_ladder=plan.collective_ladder, prompt_logprobs=plan.prompt_logprobs,
-        compile_workers=plan.compile_workers, autotune_effort=plan.autotune_effort, tuning_replica=plan.tuning_replica,
-        native_dense_activations=plan.native_dense_activations,
-        lock_gpu_clocks=plan.lock_gpu_clocks and plan.autotune_effort != "off",
+    config = PreparationConfig(
+        **common_preparation_kwargs(
+            plan, compile_forwards=compile_forwards, kernel_cache=kernel_cache, retain_graphs=retain_graphs,
+        ),
         devices=tuple(range(plan.world_size)) if ranks is None else (0,) * plan.world_size,
-        hosts=None if ranks is None else ranks.hosts, roce_ring=plan.roce_ring, roce_chain=plan.roce_chain,
-        compile_decoder=compile_forwards,
-        retain_graphs=retain_graphs,
-        max_active=plan.concurrency, image_concurrency=plan.image_concurrency,
-        context=plan.recipe.context,
-        prefill_chunk_size=plan.prefill_chunk,
-        snapshot_budget_bytes=plan.snapshots * plan.costs.state_row_bytes,
-        headroom_bytes=plan.headroom_bytes + plan.reserve_bytes,
-        kernel_cache=kernel_cache,
-        dspark=speculation is not None,
-        stream_overlap=plan.stream_overlap,
-        **drafting,
+        hosts=None if ranks is None else ranks.hosts,
     )
     return prepare_group(snapshot, config, prepare_rank, progress=progress, core_storage=core_storage,
                          ranks=ranks, checkpoint=plan.checkpoint)
@@ -67,7 +73,6 @@ def usage(prepared):
 
 RECIPE = Recipe(
     name="deepseek4",
-    draft_head_quantizations=("nvfp4",), markov_head_quantizations=("nvfp4",),
     served_model_name="DeepSeek-V4-Flash-Vision-Exp",
     # Agent evaluation sampling: https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-Vision-Exp#introduction.
     sampling_defaults=SamplingDefaults(temperature=1., top_p=.95, top_k=-1),
@@ -86,13 +91,16 @@ RECIPE = Recipe(
     ),
     context=1048576,
     page_tokens=256,
-    concurrency=32,
-    max_concurrency=64,
-    prefill_chunk=4096,
-    speculation=Speculation(draft_tokens=5, token_capacity=128, packed_verification=True, graph_budget=64),
-    max_draft_tokens=5,
-    # Single-row decode runs the shared expert on an auxiliary stream.
-    stream_overlap=True,
+    parameters=DeepSeek4Parameters(
+        max_concurrency=32,
+        max_concurrency_limit=64,
+        prefill_chunk=4096,
+        speculation=SpeculationParameters(
+            draft_tokens=5, max_draft_tokens=5, token_capacity=128, packed_verification=True, graph_budget=64,
+        ),
+        vision=VisionParameters(),
+        prompt_logprobs=PromptLogprobsParameters(),
+    ),
     max_images=4,
     image_bytes=32 << 20,
     # Continuation rows and latent pages are replicated, so their costs do not depend on the rank count.

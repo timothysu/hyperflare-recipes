@@ -22,14 +22,12 @@ WORLD, ROWS, TOPK, MAXIMUM = 16, 4096, 2048, 16384
 def configure(checkpoint, path):
     from ignition.cli.config import Configuration
     from ignition.cli.environment import apply
-    from ignition.cli.preparation import Host, collective_tuning_mode, resolve_model, tuning_effort
+    from ignition.cli.preparation import Host, resolve_model, tuning_effort
 
     configuration = Configuration.load(path)
     model, gpus = resolve_model(configuration, str(checkpoint)), Host.discover().gpus
     if model.recipe.name != "kimi31" or len(gpus) != WORLD:
         raise ValueError("the qualifier requires Kimi K3.1 and sixteen assigned GPUs")
-    if collective_tuning_mode(configuration, model) != "static":
-        raise ValueError("the qualifier requires static collective tuning")
     apply(configuration, gpus, model.recipe.b12x_environment)
     return dict(recipe=model.recipe.name, checkpoint=str(checkpoint), config=str(configuration.path),
         b12x={key: value for key, value in os.environ.items() if key.startswith("B12X_")},
@@ -269,7 +267,7 @@ def _worker(rank, rendezvous, checkpoint, destination, policy, compiled, maximum
             selected_runtime = create_head_exchange(dist.group.WORLD, device,
                 max_rows=ROWS // WORLD, heads=WORLD, head_dim=4096, ipc=storage.peer_storage)
             barrier = create_all_reduce_runtime(dist.group.WORLD, device,
-                max_tokens=1, hidden_size=8, collective_tuning="static", ipc=storage.peer_storage)
+                max_tokens=1, hidden_size=8, ipc=storage.peer_storage)
             runtimes = [control_runtime, selected_runtime, barrier]
             stage = SharedPages(dist.group.WORLD, device, maximum // WORLD * 132, ipc=storage.peer_storage)
             logical_pages, physical_pages = maximum // (WORLD * 128), maximum // (WORLD * 128) + 3

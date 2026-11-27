@@ -8,7 +8,7 @@ import contextlib
 import hashlib
 import json
 import os
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 import torch
@@ -45,7 +45,8 @@ from ignition.progress import phase
 from ignition.preparation.tuning import RecordedPreparationSession, with_autotune_effort
 from ignition.preparation.tuning_replicas import TuningReplica
 
-from .recipe import RECIPE
+from .recipe import Glm53Parameters, RECIPE
+from hyperflare_recipes.parameters import ContextParallelParameters
 from .batch import BatchInputs, PreparedBatch
 from .generation import PreparedGeneration
 from .maintenance import PreparedMaintenance
@@ -70,42 +71,58 @@ _KV_ALLOCATION_MARGIN = 64 << 20
 def races_context_transport(config, world_size, device):
     """Whether single-host preparation races peer pull against the ring for prefill context.
 
-    The race captures compiled forwards, needs a tuning effort above off, and needs static
-    collectives because runtime tuning owns the transports' launch parameters. It is qualified
-    on four ranks of SM120 GPUs; every other cell keeps peer pull.
+    The race captures compiled forwards and requires an autotune effort above off.
+    It is qualified on four ranks of SM120 GPUs; every other cell keeps peer pull.
     """
-    return (config.compile_decoder and config.autotune_effort != "off" and config.collective_tuning == "static"
+    return (config.compile_decoder and config.autotune_effort != "off"
             and world_size == 4 and torch.cuda.get_device_capability(device) == (12, 0))
+
+
+def _default_parameters() -> Glm53Parameters:
+    return replace(
+        RECIPE.parameters,
+        max_concurrency=4,
+        speculation=None,
+        context_parallel=ContextParallelParameters(enabled=False),
+    )
 
 
 @dataclass(frozen=True)
 class PreparationConfig(BasePreparationConfig):
-    prompt_logprobs: bool = False
+    parameters: Glm53Parameters = field(default_factory=_default_parameters)
     devices: tuple[int, ...] = (0, 1)
     # Each rank's host when ranks run on separate hosts; devices are then host-local ordinals.
     hosts: tuple[str, ...] | None = None
-    roce_ring: bool = False
-    roce_chain: bool = False
-    image_concurrency: int | None = None
-    language_model_only: bool = False
     pages: int | None = None
     # Without fixed pages, KV pages fill the memory measured free after graph capture, at least this many.
     minimum_pages: int | None = None
     # The annotated chat template, resolved once before the ranks start so that a failed download surfaces
     # from the process that reports preparation errors; None makes a rank resolve it from the snapshot.
     chat_template: dict | None = None
-    mtp: bool = False
     # SM103 uses checkpoint-scaled A4; SM120/121 retain A16 with A4 prefill launches.
     expert_activation: str = "auto"
-    # Shard latent records and C4 pools across the tensor-parallel ranks (decode context parallelism).
-    context_parallel: bool = False
     # Expand routed experts' CSF block scales once at load instead of before every expert launch.
     expand_expert_scales: bool = False
-    # Run shared experts, KDA gate projections, and decode query chains on an auxiliary stream;
-    # without overlap every branch runs serially on the main stream.
-    stream_overlap: bool = True
+
+    @property
+    def native_dense_activations(self) -> bool:
+        return self.parameters.native_dense_activations.enabled
+
+    @property
+    def mtp(self) -> bool:
+        return self.parameters.speculation is not None
+
+    @property
+    def context_parallel(self) -> bool:
+        return self.parameters.context_parallel.enabled
+
+    @property
+    def stream_overlap(self) -> bool:
+        return self.parameters.stream_overlap.enabled
 
     def __post_init__(self):
+        if not isinstance(self.parameters, Glm53Parameters):
+            raise TypeError("GLM-5.3 PreparationConfig requires Glm53Parameters")
         if self.mtp_only and (not self.mtp
                 or max(self.speculative_widths, default=1) <= 1 or self.speculative_fixed_width == 1):
             raise ValueError("--mtp-only requires enabled learned speculation with positive draft depth")
@@ -146,7 +163,7 @@ class PreparationConfig(BasePreparationConfig):
         if not self.language_model_only:
             from ignition.components.capacity import image_capacity
 
-            object.__setattr__(self, "image_concurrency", image_capacity(self.max_active, self.image_concurrency))
+            image_capacity(self.max_active, self.image_concurrency)
         if self.pages is not None and (type(self.pages) is not int or not 0 < self.pages <= 2147483647):
             raise ValueError("page capacity must be a positive signed 32-bit integer")
         if self.minimum_pages is not None and (type(self.minimum_pages) is not int or self.minimum_pages <= 0
@@ -361,7 +378,7 @@ def prepare_rank(snapshot: Path, config: PreparationConfig, *, rank, group, prog
                 group, device, max_tokens=decode_tokens, pipe_tokens=config.token_capacity, hidden_size=4096,
                 gather_bytes=gather_bytes, ring=config.roce_ring, ring_open=config.roce_chain, core_storage=core_storage, varlen_bytes=varlen_bytes)
         elif group is not None:
-            collective = create_all_reduce_runtime(group, device, collective_tuning=config.collective_tuning, max_tokens=config.token_capacity,
+            collective = create_all_reduce_runtime(group, device, max_tokens=config.token_capacity,
                                                    hidden_size=4096, ipc=ipc)
             prefill_collective = create_dma_all_reduce_runtime(group, device, max_tokens=config.prefill_chunk_size,
                                                                hidden_size=4096, ipc=ipc)
@@ -371,7 +388,7 @@ def prepare_rank(snapshot: Path, config: PreparationConfig, *, rank, group, prog
             "headers": [s.header_sha256 for s in manifest.shards], "world_size": shard.world_size,
             "contract": "glm5next.graph-inputs.v3", "vision": not config.language_model_only}, sort_keys=True).encode()).hexdigest()
         session = RecordedPreparationSession(
-            compile_workers=config.compile_workers, collective_tuning=config.collective_tuning, collective_ladder=config.collective_ladder, autotune_effort=config.autotune_effort, tuning_replica=config.tuning_replica,
+            compile_workers=config.compile_workers, autotune_effort=config.autotune_effort, tuning_replica=config.tuning_replica,
             native_dense_activations=config.native_dense_activations, lock_gpu_clocks=config.lock_gpu_clocks,
             device=device, checkpoint=identity, workload_schema="glm-text-stack-tp-v1",
             numerical_policy="default", coordinator=coordinator,

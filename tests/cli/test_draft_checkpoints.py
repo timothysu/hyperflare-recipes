@@ -3,6 +3,7 @@
 
 """External draft models share the configured target-checkpoint hub cache."""
 
+from dataclasses import replace
 from importlib import import_module
 import sys
 from types import SimpleNamespace
@@ -10,7 +11,7 @@ from types import SimpleNamespace
 import pytest
 
 from ignition import planning
-from ignition.cli.config import Configuration, Setting
+from ignition.cli.config import Configuration
 from ignition.cli.preparation import Host, derive
 from hyperflare_recipes.recipes import ResolvedModel, recipes
 
@@ -30,8 +31,8 @@ def test_draft_preparation_selects_local_or_hub_snapshot(monkeypatch, tmp_path, 
     world = recipe.tensor_parallel[0]
     gpus = tuple(planning.Gpu(i, "Blackwell", f"GPU-{i}", 256 << 30, 250 << 30, (12, 0))
                  for i in range(world))
-    plan = derive(configuration, model, Host(gpus, None), gpus=f"0-{world - 1}",
-                  concurrency=Setting(4, "test"), speculation=recipe.speculation if drafting else None)
+    params = replace(recipe.parameters, max_concurrency=4, speculation=recipe.speculation if drafting else None)
+    plan = derive(configuration, model, Host(gpus, None), gpus=f"0-{world - 1}", parameters=params)
     assert plan.hub_cache == hub_cache
 
     draft = import_module(f"hyperflare_recipes.recipes.{name}." + ("config" if name == "kimi3" else "draft_config"))
@@ -70,17 +71,17 @@ def test_draft_preparation_selects_local_or_hub_snapshot(monkeypatch, tmp_path, 
         snapshot = target / "dspark"
         snapshot.mkdir(parents=True)
     config = recipe.prepare(target, plan, compile_forwards=True, kernel_cache=None, progress=None)
+    assert (config.parameters.speculation is not None) is drafting
     if name in ("muse_spark", "qwen38_dense"):
-        if name == "qwen38_dense":
-            assert config.mtp is drafting
-        else:
-            assert config.dflash is drafting
         assert getattr(config, "draft_snapshot", None) == (snapshot if drafting else None)
         if drafting:
-            assert config.speculative_widths == plan.speculation.widths
-            assert config.speculative_fixed_width == plan.speculation.fixed_width
-            assert config.speculative_token_capacity == (128 if name == "qwen38_dense" else 32)
-            assert config.speculative_graph_budget == 64
+            spec = config.parameters.speculation
+            assert spec.widths == plan.speculation.widths
+            assert spec.fixed_width == plan.speculation.fixed_width
+            assert spec.effective_token_capacity(config.parameters.max_concurrency) == (
+                128 if name == "qwen38_dense" else 32
+            )
+            assert spec.graph_budget == 64
     else:
         assert config.draft_checkpoint == (str(snapshot) if drafting else None)
     assert downloads == ([repository] if drafting and not embedded else [])

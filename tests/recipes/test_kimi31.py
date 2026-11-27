@@ -123,17 +123,17 @@ def test_recipe_registration_and_sampling_defaults(raw_config, tmp_path):
 
 @pytest.mark.parametrize("command", ["export", "debug-serve"])
 def test_cli_draft_defaults_and_explicit_disabling(command):
-    from ignition.cli import _parser, preparation
-    from hyperflare_recipes.recipes import resolve
+    from ignition.cli import parse_args, preparation
+    from hyperflare_recipes.recipes import recipes, resolve
 
     model = resolve("kimi-k3.1-pro")
-    args = _parser().parse_args([command, model.checkpoint.alias])
-    assert preparation.speculation(args, model).draft_tokens == 7
-    args = _parser().parse_args([command, model.checkpoint.alias, "--no-mtp"])
-    assert preparation.speculation(args, model) is None
-    args = _parser().parse_args([command, model.checkpoint.alias, "--mtp-draft-tokens", "3",
-        "--speculative-token-capacity", "32", "--speculative-graph-budget", "16"])
-    chosen = preparation.speculation(args, model)
+    args = parse_args([command, model.checkpoint.alias], recipes=recipes())
+    assert preparation.resolve_parameters(model, args).speculation.draft_tokens == 7
+    args = parse_args([command, model.checkpoint.alias, "--no-mtp"], recipes=recipes())
+    assert preparation.resolve_parameters(model, args).speculation is None
+    args = parse_args([command, model.checkpoint.alias, "--mtp-draft-tokens", "3",
+        "--speculative-token-capacity", "32", "--speculative-graph-budget", "16"], recipes=recipes())
+    chosen = preparation.resolve_parameters(model, args).speculation
     assert (chosen.draft_tokens, chosen.token_capacity, chosen.graph_budget) == (3, 32, 16)
 
 
@@ -189,24 +189,32 @@ def test_preparation_selects_the_inferact_draft(monkeypatch, tmp_path, embedded_
 
 
 def test_preparation_rejects_unsharded_context_before_dispatch(tmp_path):
+    from dataclasses import replace
     from types import SimpleNamespace
+    from hyperflare_recipes.parameters import ContextParallelParameters
     from hyperflare_recipes.recipes import resolve
 
+    recipe = resolve("kimi-k3.1-pro").recipe
+    bad_params = replace(recipe.parameters, context_parallel=ContextParallelParameters(enabled=False))
     with pytest.raises(ValueError, match="requires context parallelism"):
-        resolve("kimi-k3.1-pro").recipe.prepare(tmp_path, SimpleNamespace(context_parallel=False),
+        recipe.prepare(tmp_path, SimpleNamespace(parameters=bad_params),
             compile_forwards=True, kernel_cache=None, progress=None)
 
 
-@pytest.mark.parametrize("options,reason", [
-    ({"context_parallel": False}, "requires context parallelism"),
-    ({}, "requires recipe sampling defaults and a frontend template"),
+@pytest.mark.parametrize("context_parallel,reason", [
+    (False, "requires context parallelism"),
+    (True, "requires recipe sampling defaults and a frontend template"),
 ])
-def test_rank_preparation_rejects_invalid_k31_inputs_before_cuda(raw_config, tmp_path, options, reason):
+def test_rank_preparation_rejects_invalid_k31_inputs_before_cuda(raw_config, tmp_path, context_parallel, reason):
+    from dataclasses import replace
+    from hyperflare_recipes.parameters import ContextParallelParameters
     from hyperflare_recipes.recipes.kimi3.bootstrap import PreparationConfig, prepare_rank
 
     (tmp_path / "config.json").write_text(json.dumps(raw_config))
+    base = PreparationConfig().parameters
+    params = replace(base, context_parallel=ContextParallelParameters(enabled=context_parallel))
     with pytest.raises(ValueError, match=reason):
-        prepare_rank(tmp_path, PreparationConfig(**options), rank=0, group=None, core_storage=None)
+        prepare_rank(tmp_path, PreparationConfig(parameters=params), rank=0, group=None, core_storage=None)
 
 
 @pytest.mark.parametrize("rows,expected_blocks", [(2, 1), (4, 1), (6, 1), (7, 1), (8, 2)])

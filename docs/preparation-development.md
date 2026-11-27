@@ -8,6 +8,22 @@ For running preparation, use [model preparation and serving](model-preparation.m
 Recipe and execution-component changes also require
 [model development](model-development.md).
 
+## Recipe parameters and preparation manifests
+
+Recipes declare their preparation options, defaults, validation rules, planning
+adjustments, and manifest serialization on a frozen `RecipeParameters` instance
+(`ignition.parameters`) attached to `Recipe.parameters`. Reusable recipe-domain
+parameter groups live in
+[hyperflare_recipes/parameters.py](../hyperflare_recipes/parameters.py), while
+universal core options and Helios `GraphOperation` ABI opt-ins
+(`SpeculationParameters`, `VisionParameters`, `PromptLogprobsParameters`,
+`MixedPrefillParameters`) live in core `ignition.parameters`. `PreparationConfig`
+classes inherit from `BasePreparationConfig` (`ignition.preparation.bootstrap`)
+and embed `plan.parameters` directly via `common_preparation_kwargs`.
+`PreparationManifest` (`parameters` and `reproduction_args`) is serialized
+exclusively from the resolved `RecipeParameters` object and checkpoint
+provenance, emitting only keys declared by the selected recipe.
+
 ## Operator declaration, tuning, and binding
 
 - Use b12x's autotuning and warmup facilities during preparation. Do not pin
@@ -298,14 +314,7 @@ requests run in a follow-up collective or independent remainder batch where
 ranks without local remainders still join completion and failure relays.
 `ReplicaPreparation` keeps these exchanges within each serving TP replica;
 independent kernel candidates retain corresponding-rank sharding across replicas.
-Preparation-time search ends before graph handoff. With `--collective-tuning
-runtime`, the required `--collective-ladder PATH` file supplies final compiled
-geometries for eligible plain BF16 PCIe reductions and column gathers. Gather
-buckets depend on total per-rank input bytes, independently of row width. These pinned plans do not
-race geometries during preparation, including with `--autotune-effort off`.
-Captured tuning graphs select among the supplied submode/active-CTA profiles
-before serving begins; native rank coordination only launches those graphs and
-waits for their completion. See the [ladder format](https://github.com/NVIDIA/hyperflare-inference/blob/main/ignition/preparation/ladders/README.md).
+Preparation-time search ends before graph handoff.
 
 - **Compile tensor-parallel forwards once, sharded across ranks.** Pass the
   preparation coordinator to `capture_forwards`. Each forward variant compiles
@@ -342,8 +351,7 @@ waits for their completion. See the [ladder format](https://github.com/NVIDIA/hy
   Complete warmup for the entire catalog before capturing any graph.
   After successful capture and any required instantiation, release the compiled
   Python wrapper and guards while retaining graph, kernel, and storage owners
-  through drain. Grouped forwards release shared guards after their final capture;
-  recipes exposing eager forwards retain guarded callables.
+  through drain. Recipes exposing eager forwards retain guarded callables.
 
 ## Shape and graph-transition validation
 

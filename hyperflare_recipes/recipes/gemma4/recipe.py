@@ -4,6 +4,7 @@
 
 """Gemma 4 text preparation across dense, MoE, and Assistant MTP checkpoints."""
 
+from dataclasses import dataclass
 from pathlib import Path
 
 from ignition.declaration import (
@@ -12,8 +13,23 @@ from ignition.declaration import (
     RankUsage,
     Recipe,
     SamplingDefaults,
-    Speculation,
 )
+from ignition.parameters import (
+    PromptLogprobsParameters,
+    RecipeParameters,
+    SpeculationParameters,
+)
+from ignition.preparation.bootstrap import common_preparation_kwargs
+
+from hyperflare_recipes.parameters import NativeDenseActivationsParameters
+
+
+@dataclass(frozen=True)
+class Gemma4Parameters(RecipeParameters):
+    """Preparation parameters for Gemma 4 checkpoints."""
+
+    native_dense_activations: NativeDenseActivationsParameters = NativeDenseActivationsParameters()
+
 
 _GRAPH_BYTES = 4 << 30
 
@@ -61,48 +77,32 @@ def prepare(
     from .bootstrap import PreparationConfig, prepare as prepare_model, prepare_rank
     from .config import DRAFT_DIRECTORY
 
-    drafting = {}
+    draft_checkpoint = None
     if plan.speculation is not None:
         assistant = _assistant_for(snapshot, plan.checkpoint)
-        drafting = dict(
-            speculative_widths=plan.speculation.widths,
-            speculative_fixed_width=plan.speculation.fixed_width,
-            speculative_token_capacity=plan.speculative_token_capacity,
-        )
         if (Path(snapshot) / DRAFT_DIRECTORY).is_dir():
-            drafting["draft_checkpoint"] = str(Path(snapshot) / DRAFT_DIRECTORY)
+            draft_checkpoint = str(Path(snapshot) / DRAFT_DIRECTORY)
         else:
             from huggingface_hub import snapshot_download
 
-            drafting["draft_checkpoint"] = snapshot_download(
+            draft_checkpoint = snapshot_download(
                 assistant[0],
                 revision=assistant[1],
                 cache_dir=plan.hub_cache,
                 allow_patterns=("config.json", "model.safetensors"),
             )
     config = PreparationConfig(
-        mtp_only=plan.speculation is not None and plan.speculation.mtp_only,
-        collective_tuning=plan.collective_tuning, collective_ladder=plan.collective_ladder,
-        prompt_logprobs=plan.prompt_logprobs,
-        compile_workers=plan.compile_workers, autotune_effort=plan.autotune_effort,
-        native_dense_activations=plan.native_dense_activations,
-        lock_gpu_clocks=plan.lock_gpu_clocks and plan.autotune_effort != "off",
-        tuning_replica=plan.tuning_replica,
+        **common_preparation_kwargs(
+            plan,
+            compile_forwards=compile_forwards,
+            kernel_cache=kernel_cache,
+            retain_graphs=retain_graphs,
+        ),
         devices=tuple(range(plan.world_size)) if ranks is None else (0,) * plan.world_size,
         hosts=None if ranks is None else ranks.hosts,
-        roce_ring=plan.roce_ring,
-        roce_chain=plan.roce_chain,
-        max_active=plan.concurrency,
         minimum_pages=plan.minimum_pages,
-        context=plan.recipe.context,
-        prefill_chunk_size=plan.prefill_chunk,
-        snapshot_budget_bytes=plan.snapshots * plan.costs.state_row_bytes,
-        headroom_bytes=plan.headroom_bytes + plan.reserve_bytes,
-        compile_decoder=compile_forwards,
-        retain_graphs=retain_graphs,
-        kernel_cache=kernel_cache,
         hub_cache=plan.hub_cache,
-        **drafting,
+        draft_checkpoint=draft_checkpoint,
     )
     if plan.world_size == 1:
         return prepare_model(snapshot, config, progress=progress, core_storage=core_storage)
@@ -240,12 +240,14 @@ RECIPE = Recipe(
     ),
     context=262144,
     page_tokens=128,
-    concurrency=4,
-    max_concurrency=64,
-    prefill_chunk=4096,
-    speculation=Speculation(draft_tokens=5),
-    max_draft_tokens=7,
     verification_rows=0,
+    parameters=Gemma4Parameters(
+        max_concurrency=4,
+        max_concurrency_limit=64,
+        prefill_chunk=4096,
+        speculation=SpeculationParameters(draft_tokens=5, max_draft_tokens=7),
+        prompt_logprobs=PromptLogprobsParameters(),
+    ),
     ranks=_26B_RANKS,
     plain_ranks=_26B_RANKS,
 )

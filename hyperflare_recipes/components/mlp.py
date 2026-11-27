@@ -45,7 +45,7 @@ class PreparedMLP:
     def __init__(self, source, weights: MLPWeights, gate_up, intermediate, output, *,
                  session, name, workspace, swiglu_limit=float("inf"), round_silu=True,
                  activation_mode="auto", gate_up_bias=None, down_bias=None, clamp_after_silu=False,
-                 swiglu_alpha=1., swiglu_beta=0.):
+                 swiglu_alpha=1., swiglu_beta=0., encoded=None):
         self.gate_up, self.intermediate, self.output = gate_up, intermediate, output
         self.swiglu_limit, self.round_silu = swiglu_limit, round_silu
         if source.ndim != 2 or intermediate.ndim != 2:
@@ -58,20 +58,22 @@ class PreparedMLP:
                     or tensor.device != source.device or not tensor.is_contiguous()):
                 raise ValueError("MLP buffers require contiguous BF16 storage with matching geometry and device")
 
-        def projection(input, weight, out, suffix, bias):
+        def projection(input, weight, out, suffix, bias, *, preencoded=None):
             from hyperflare_recipes.components.block_fp8 import BlockFP8Projection, BlockFP8Weight
 
             if isinstance(weight, BlockFP8Weight):
-                if bias is not None:
-                    raise ValueError("block-FP8 MLP projections do not support bias")
+                if bias is not None or preencoded is not None:
+                    raise ValueError("block-FP8 MLP projections do not support bias or preencoded MXFP8 inputs")
                 return BlockFP8Projection(input, weight, out, session=session, name=f"{name}.{suffix}")
             if isinstance(weight, torch.Tensor):
+                if preencoded is not None:
+                    raise ValueError("unquantized MLP projections do not support preencoded MXFP8 inputs")
                 return UnquantizedProjection(input, weight, out, session=session, name=f"{name}.{suffix}", bias=bias)
             return QuantizedProjection(input, weight, out, session=session,
                                        name=f"{name}.{suffix}", workspace=workspace,
-                                       activation_mode=activation_mode, bias=bias)
+                                       activation_mode=activation_mode, bias=bias, encoded=preencoded)
 
-        self.up_projection = projection(source, weights.gate_up, gate_up, "gate_up", gate_up_bias)
+        self.up_projection = projection(source, weights.gate_up, gate_up, "gate_up", gate_up_bias, preencoded=encoded)
         self.down_projection = projection(intermediate, weights.down, output, "down", down_bias)
         self.activation_plan = hyperconnection.plan(
             hyperconnection.Caps(device=source.device, max_tokens=tokens, hidden_size=width),
@@ -99,17 +101,18 @@ class PreparedMLP:
             self.gate_up = self.intermediate = self.output = None
         return self
 
-    def __call__(self, source):
+    def __call__(self, source, *, encoded_bases=None):
+        up_kwargs = {} if encoded_bases is None else {"encoded_bases": encoded_bases}
         if self._functional_layout is not None:
             _, _, _, intermediate_shape, intermediate_stride, intermediate_dtype, _, _, _ = self._functional_layout
-            gate_up = self.up_projection(source)
+            gate_up = self.up_projection(source, **up_kwargs)
             intermediate = torch.empty_strided(intermediate_shape, intermediate_stride, dtype=intermediate_dtype,
                                                device=source.device)
             hyperconnection.run_swiglu(gate_up, limit=self.swiglu_limit,
                                       round_silu=self.round_silu, out=intermediate,
                                       plan=self.activation_plan)
             return self.down_projection(intermediate)
-        self.up_projection(source)
+        self.up_projection(source, **up_kwargs)
         hyperconnection.run_swiglu(self.gate_up, limit=self.swiglu_limit,
                                   round_silu=self.round_silu, out=self.intermediate,
                                   plan=self.activation_plan)
@@ -131,6 +134,12 @@ class PreparedUngatedMLP:
         self.activation, self.intermediate = activation, intermediate
 
         def projection(x, weight, y, suffix, bias):
+            from hyperflare_recipes.components.tensor_fp8 import TensorFP8Projection, TensorFP8Weight
+
+            if isinstance(weight, TensorFP8Weight):
+                if bias is not None:
+                    raise ValueError("tensor-FP8 MLP projections do not support bias")
+                return TensorFP8Projection(x, weight, y, session=session, name=name + suffix)
             kwargs = dict(session=session, name=name + suffix, bias=bias)
             if isinstance(weight, torch.Tensor):
                 return UnquantizedProjection(x, weight, y, **kwargs)

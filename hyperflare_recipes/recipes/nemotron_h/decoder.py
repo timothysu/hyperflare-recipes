@@ -44,11 +44,12 @@ class Scratch:
     logits: torch.Tensor
 
     @classmethod
-    def allocate(cls, tokens, rows, config, device, *, examples=None, role="nemotron.target"):
+    def allocate(cls, tokens, rows, config, device, *, shard=None, examples=None, role="nemotron.target"):
         def empty(field, shape):
             return declaration_tensor(examples, role + "." + field, shape, torch.bfloat16, device)
+        world = 1 if shard is None else shard.world_size
         return cls(empty("activations", (tokens, config.hidden)), empty("normalized", (tokens, config.hidden)),
-            empty("hidden", (rows, config.hidden)), empty("local_logits", (rows, config.vocabulary)),
+            empty("hidden", (rows, config.hidden)), empty("local_logits", (rows, config.vocabulary // world)),
             empty("logits", (rows, config.vocabulary)))
 
     def rows(self, tokens, rows):
@@ -58,10 +59,10 @@ class Scratch:
 
 class PreparedDecoder:
     def __init__(self, weights, scratch, metadata, pool, *, mode, session, name, workspace,
-                 coordinator=None, vocabulary_runtime=None, vision_state=None, scoring=None, examples=None):
+                 runtime=None, coordinator=None, vocabulary_runtime=None, vision_state=None, scoring=None, examples=None):
         self.weights, self.scratch, self.pool, self.session = weights, scratch, pool, session
         self.vision_state = vision_state if mode == "prefill" else None
-        config, source = weights.config, scratch.normalized
+        config, shard, source = weights.config, getattr(weights, "shard", None), scratch.normalized
         self.embedding = PreparedEmbedding(weights.embedding, metadata.token_ids, scratch.activations,
             num_rows=metadata.live_counts[:1], session=session, name=name + ".embedding")
         self.mode = mode
@@ -88,14 +89,15 @@ class PreparedDecoder:
             prefix, kind = f"{name}.layer{index}", config.layers[index]
             norm = PreparedRMSNorm(scratch.activations, w["norm"], source,
                 eps=config.text["layer_norm_epsilon"], residual=previous, session=session, name=prefix + ".norm")
-            kwargs = dict(session=session, name=prefix, workspace=workspace, examples=examples)
+            kwargs = dict(session=session, name=prefix, workspace=workspace, shard=shard,
+                runtime=runtime, coordinator=coordinator, examples=examples)
             records = pool.replay_records(index) if mode == "verify" and kind == "mamba" else None
             if kind == "mamba":
                 block = PreparedMamba(w, source, pool.recurrent(index), mamba_metadata(metadata), config, mode=mode,
                     replay=self.replay, records=records,
                     verification_width=self.width, **kwargs)
             elif kind == "attention":
-                key, value = pool.attention(index, config)
+                key, value = pool.attention(index, config, shard=shard)
                 block = PreparedAttention(w, source, metadata, key, value, config, mode=mode,
                     tuning_page_count=int(pool.memory_capacity[1].item()),
                     key_scale=self.kv_scale, value_scale=self.kv_scale, **kwargs)
@@ -156,7 +158,7 @@ class PreparedDecoder:
                 recurrent_records = None if layer_records is None else layer_records
                 output = block(normalized, recurrent_metadata, state, records=recurrent_records, replay_state=replay_state)
             elif kind == "attention":
-                key, value = self.pool.attention(layer_index, self.weights.config)
+                key, value = self.pool.attention(layer_index, self.weights.config, shard=getattr(self.weights, "shard", None))
                 output = block(normalized, m, key, value)
             else:
                 output = block(normalized, m)

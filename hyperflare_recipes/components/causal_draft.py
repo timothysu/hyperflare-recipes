@@ -66,7 +66,7 @@ class PreparedCausalDraftRound:
         b, w = self.batch, self.width
         args = (self.requests, self.inputs.row_slot_ids[:b], self.inputs.row_generations[:b], self.inputs.live_rows)
         target = PreparedSpeculativeDistributions(self.decoder.scratch.logits.view(b, w, -1), *args,
-            self.drafts, workspace=self.sampling_scratch["target"])
+            self.drafts, token_limits=self.inputs.query_lengths[:b], workspace=self.sampling_scratch["target"])
         draft_logits = torch.empty(self.draft.logit_shape, dtype=self.draft.logit_dtype, device=self.requests.generation.device)
         proposals = tuple(PreparedDraftDistribution(draft_logits.view(b, 1, -1), *args,
             self.drafts, prefix_offset=i, seed=self.seed, offset=self.offset, sampled=self.sampled,

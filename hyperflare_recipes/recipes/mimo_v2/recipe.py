@@ -4,9 +4,26 @@
 
 """MiMo V2.6 Pro MOPD and Flash RL text, DFlash and image preparation."""
 
+from dataclasses import dataclass
 from types import MappingProxyType
 
-from ignition.declaration import Checkpoint, RankCosts, RankUsage, Recipe, SamplingDefaults, Speculation
+from ignition.declaration import Checkpoint, RankCosts, RankUsage, Recipe, SamplingDefaults
+from ignition.parameters import (
+    PromptLogprobsParameters,
+    RecipeParameters,
+    SpeculationParameters,
+    VisionParameters,
+)
+from ignition.preparation.bootstrap import common_preparation_kwargs
+
+from hyperflare_recipes.parameters import NativeDenseActivationsParameters
+
+
+@dataclass(frozen=True)
+class MiMoV2Parameters(RecipeParameters):
+    """Preparation parameters for MiMo V2.6 checkpoints."""
+
+    native_dense_activations: NativeDenseActivationsParameters = NativeDenseActivationsParameters()
 
 
 def prepare(snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_graphs=False, core_storage=None,
@@ -18,22 +35,12 @@ def prepare(snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_
     from ignition.preparation.rank_group import prepare_group
     from .bootstrap import PreparationConfig, prepare_rank
 
-    speculation = plan.speculation
-    drafting = {} if speculation is None else {
-        "speculative_widths": speculation.widths, "speculative_token_capacity": plan.speculative_token_capacity, "speculative_graph_budget": speculation.graph_budget or 64, "speculative_fixed_width": speculation.fixed_width}
-    config = PreparationConfig(mtp_only=plan.speculation is not None and plan.speculation.mtp_only,
-        collective_tuning=plan.collective_tuning, collective_ladder=plan.collective_ladder, prompt_logprobs=plan.prompt_logprobs,
-        compile_workers=plan.compile_workers, autotune_effort=plan.autotune_effort, tuning_replica=plan.tuning_replica,
-        native_dense_activations=plan.native_dense_activations,
-        lock_gpu_clocks=plan.lock_gpu_clocks and plan.autotune_effort != "off",
+    config = PreparationConfig(
+        **common_preparation_kwargs(plan, compile_forwards=compile_forwards,
+                                    kernel_cache=kernel_cache, retain_graphs=retain_graphs),
         devices=tuple(range(plan.world_size)) if ranks is None else (0,) * plan.world_size,
-        hosts=None if ranks is None else ranks.hosts, roce_ring=plan.roce_ring, roce_chain=plan.roce_chain,
-        compile_decoder=compile_forwards,
-        retain_graphs=retain_graphs, max_active=plan.concurrency, image_concurrency=plan.image_concurrency, context=plan.recipe.context,
-        prefill_chunk_size=plan.prefill_chunk,
-        snapshot_budget_bytes=plan.snapshots * plan.costs.state_row_bytes,
-        headroom_bytes=plan.headroom_bytes + plan.reserve_bytes, kernel_cache=kernel_cache,
-        dflash=speculation is not None, **drafting)
+        hosts=None if ranks is None else ranks.hosts,
+    )
     return prepare_group(snapshot, config, prepare_rank, progress=progress, core_storage=core_storage,
                          ranks=ranks, checkpoint=plan.checkpoint)
 
@@ -70,9 +77,14 @@ RECIPE = Recipe(
         # Plain dicts: multi-host preparation pickles the checkpoint for peer ranks.
         ranks={2: RankCosts(12_386_304, 737_280, 8 << 30), 4: RankCosts(6_291_456, 368_640, 8 << 30)},
         plain_ranks={2: RankCosts(7_274_496, 737_280, 8 << 30), 4: RankCosts(3_637_248, 368_640, 8 << 30)}),),
-    context=1048576, page_tokens=128, concurrency=32, max_concurrency=64, prefill_chunk=4096,
-    speculation=Speculation(draft_tokens=7, token_capacity=128, packed_verification=True, graph_budget=64), max_draft_tokens=7, max_images=4, image_bytes=32 << 20,
-    verification_rows=0,
+    context=1048576, page_tokens=128, max_images=4, image_bytes=32 << 20, verification_rows=0,
+    parameters=MiMoV2Parameters(
+        max_concurrency=32, max_concurrency_limit=64, prefill_chunk=4096,
+        speculation=SpeculationParameters(draft_tokens=7, max_draft_tokens=7, token_capacity=128,
+                                          packed_verification=True, graph_budget=64),
+        vision=VisionParameters(),
+        prompt_logprobs=PromptLogprobsParameters(),
+    ),
     ranks=MappingProxyType({world: RankCosts(33_816_576 // world, 3_276_800 // world, 8 << 30)
                             for world in (2, 4, 8)}),
     plain_ranks=MappingProxyType({world: RankCosts(23_199_744 // world, 3_276_800 // world, 8 << 30)

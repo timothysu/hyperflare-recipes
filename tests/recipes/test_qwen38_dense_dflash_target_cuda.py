@@ -103,6 +103,14 @@ def test_checkpoint_compiled_packed_round_preserves_taps_and_inactive_state(chec
             frame=frame, sequence=sequence, session=session, workspace=arena,
             verification_width=width)
         operation = owner.round(2, width, "qwen.actual.packed", target_token_capacity=width + 1)
+        assert operation.draft.shortlist_output is True
+        assert operation.proposal_block is not None
+        assert len(operation.operations[1]) == width - 1
+        assert all(
+            proposal.has_shortlist_scores and not proposal._write_dense
+            and "probabilities" not in proposal.layout and "scores" not in proposal.layout
+            for proposal in operation.operations[1]
+        )
         decoder = operation.decoder
         if checkpoint in ("qwen3.8-27b-qad", "hybrid"):
             gdn = [layer.layer.linear_attn.operation for layer in decoder.layers

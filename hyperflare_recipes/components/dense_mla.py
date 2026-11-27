@@ -29,6 +29,25 @@ def _fake_attend(q, cache, output, pages, lengths, starts, scratch, handle, scal
     pass
 
 
+# `dependencies` is an unread graph-ordering operand that orders preceding writes or barriers before attention.
+@torch.library.custom_op("flare::dense_mla_dep", mutates_args=("output", "scratch", "lse"))
+def _attend_dep(q: torch.Tensor, cache: torch.Tensor, output: torch.Tensor, pages: torch.Tensor,
+                lengths: torch.Tensor, starts: torch.Tensor, scratch: list[torch.Tensor],
+                dependencies: list[torch.Tensor], handle: int, scale: float,
+                lse: torch.Tensor | None, kv_scale: torch.Tensor | None, q_scale: torch.Tensor | None) -> None:
+    plan = plan_from_handle(handle)
+    binding = dense_mla.bind(plan, q=q, kv_cache=cache, output=output, page_table=pages,
+        cache_seqlens=lengths, cu_seqlens_q=starts, scratch=scratch, sm_scale=scale,
+        kv_scale=kv_scale, q_scale=q_scale, lse_output=lse)
+    dense_mla.run(binding=binding)
+
+
+@_attend_dep.register_fake
+def _fake_attend_dep(q, cache, output, pages, lengths, starts, scratch, dependencies,
+                     handle, scale, lse, kv_scale, q_scale):
+    pass
+
+
 class PreparedDenseMLA:
     """Dense MLA over a paged cache; an E4M3 cache defaults to unit query and cache scales.
 
@@ -118,14 +137,19 @@ class PreparedDenseMLA:
         self.output = self.lse = self.scratch = None
 
     def __call__(self, query=None, output=None, *, page_table=None, lengths=None, starts=None,
-                 cache=None, kv_scale=None, q_scale=None):
+                 cache=None, kv_scale=None, q_scale=None, dependencies=()):
         a = self.arguments
         if self.output is not None:
             output = self.output if output is None else output
             query = a["q"] if query is None else query
-            _attend(query, a["kv_cache"], output, a["page_table"], a["cache_seqlens"],
-                    a["cu_seqlens_q"], self.scratch, self.plan.handle, self.scale, self.lse,
-                    a["kv_scale"], a["q_scale"])
+            if dependencies:
+                _attend_dep(query, a["kv_cache"], output, a["page_table"], a["cache_seqlens"],
+                            a["cu_seqlens_q"], self.scratch, list(dependencies), self.plan.handle,
+                            self.scale, self.lse, a["kv_scale"], a["q_scale"])
+            else:
+                _attend(query, a["kv_cache"], output, a["page_table"], a["cache_seqlens"],
+                        a["cu_seqlens_q"], self.scratch, self.plan.handle, self.scale, self.lse,
+                        a["kv_scale"], a["q_scale"])
             return output
         shape, stride, dtype = self.output_layout
         output = torch.empty_strided(shape, stride, dtype=dtype, device=query.device)
@@ -134,7 +158,13 @@ class PreparedDenseMLA:
         if page_table.stride() != self.page_table_stride:
             page_table = torch.empty_strided(page_table.shape, self.page_table_stride,
                 dtype=page_table.dtype, device=page_table.device).copy_(page_table)
-        _attend(query, a["kv_cache"] if cache is None else cache, output, page_table, lengths, starts,
-                scratch, self.plan.handle, self.scale, lse,
-                a["kv_scale"] if kv_scale is None else kv_scale, a["q_scale"] if q_scale is None else q_scale)
+        kv_cache = a["kv_cache"] if cache is None else cache
+        resolved_kv_scale = a["kv_scale"] if kv_scale is None else kv_scale
+        resolved_q_scale = a["q_scale"] if q_scale is None else q_scale
+        if dependencies:
+            _attend_dep(query, kv_cache, output, page_table, lengths, starts, scratch, list(dependencies),
+                        self.plan.handle, self.scale, lse, resolved_kv_scale, resolved_q_scale)
+        else:
+            _attend(query, kv_cache, output, page_table, lengths, starts, scratch, self.plan.handle,
+                    self.scale, lse, resolved_kv_scale, resolved_q_scale)
         return (output, lse) if self.return_lse else output

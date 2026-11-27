@@ -10,7 +10,7 @@ from b12x.quantization import mla_norm_mxfp8, mxfp8
 from hyperflare_recipes.fixtures.projection import input_factory
 from ignition.preparation.examples import declaration_tensor
 from ignition.preparation.tensor_metadata import record_numeric_tensor
-from ignition.preparation.tuning import declare, register_context_plan, register_finalizer
+from ignition.preparation.tuning import declare, register_finalizer
 
 
 class PreparedMLANormQuant:
@@ -61,7 +61,6 @@ class PreparedMLANormQuant:
         declare(session, (self.plan.request(name=name,
             prepare_call=lambda state: prepare(state),
             benchmark_call=lambda state: prepare(state, representative())),))
-        register_context_plan(session, name, self)
 
     def functional(self, *, session):
         self.layouts = tuple((tuple(t.shape), t.dtype) for t in (self.query, self.kv, *self.encoded_bases))

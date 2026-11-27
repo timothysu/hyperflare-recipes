@@ -179,6 +179,24 @@ def _residual_checkpoint(Source, Saved, Rope, SavedRope, Slots, Active, Cu,
 
 
 @triton.jit
+def _rope_delta_checkpoint(Delta, Slots, Active, Cu, Positions, Rope, StateRows,
+                           DELTA_STRIDE: tl.constexpr, POSITION_BLOCK: tl.constexpr, SLOTS: tl.constexpr = 4):
+    row = tl.program_id(0)
+    slot = tl.load(Slots + row)
+    state_row = tl.load(StateRows + slot * 8, (slot >= 0) & (slot < SLOTS), other=0)
+    valid = (tl.load(Active + row) != 0) & (slot >= 0) & (slot < SLOTS)
+    begin, end = tl.load(Cu + row), tl.load(Cu + row + 1)
+    valid &= end > begin
+    position = tl.load(Positions + row)
+    old_delta = tl.load(Delta + state_row * DELTA_STRIDE, valid, other=0)
+    old_next = position + old_delta
+    indices = tl.arange(0, POSITION_BLOCK)
+    rope = tl.load(Rope + indices, valid & (indices // 3 >= begin) & (indices // 3 < end), other=-1)
+    next_position = tl.maximum(old_next, tl.max(rope, 0) + 1)
+    tl.store(Delta + state_row * DELTA_STRIDE, next_position - (position + end - begin), valid)
+
+
+@triton.jit
 def _hidden_checkpoint(Hidden, Saved, Delta, Sample, Slots, Active, Cu, Positions, Rope,
                        StateRows, SAVED_STRIDE: tl.constexpr, DELTA_STRIDE: tl.constexpr,
                        PREFILL: tl.constexpr, POSITION_BLOCK: tl.constexpr, BLOCK: tl.constexpr, SLOTS: tl.constexpr = 4):
@@ -273,7 +291,7 @@ class PreparedDecoderState:
             inputs.page_tables, q.main_block_table, q.is_prefilling, inputs.request_state_rows, q.raw_state_slot_ids,
             rows, tokens, inputs.page_tables.shape[1], pool.rope_delta.stride(0), mode == "prefill", 128, requests.capacity)
         self._metadata = compile_kernel(_metadata, args, (rows, 1, 1))
-        self._residual = None
+        self._hidden = self._rope_delta = self._residual = None
 
     def prepare_hidden(self, hidden, sample):
         self._hidden = compile_kernel(_hidden_checkpoint,
@@ -281,6 +299,15 @@ class PreparedDecoderState:
              self.token_state.active, self.gdn.query_start_loc, self.token_state.positions, self.qsa.rope_positions,
              self.inputs.request_state_rows, self.pool.last_hidden.stride(0), self.pool.rope_delta.stride(0),
              self.mode == "prefill", triton.next_power_of_2(self.tokens * 3), 4096, self.requests.capacity), (self.rows, 1, 1))
+
+    def prepare_rope_delta(self):
+        if self.mode != "prefill":
+            raise ValueError("rope-delta-only checkpoints apply to prefill state")
+        self._rope_delta = compile_kernel(_rope_delta_checkpoint,
+            (self.pool.rope_delta, self.inputs.row_slot_ids, self.token_state.active, self.gdn.query_start_loc,
+             self.token_state.positions, self.qsa.rope_positions, self.inputs.request_state_rows,
+             self.pool.rope_delta.stride(0), triton.next_power_of_2(self.tokens * 3), self.requests.capacity),
+            (self.rows, 1, 1))
 
     def prepare_residual(self, residual):
         if self.pool.layout.speculative_tokens and self.maintain_draft_state:
@@ -300,7 +327,8 @@ class PreparedDecoderState:
         if dynamic_inputs:
             examples.update({f"input.{name}": getattr(self.inputs, name) for name in
                 ("row_slot_ids", "row_generations", "live_rows", "query_lengths", "token_ids", "prefill_positions")})
-        examples.update(hidden=self._hidden.args[0], sample=self._hidden.args[3])
+        if self._hidden is not None:
+            examples.update(hidden=self._hidden.args[0], sample=self._hidden.args[3])
         if self._residual is not None:
             examples["residual"] = self._residual.args[0]
         def detach(call):
@@ -313,6 +341,7 @@ class PreparedDecoderState:
             return call.kernel, call.compiled, args, call.grid, call.options, slots
         self._runtime_metadata = detach(self._metadata)
         self._runtime_hidden = detach(self._hidden)
+        self._runtime_rope_delta = detach(self._rope_delta)
         self._runtime_residual = detach(self._residual)
         self._runtime_validate = detach(self._validate) if dynamic_inputs else None
         self.token_state.functional(dynamic_inputs=dynamic_inputs)
@@ -362,9 +391,15 @@ class PreparedDecoderState:
         return DecoderRuntime(gdn, qsa, ple, values, inputs)
 
     def finish_runtime(self, runtime, hidden, residual):
-        sample = torch.empty((self.rows, 2560), dtype=hidden.dtype, device=hidden.device)
-        values = {**runtime.values, "hidden": hidden, "sample": sample, "residual": residual}
-        self._launch_runtime(self._runtime_hidden, values)
+        if hidden is None:
+            sample = None
+            values = {**runtime.values, "residual": residual}
+            if self._runtime_rope_delta is not None:
+                self._launch_runtime(self._runtime_rope_delta, values)
+        else:
+            sample = torch.empty((self.rows, 2560), dtype=hidden.dtype, device=hidden.device)
+            values = {**runtime.values, "hidden": hidden, "sample": sample, "residual": residual}
+            self._launch_runtime(self._runtime_hidden, values)
         if self._runtime_residual is not None:
             self._launch_runtime(self._runtime_residual, values)
         inputs = runtime.inputs
@@ -383,7 +418,7 @@ class PreparedResume:
 
     def __init__(self, inputs, requests, pool, sample_hidden, logits, lm_head_weight,
                  completion, frame_index, submission_sequence, *, session, name,
-                 local_logits=None, vocabulary_runtime=None, coordinator=None, sampling_workspace=None):
+                 local_logits=None, vocabulary_runtime=None, result_runtime=None, coordinator=None, sampling_workspace=None):
         from hyperflare_recipes.components.linear import UnquantizedProjection
         from ignition.components.sampling import PreparedSampling
 
@@ -407,7 +442,8 @@ class PreparedResume:
             inputs.row_generations[:rows], inputs.live_rows, completion, frame_index, submission_sequence,
             sample_enabled=inputs.sample_enabled[:rows], workspace=sampling_workspace)
         self.sampler.prepare()
-        self.sampler.prepare_broadcast(runtime=vocabulary_runtime, session=session,
+        self.sampler.prepare_broadcast(runtime=vocabulary_runtime if result_runtime is None else result_runtime,
+            session=session,
             coordinator=coordinator, name=name + ".sampling")
 
     def functional(self, *, session):

@@ -184,30 +184,6 @@ no winners and is meant for occasional sampled runs, not routine tuning. The
 audit search includes every default candidate. Kernel families retain their
 declared tuning axes.
 
-`--collective-tuning static|runtime` selects when collective choices become fixed.
-`static` uses ordinary preparation-time autotuning and emits no collective startup
-tuners. Every recipe defaults to `static`. `[preparation] collective_tuning`
-overrides the recipe default; the command-line option overrides configuration.
-`runtime` requires `--collective-ladder PATH` and uses the file's final joint
-kernel geometry for eligible plain BF16 direct PCIe reductions. Preparation
-compiles that geometry without racing alternatives. A captured tuner selects
-among the supplied submode and active-CTA profiles when the core loads,
-including with autotune effort `off`; geometry stays fixed and no search runs
-during requests. Other collective paths retain their preparation policy. The
-[GB202 PCIe TP4 ladder](https://github.com/NVIDIA/hyperflare-inference/blob/main/ignition/preparation/ladders/README.md) covers four
-SM120 GPUs with out-of-place BF16 reductions from 16 bytes through 8 MiB:
-
-```sh
---collective-tuning runtime \
---collective-ladder ignition/preparation/ladders/gb202_pcie_tp4.json
-```
-
-Startup races in one preparation share fixture and timing storage. Cold races
-read an existing checkpoint allocation on the same GPU when it is at least
-twice the L2 cache size or 64 MiB, whichever is larger. If no allocation is large
-enough, the races use one shared eviction buffer. A core's resident startup
-storage is fixed at export.
-
 `--lock-gpu-clocks` locks each participating GPU to its maximum supported
 graphics frequency for the b12x tuning batch and actual Inductor autotuning
 trials during compiled-forward preparation. Frozen warmup, capture, and serving
@@ -389,9 +365,8 @@ publishes image features into the shared `VisionState` feature arena through
 `PreparedFeaturePublication`. Prefill replaces the embeddings at image-token
 positions (token 248056) with the published rows. Each feature slot holds
 16,384 BF16 vectors of width 5,120 (167,772,160 bytes, or 160 MiB).
-`--image-concurrency` defaults to the smaller of four and `--max-concurrency`,
-and can also be set via `image_concurrency` in `[defaults]` or
-`[models."qwen3.8-27b"]`. Fixed persistent vision storage declares
+`--image-concurrency` defaults to the smaller of four and `--max-concurrency`
+and is configured on the command line. Fixed persistent vision storage declares
 1,023,172,092 bytes (the 921,460,192-byte BF16 vision tower plus 101,711,900
 bytes of float32 patch upload and handoff metadata), and each feature slot adds
 167,772,160 bytes (1,694,260,732 bytes declared for four slots). Vision scratch
@@ -563,10 +538,9 @@ verification use A16 at every row count; separate prefill graphs use calibrated
 A4 from the checkpoint activation scales. The option requires SM120/121 and
 rank-local intermediate width divisible by 64 (TP1/2); mixed prefill is rejected
 because its prompt and decode rows share one expert call. Shared experts and MTP
-retain their declared precision. `[preparation] force_moe_decode_a16 = true`
-sets the default, and `--no-force-moe-decode-a16` overrides it. Preparation records
-the resolved option in the plan and rebuild metadata; compatible weight reuse
-requires the packed layouts and activation scales prepared for that option.
+retain their declared precision. Preparation records the resolved option in the
+plan and `PreparationManifest`; compatible weight reuse requires the packed
+layouts and activation scales prepared for that option.
 
 `ignition export qwen3.8-flash --gpus 0,1 --shard-hyperconnections` partitions
 the 320-wide hyperconnection bottleneck across ranks, including target and MTP
@@ -579,11 +553,9 @@ Replicated execution is the default: the compute savings must outweigh the extra
 10,240-element reduction per mixer and token. Changing the option requires a
 fresh export; `--reuse-weights` requires matching prepared weight layouts.
 
-Vision recipes accept `--image-concurrency N`, independently of
-`--max-concurrency`. It defaults to `min(4, max_concurrency)` and can also be set
-as `image_concurrency` in `[defaults]` or a model's configuration section.
-Explicit flags override configuration. Text-only recipes ignore the configured
-image default and reject an explicit image-concurrency flag.
+Vision recipes accept `--image-concurrency N` on the command line, independently
+of `--max-concurrency`, defaulting to `min(4, max_concurrency)`. Text-only
+recipes do not accept `--image-concurrency`.
 Helios reserves a feature slot when a request needs vision computation. Requests
 whose image spans are already covered by a reused prefix checkpoint need no
 feature slot. Requests needing a slot queue when those slots are occupied;
@@ -691,8 +663,8 @@ per rank through b12x's neighbor-only ring byte gather (a kernel run by eight CT
 through the channel's peer-accessible staging banks, not a copy engine), and
 scatters them into the slab. Peer pull is the default.
 
-With one host, four ranks on SM120 GPUs, compiled forwards,
-`--collective-tuning static`, and `--autotune-effort default` or `audit`, the
+With one host, four ranks on SM120 GPUs, compiled forwards, and
+`--autotune-effort default` or `audit`, the
 "Tune prefill context transport" phase races the two transports. It runs after
 child kernel tuning and before model-forward compilation and capture, and binds the
 winner to every prefill gather. Both transports must reproduce exact latent bytes
@@ -703,7 +675,7 @@ choice. Every rank must select the same transport, or preparation fails. The
 selected implementation and the race's record are reported under
 `context_compositions` in preparation measurements.
 
-Control. `--autotune-effort off`, `--collective-tuning runtime`, eager forwards
+Control. `--autotune-effort off`, eager forwards
 (`--no-compile`), and `--no-context-parallel` prepare without the race and keep peer
 pull. Other GPU architectures, other rank counts, and TP1 never run it, and
 cross-host preparation keeps its RoCE gather. If the race fails, preparation stops
@@ -778,16 +750,6 @@ without generating proposals. Ordinary graphs remain available for native
 Standalone proposal, verification, and joined wider speculative graphs are not
 registered in the packed catalog. Image preprocessing preserves the checkpoint's
 row-major patch layout and 1024-token image limit.
-
-`--joint-tuning` enables joint selection of QKV projection, query normalization,
-and query expansion plans. It covers every prepared text execution shape,
-including prefill, ordinary decode, width-one continuations, packed target
-verification, and DSpark proposals. Matching operator declarations share a
-selection scored across their layer contexts; distinct declarations are tuned
-independently. Batch capacity, physical token capacity, attention mode, and mHC
-seams determine the measured contexts. The option defaults to off and requires
-MXFP8 query normalization on the selected GPUs and `--autotune-effort default`
-or `audit`. It adds preparation time without changing the serving graph catalog.
 
 `--speculative-token-capacity` bounds physical target rows;
 `--speculative-graph-budget` independently controls the number of packed rounds.
@@ -966,8 +928,7 @@ For a TP4, single-request configuration with seven drafts, run:
   --max-concurrency 1 --mtp-draft-tokens 7 --speculative-token-capacity 8 \
   --prefill-chunk-size 4096 --expert-scale-compression native --mla-compute-mode bf16 \
   --draft-head-quantization nvfp4 --markov-head-quantization fp8 \
-  --vocabulary-parallel-sampling --joint-tuning --collective-tuning runtime \
-  --collective-ladder ignition/preparation/ladders/gb202_pcie_tp4.json
+  --vocabulary-parallel-sampling
 ```
 
 Use a fresh weight export when first enabling this option: the Markov head's
@@ -1302,8 +1263,8 @@ of two; key scales use `max(absmax, 1e-4) / 448` in FP32.
 MLA query/KV normalization and indexer LayerNorm use the checkpoint's
 `rms_norm_eps` value of `1e-5`.
 
-With compiled forwards, speculation enabled, `--collective-tuning static`
-(the default), and `--autotune-effort default` or `audit`, preparation measures
+With compiled forwards, speculation enabled, and `--autotune-effort default` or
+`audit`, preparation measures
 two complete sparse-candidate exchanges for single-request decode and
 verification. One gathers every rank's candidates on every rank; the other
 sends each query's candidates to one owner, selects there, and broadcasts only
@@ -1311,7 +1272,7 @@ the selected IDs. Both preserve FP32 score words, cutoff ties and ID order.
 The measurement includes packing, transport, selection and replication, and
 binds one implementation per row capacity before model capture. The choice is
 recorded under `candidate_compositions` in preparation measurements. Prefill
-graphs below 4096 rows, multiple-request graphs, runtime collective tuning and
+graphs below 4096 rows, multiple-request graphs, and
 disabled autotuning retain the replicated exchange. Prefill graphs of 4096 rows
 or more use neither exchange; they distribute index queries as described below.
 No serving flag or runtime graph change is required.

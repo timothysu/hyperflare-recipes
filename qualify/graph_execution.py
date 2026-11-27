@@ -283,7 +283,8 @@ def verify_prepared_scratch_arena(model, decoders, owners, evidence):
                 ("scratch", "gathered_state", "request_ids"), external_fields=("conv_state", "out"))
             for key in ("key_projection", "value_projection"):
                 audit.projection(f"{prefix}.ple.{key}", getattr(ple, key))
-            audit.projection(prefix + ".lm_head", decoder.lm_head)
+            if decoder.lm_head is not None:
+                audit.projection(prefix + ".lm_head", decoder.lm_head)
         visions = [owner for owner in owners if isinstance(owner, PreparedVision)]
         if not decoders or not visions:
             raise AssertionError("scratch audit requires decoder and vision graph owners")
@@ -492,6 +493,8 @@ class Scenario:
         self.requests, self.snapshots, self.groups, self.payloads = {}, {}, [], {}
         self.prefill_capacities = sorted({signature.token_capacity for signature in model.signatures.values()
             if signature.kind == "prefill"})
+        self.terminal_prefill_capacities = {signature.token_capacity for signature in model.signatures.values()
+            if signature.kind == "terminal_prefill"}
         self.extended_cases = []
         self.next_page = 0
         self.sequence = 0
@@ -515,7 +518,7 @@ class Scenario:
         for slot in slots:
             request = self.requests[slot]
             token = -1 if signature.kind == "decode" and request.generated >= request.max_new else None
-            if signature.kind == "prefill":
+            if signature.kind in ("prefill", "terminal_prefill"):
                 request.consumed += length
                 if sample:
                     request.generated += 1
@@ -524,7 +527,8 @@ class Scenario:
                 request.generated += 1
             elif signature.kind == "resume":
                 request.generated += 1
-            if signature.kind in ("init", "restore", "snapshot", "vision") or (signature.kind == "prefill" and not sample):
+            if signature.kind in ("init", "restore", "snapshot", "vision") or (
+                    signature.kind in ("prefill", "terminal_prefill") and not sample):
                 token = -1
             records[str(slot)] = {"generation": request.generation, "consumed": request.consumed,
                 "generated": request.generated, "status": 2 if request.generated == request.max_new else 1,
@@ -612,7 +616,7 @@ class Scenario:
             h["page_tables"][slot].fill_(-1)
             h["page_tables"][slot, :len(request.pages)] = torch.tensor(request.pages, dtype=torch.int32)
 
-    def prefill(self, slot, end, capacity, *, sample=True, vision=False):
+    def prefill(self, slot, end, capacity, *, sample=True, vision=False, terminal=None):
         import torch
 
         self.rows([slot])
@@ -631,7 +635,9 @@ class Scenario:
         if vision:
             h["vision_token_indices"][:length] = self.image["token_indices"][begin:end]
             h["vision_feature_slot"].fill_(0)
-        name = f"prefill{capacity}"
+        if terminal is None:
+            terminal = sample and capacity in self.terminal_prefill_capacities
+        name = f"{'terminal_prefill' if terminal else 'prefill'}{capacity}"
         self.emit(name, [slot], sample=sample, length=length,
             note=f"consume [{begin},{end}) with {'image' if vision else 'text'} positions")
 
@@ -764,7 +770,7 @@ class Scenario:
 
     def extended_prefills(self):
         for capacity in self.prefill_capacities:
-            if capacity <= 512:
+            if capacity <= 512 and capacity not in self.terminal_prefill_capacities:
                 continue
             for temperature, fixture_label in ((0.7, "general"), (1., "greedy")):
                 index = len(self.extended_cases)
@@ -1006,7 +1012,9 @@ def run_comparison(model, state, requests, scratch, cache, reset, scenario, evid
                     evidence.check(f"{side}.{stage}.slot{slot}-rng", seed == current["seed"]
                         and counter == current["generated"], seed=seed, counter=counter, generated=current["generated"])
                 last = group[-1]
-                if model.signatures[last["graph"]].kind in ("prefill", "decode", "resume"):
+                last_sig = model.signatures[last["graph"]]
+                if (last_sig.kind in ("terminal_prefill", "decode", "resume")
+                        or (last_sig.kind == "prefill" and last_sig.token_capacity not in scenario.terminal_prefill_capacities)):
                     evidence.check(f"{side}.{stage}.finite_active_logits", bool(torch.isfinite(logits[:len(last["slots"])]).all()))
                 for transfer in last.get("transfers", []):
                     if transfer["operation"] == 0:

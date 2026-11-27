@@ -26,20 +26,17 @@ def configure_environment(checkpoint, configuration_path, gpus):
         raise RuntimeError('configure the qualifier before importing b12x')
     from ignition.cli.config import Configuration
     from ignition.cli.environment import apply
-    from ignition.cli.preparation import collective_tuning_mode, resolve_model, tuning_effort
+    from ignition.cli.preparation import resolve_model, tuning_effort
 
     configuration = Configuration.load(configuration_path)
     model = resolve_model(configuration, str(checkpoint))
     if model.recipe.name != 'kimi31':
         raise ValueError('latent projection qualification requires a Kimi K3.1 checkpoint')
-    collective_tuning = collective_tuning_mode(configuration, model)
-    if collective_tuning != 'static':
-        raise ValueError('latent projection qualification requires static collective tuning')
     apply(configuration, gpus, model.recipe.b12x_environment)
     return dict(recipe=model.recipe.name, configuration=str(configuration.path),
         recipe_b12x=dict(model.recipe.b12x_environment),
         effective_b12x={name: value for name, value in sorted(os.environ.items()) if name.startswith('B12X_')},
-        gpu_uuids=[gpu.uuid for gpu in gpus], collective_tuning=collective_tuning,
+        gpu_uuids=[gpu.uuid for gpu in gpus],
         autotune_effort=tuning_effort(configuration))
 
 
@@ -171,7 +168,7 @@ def worker(rank, rendezvous, checkpoint, destination, policy):
         columns = torch.arange(h0, h1, device=device)
         coordinator = CollectivePreparation(dist.group.WORLD)
         reduction = create_all_reduce_runtime(dist.group.WORLD, device,
-            collective_tuning=policy['collective_tuning'], max_tokens=1024, hidden_size=7168)
+            max_tokens=1024, hidden_size=7168)
         router_runtime = create_all_gather_runtime(dist.group.WORLD, device, max_rows=1024, columns=2048)
         pair_runtime = create_head_exchange(dist.group.WORLD, device, max_rows=1024, heads=16, head_dim=336)
         runtimes = [pair_runtime, router_runtime, reduction]
@@ -179,7 +176,7 @@ def worker(rank, rendezvous, checkpoint, destination, policy):
                 workload_schema='kimi-full-k-latent-routing', numerical_policy='fp32-reference-bf16-output',
                 namespace={'recipe_b12x': policy['recipe_b12x']},
                 coordinator=coordinator, compile_workers=16,
-                collective_tuning=policy['collective_tuning'], autotune_effort=policy['autotune_effort']) as session:
+                autotune_effort=policy['autotune_effort']) as session:
             cases, buffers, compiled, timing_cases = [], {}, [], []
             for rows, strided in ((4096, False), (128, False), (16, False), (128, True)):
                 backing = torch.zeros((rows, 7200 if strided else 7168), dtype=torch.bfloat16, device=device)

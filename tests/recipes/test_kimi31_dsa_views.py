@@ -172,3 +172,120 @@ def test_selected_attention_reuses_only_identical_record_and_constant_views(monk
         else:
             _assert_geometry(call.args[1], part["gather"].args[4].view(-1, 1, RECORD_BYTES))
     assert first.plan is not tail.plan
+
+
+def test_prefill_with_staged_history_attends_directly_without_record_gather(monkeypatch):
+    from hyperflare_recipes.recipes.kimi31 import attention
+    from hyperflare_recipes.recipes.kimi31.dcp import RECORD_BYTES, TOPK
+
+    rows = 4096
+    bounds = ((0, 128), (128, 256))
+    completed = torch.zeros((1, 8), dtype=torch.bfloat16)
+    staged_records = torch.zeros((8192, RECORD_BYTES), dtype=torch.float8_e4m3fn)
+    runtime_history = torch.zeros((8192, RECORD_BYTES), dtype=torch.float8_e4m3fn)
+    attention_calls = []
+
+    def projection(self, weights, source, metadata, cache, **kwargs):
+        self.absorbed = torch.zeros((rows, 2, RECORD_BYTES), dtype=torch.bfloat16)
+        self.attended = torch.zeros((rows, 2, 512), dtype=torch.bfloat16)
+        self.query_norm = torch.zeros((rows, 1536), dtype=torch.bfloat16)
+        self.heads = 2
+        self.cache = cache
+        self.buffer = lambda name, dtype: torch.zeros(rows, dtype=dtype)
+
+    def selection(*args, **kwargs):
+        return SimpleNamespace(
+            bounds=bounds,
+            selections={128: object()},
+            sharded=lambda q, w, m: torch.full((rows, TOPK), -1, dtype=torch.int32),
+            project=lambda *a, **k: (torch.zeros((rows, 4096)), torch.zeros((rows, 32))),
+        )
+
+    class FakeHistory:
+        def __init__(self, *args, **kwargs):
+            self.completed = completed
+
+        def functional(self):
+            return self
+
+        def __call__(self, table, end):
+            return runtime_history
+
+    class FakeAttention:
+        def __init__(self, *args, **kwargs):
+            self.args = args
+            self.kwargs = kwargs
+            self.plan = object()
+
+        def functional(self, **options):
+            return self
+
+        def __call__(self, query, **kwargs):
+            attention_calls.append((query, kwargs))
+            return torch.zeros((query.shape[0], 2, 512), dtype=query.dtype)
+
+    def fail_gather(*args, **kwargs):
+        raise AssertionError("PreparedPeerRecordGather must not be constructed when history is staged")
+
+    monkeypatch.setattr(attention.PreparedMLAProjection, "__init__", projection)
+    monkeypatch.setattr(attention.PreparedMLAProjection, "functional", lambda self, **kwargs: self)
+    monkeypatch.setattr(attention, "PreparedDSAIndexer", selection)
+    monkeypatch.setattr(attention, "PreparedInterleavedHistory", FakeHistory)
+    monkeypatch.setattr(attention, "PreparedDenseMLA", FakeAttention)
+    monkeypatch.setattr(attention, "PreparedPeerRecordGather", fail_gather)
+    monkeypatch.setattr(attention, "write_records", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        attention,
+        "selection_slots",
+        lambda selected, positions, tables, owners, slots, counts, *args, **kwargs: (
+            slots.fill_(-1),
+            slots[:, 0].fill_(7),
+            counts.fill_(1),
+        ),
+    )
+
+    constants = SimpleNamespace(
+        starts=torch.arange(129, dtype=torch.int32),
+        pages=torch.arange(128 * TOPK, dtype=torch.int32).view(128, TOPK),
+        scale=torch.ones(1),
+    )
+    context = SimpleNamespace(
+        shards=ContextShards.on(0, 8, "cpu"),
+        attention_constants=constants,
+        staging=SimpleNamespace(tensor=torch.zeros((1024, RECORD_BYTES), dtype=torch.uint8), addresses=torch.zeros(8, dtype=torch.int64)),
+        staged_records=staged_records,
+        stage_signals=tuple(torch.zeros((1, 8), dtype=torch.bfloat16) for _ in range(4)),
+        stage_runtime=object(),
+    )
+    cache = torch.zeros((8, 128, RECORD_BYTES), dtype=torch.float8_e4m3fn)
+    metadata = SimpleNamespace(
+        starts=torch.zeros(1, dtype=torch.int64),
+        lengths=torch.tensor([rows], dtype=torch.int64),
+        positions=torch.arange(rows, dtype=torch.int64),
+        page_table=torch.zeros((1, 8), dtype=torch.int32),
+        token_page_table=torch.zeros((rows, 8), dtype=torch.int32),
+    )
+    prepared = attention.PreparedDSA({}, torch.zeros((rows, 8), dtype=torch.bfloat16), metadata, cache,
+        index_cache=torch.zeros((16, 64 * 132), dtype=torch.uint8), eps=1e-5, mode="prefill",
+        session=None, name="attention", workspace=None, buffers={}, context=context,
+        peers=torch.zeros(8, dtype=torch.int64))
+    part = prepared.parts[128]
+    assert "gather" not in part
+    _assert_geometry(part["attention"].args[1], staged_records.view(-1, 1, RECORD_BYTES))
+    assert part["attention"].kwargs["caps"].num_cache_pages == staged_records.shape[0]
+    prepared.project = lambda src, meta, **k: SimpleNamespace(
+        absorbed=torch.zeros((rows, 2, RECORD_BYTES), dtype=torch.bfloat16),
+        latent=torch.zeros((rows, RECORD_BYTES), dtype=torch.bfloat16),
+        query_norm=torch.zeros((rows, 1536), dtype=torch.bfloat16),
+        rope=None,
+        gate=None,
+    )
+    prepared.finish = lambda attended, projected: attended
+    prepared(torch.zeros((rows, 8), dtype=torch.bfloat16), metadata)
+    assert len(attention_calls) == len(bounds)
+    for _, kwargs in attention_calls:
+        assert kwargs["cache"].data_ptr() == runtime_history.data_ptr()
+        assert kwargs["cache"].shape == (8192, 1, RECORD_BYTES)
+        assert kwargs["dependencies"] == (completed,)
+        assert (kwargs["page_table"][:, 0] == 7).all()
+        assert (kwargs["page_table"][:, 1:] == 0).all()

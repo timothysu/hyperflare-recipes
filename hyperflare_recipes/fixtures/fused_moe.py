@@ -16,7 +16,7 @@ from ignition.preparation.tuning import benchmark_resource
 class ExpertBenchmarkInputs:
     """Deterministic activation and routing cases outside serving storage."""
 
-    def __init__(self, source, *, experts, top_k, allocate_router, router_plan=None, integrated_query=None, output_template=None):
+    def __init__(self, source, *, experts, top_k, allocate_router, router_plan=None, integrated_query=None, output_template=None, a_scales=None):
         from b12x.moe.fused_moe.workloads import make_tuning_routes
 
         tokens, hidden = source.shape
@@ -25,6 +25,8 @@ class ExpertBenchmarkInputs:
         fixture /= fixture.square().mean(-1, keepdim=True).sqrt().clamp_min(1e-6)
         self.fixture = fixture.to(device=source.device, dtype=source.dtype)
         self.source = torch.empty_like(source)
+        self.a_scales_fixture = None if a_scales is None else torch.full_like(a_scales, 127)
+        self.a_scales = None if a_scales is None else torch.empty_like(a_scales)
         self.output = torch.empty_like(source if output_template is None else output_template)
         self.routes = make_tuning_routes(tokens, top_k, experts, device=source.device)
         self.router = allocate_router(tokens, source.device, experts=experts, top_k=top_k)
@@ -66,7 +68,7 @@ class ExpertBenchmarkInputs:
 
     @property
     def nbytes(self):
-        tensors = (self.fixture, self.source, self.output, self.routes,
+        tensors = (self.fixture, self.source, self.a_scales_fixture, self.a_scales, self.output, self.routes,
             *(getattr(self.router, field) for field in self.router.__dataclass_fields__),
             self.route_weights, *self.route_inputs.values(), self.route_scores, *self.long_routes)
         storage = {value.untyped_storage().data_ptr(): value.untyped_storage().nbytes()
@@ -75,6 +77,8 @@ class ExpertBenchmarkInputs:
 
     def _synthetic_routes(self, index):
         self.source.copy_(self.fixture)
+        if self.a_scales is not None:
+            self.a_scales.copy_(self.a_scales_fixture)
         self.router.ids.copy_(self.routes[index])
         self.router.weights.copy_(self.route_weights.expand_as(self.router.weights))
         if self.route_inputs:
@@ -84,15 +88,17 @@ class ExpertBenchmarkInputs:
 
 
 def benchmark_call(state, *, source, experts, top_k, session, name, workspace,
-                   allocate_router, router_plan, precision=None, integrated_query=None, output_template=None):
+                   allocate_router, router_plan, precision=None, integrated_query=None, output_template=None,
+                   a_scales=None):
     operands = benchmark_resource(session, ("moe_inputs", name),
         lambda: ExpertBenchmarkInputs(source, experts=experts.num_experts,
             top_k=top_k, allocate_router=allocate_router, router_plan=router_plan,
-            integrated_query=integrated_query, output_template=output_template))
+            integrated_query=integrated_query, output_template=output_template, a_scales=a_scales))
     scratch = planned_scratch(state.scratch.scratch_specs(), workspace)
+    scale_kwargs = {"a_scales": operands.a_scales} if operands.a_scales is not None else {}
     binding = state.bind(a=operands.source, topk_ids=operands.router.ids,
         topk_weights=operands.router.weights, output=operands.output,
-        scratch=scratch, input_scales_static=True, **(precision or {}), **operands.route_inputs)
+        scratch=scratch, input_scales_static=True, **(precision or {}), **operands.route_inputs, **scale_kwargs)
     producers = operands.producers
     call = PreparedCall(run=lambda: state.run(binding), output=operands.output,
         produce=producers[0], benchmark_producers=producers,

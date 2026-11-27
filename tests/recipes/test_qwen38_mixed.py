@@ -3,6 +3,7 @@
 
 """Joint catalog coverage and dense native-to-role packing for mixed Qwen graphs."""
 
+from dataclasses import replace
 from types import SimpleNamespace
 from pathlib import Path
 
@@ -10,11 +11,11 @@ import pytest
 import torch
 
 from ignition.components.capacity import batch_capacities, mixed_shapes, prefill_capacities
+from ignition.parameters import MixedPrefillParameters, SpeculationParameters
 from hyperflare_recipes.recipes.qwen38.bootstrap import PreparationConfig
 from hyperflare_recipes.recipes.qwen38.decoder_state import DecoderInputs
 from hyperflare_recipes.recipes.qwen38.mixed_state import MixedPacking, role_inputs
 from hyperflare_recipes.recipes.qwen38.recipe import RECIPE
-from ignition.declaration import Speculation
 
 
 @pytest.mark.parametrize("concurrency", [1, 2, 3, 8, 64])
@@ -30,7 +31,13 @@ def test_joint_catalog_covers_both_axes_without_cross_product(concurrency, width
         assert {(b, 1, p) for b in (batch,) for p in prompts} <= set(shapes)
         for width in widths:
             assert any(b == batch and w == width for b, w, _ in shapes) == (width == 1 or batch * width <= budget)
-    config = PreparationConfig(max_active=concurrency, mtp=True, speculative_widths=widths, mixed_prefill=True)
+    params = replace(
+        PreparationConfig().parameters,
+        max_concurrency=concurrency,
+        speculation=replace(RECIPE.speculation, draft_tokens=max(widths) - 1),
+        mixed_prefill=MixedPrefillParameters(enabled=True),
+    )
+    config = PreparationConfig(parameters=params)
     assert all(p + (b - 1) * w <= config.token_capacity for _, b, w, p in config.mixed_shapes)
     assert all(w == 1 for enabled, _, w, _ in config.mixed_shapes if not enabled)
 
@@ -42,22 +49,44 @@ def test_plan_and_preparation_use_identical_catalogs(mixed, monkeypatch):
 
     gpu = planning.Gpu(0, "NVIDIA RTX PRO 6000 Blackwell", "GPU-test", 96 << 30, 95 << 30, (12, 0))
     monkeypatch.setattr(bootstrap, "prepare_model", lambda snapshot, config, **kwargs: config)
-    for speculation in (None, Speculation(0), Speculation(5), Speculation(3, adaptive=False)):
+    for speculation in (
+        None,
+        SpeculationParameters(0, max_draft_tokens=7, method="mtp", supported_methods=("mtp", "dflash2")),
+        SpeculationParameters(5, max_draft_tokens=7, method="mtp", supported_methods=("mtp", "dflash2")),
+        SpeculationParameters(3, max_draft_tokens=7, adaptive=False, method="mtp", supported_methods=("mtp", "dflash2")),
+    ):
+        params = replace(
+            RECIPE.parameters,
+            max_concurrency=4,
+            speculation=speculation,
+            mixed_prefill=MixedPrefillParameters(enabled=mixed),
+        )
         plan = planning.plan(RECIPE, RECIPE.checkpoints[0], (gpu,), selected=(0,),
-            concurrency=4, reserve_bytes=0, speculation=speculation, mixed_prefill=mixed)
+            parameters=params, reserve_bytes=0)
         config = RECIPE.prepare(Path("/checkpoint"), plan, compile_forwards=True, kernel_cache=None, progress=None)
-        expected = RECIPE.mixed_shapes(4, 4096, speculation) if mixed else ()
+        expected = params.mixed_prefill.shapes(4, 4096, speculation) if mixed else ()
         assert config.mixed_prefill == plan.to_dict()["mixed_prefill"] == mixed
         assert config.mixed_shapes == plan.mixed_shapes == expected
         assert plan.to_dict()["mixed_shapes"] == expected
         assert config.mtp == (speculation is not None)
-    assert len(PreparationConfig(mtp=True, mixed_prefill=True).mixed_shapes) == 42
-    assert PreparationConfig(max_active=1, mtp=True, mixed_prefill=True).mixed_shapes == ()
+    base = PreparationConfig().parameters
+    assert len(PreparationConfig(
+        parameters=replace(
+            base,
+            speculation=replace(RECIPE.speculation, token_capacity=None),
+            mixed_prefill=MixedPrefillParameters(enabled=True),
+        )
+    ).mixed_shapes) == 42
+    assert PreparationConfig(
+        parameters=replace(base, max_concurrency=1, speculation=RECIPE.speculation,
+                           mixed_prefill=MixedPrefillParameters(enabled=True))
+    ).mixed_shapes == ()
 
 
 def test_mixed_capture_defaults_off_without_changing_speculation():
+    base = PreparationConfig().parameters
     for mtp in (False, True):
-        config = PreparationConfig(mtp=mtp)
+        config = PreparationConfig(parameters=replace(base, speculation=RECIPE.speculation if mtp else None))
         assert not config.mixed_prefill and config.mixed_shapes == ()
         assert config.token_capacity == config.prefill_chunk_size
 

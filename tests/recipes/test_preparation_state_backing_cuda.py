@@ -77,9 +77,12 @@ def test_snapshot_restore_and_growth_with_unbacked_prefix_slots(recipe):
     backed, declared = 2 * capacity + 1, 145
     pages = 2 * capacity
     if recipe == "kimi3":
+        from dataclasses import replace
         from hyperflare_recipes.recipes.kimi3.bootstrap import PreparationConfig
 
-        pages = PreparationConfig(max_active=capacity).preparation_pages
+        pages = PreparationConfig(
+            parameters=replace(PreparationConfig().parameters, max_concurrency=capacity)
+        ).preparation_pages
     storage = VirtualStorage("cuda:0")
     graph = torch.cuda.CUDAGraph()
     try:

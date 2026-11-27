@@ -9,13 +9,44 @@ from types import SimpleNamespace
 
 import pytest
 
+from ignition.parameters import PromptLogprobsParameters, SpeculationParameters
 from ignition.preparation.selection import BenchmarkSelection
 from hyperflare_recipes.recipes.nemotron_h.bootstrap import PreparationConfig, _benchmark_state
+from hyperflare_recipes.recipes.nemotron_h.recipe import RECIPE
+
+
+def _cfg(**kwargs):
+    params = PreparationConfig().parameters
+    param_updates = {}
+    if "max_active" in kwargs:
+        param_updates["max_concurrency"] = kwargs.pop("max_active")
+    if "prefill_chunk_size" in kwargs:
+        param_updates["prefill_chunk"] = kwargs.pop("prefill_chunk_size")
+    if "prompt_logprobs" in kwargs:
+        param_updates["prompt_logprobs"] = PromptLogprobsParameters(enabled=kwargs.pop("prompt_logprobs"))
+    spec = params.speculation
+    spec_updates = {}
+    if "speculative_token_capacity" in kwargs:
+        spec_updates["token_capacity"] = kwargs.pop("speculative_token_capacity")
+    if "mtp_only" in kwargs:
+        spec_updates["mtp_only"] = kwargs.pop("mtp_only")
+    if "speculative_widths" in kwargs:
+        widths = kwargs.pop("speculative_widths")
+        drafts = max(widths) - 1
+        spec_updates["draft_tokens"] = drafts
+        if drafts == 0:
+            spec_updates["packed_verification"] = False
+            spec_updates["graph_budget"] = None
+    if spec_updates:
+        param_updates["speculation"] = replace(spec, **spec_updates)
+    if param_updates:
+        params = replace(params, **param_updates)
+    return PreparationConfig(parameters=params, **kwargs)
 
 
 @pytest.mark.parametrize("mtp_only", [False, True])
 def test_selected_nemotron_round_preserves_serving_configuration(mtp_only):
-    ordinary = PreparationConfig(max_active=8, draft_checkpoint=Path("lilicorr"),
+    ordinary = _cfg(max_active=8, draft_checkpoint=Path("lilicorr"),
         speculative_token_capacity=64, mtp_only=mtp_only)
     selection = BenchmarkSelection(batches=(8,), contexts=(512, 2048, 8192), width=8)
     selected = replace(ordinary, benchmark_selection=selection)
@@ -35,16 +66,20 @@ def test_selected_nemotron_round_preserves_serving_configuration(mtp_only):
 
 @pytest.mark.parametrize("prefixes,widths,shapes", [
     ((1,), (1,), ((1, 1, 1),)),
-    ((1, 4, 8), (1, 8), ((1, 1, 1), (1, 8, 4), (1, 8, 8))),
+    ((1, 4, 8), tuple(range(1, 9)), ((1, 1, 1), (1, 8, 4), (1, 8, 8))),
 ])
 def test_nemotron_verification_prefixes_preserve_logical_width(prefixes, widths, shapes):
-    selected = PreparationConfig(max_active=1, draft_checkpoint=Path("lilicorr"),
+    selected = _cfg(max_active=1, draft_checkpoint=Path("lilicorr"),
         speculative_widths=widths, speculative_token_capacity=8,
         benchmark_selection=BenchmarkSelection(batches=(1,), contexts=(4096,),
             verification_prefixes=prefixes))
     assert selected.speculative_round_shapes == shapes
-    with pytest.raises(ValueError, match="request or width"):
-        replace(selected, speculative_widths=(8,) if widths == (1,) else (1,))
+    if max(widths) > 1:
+        with pytest.raises(ValueError, match="request or width"):
+            replace(selected, parameters=replace(
+                selected.parameters,
+                speculation=SpeculationParameters(draft_tokens=0, max_draft_tokens=7, token_capacity=8),
+            ))
 
 
 @pytest.mark.parametrize("changes,match", [
@@ -60,7 +95,7 @@ def test_nemotron_selection_rejects_unavailable_geometry(changes, match):
         benchmark_selection=BenchmarkSelection(batches=(8,), contexts=(2048,)))
     options.update(changes)
     with pytest.raises(ValueError, match=match):
-        PreparationConfig(**options)
+        _cfg(**options)
 
 
 def test_nemotron_benchmark_state_covers_backed_histories_requests_and_rng():
@@ -110,10 +145,10 @@ def test_nemotron_benchmark_state_covers_backed_histories_requests_and_rng():
 @pytest.mark.parametrize("draft", [None, Path("lilicorr")])
 def test_prefill_selection_backs_exact_chunk_and_prefix(chunk, draft):
     selection = BenchmarkSelection(batches=(1,), contexts=(0, 16384), prefill_chunk=chunk)
-    selected = PreparationConfig(max_active=8, draft_checkpoint=draft,
+    selected = _cfg(max_active=8, draft_checkpoint=draft,
         prefill_chunk_size=chunk, benchmark_selection=selection)
     assert selected.speculative_round_shapes == ()
     assert selected.preparation_pages == 1 + (16384 + chunk) // 128
     assert selection.prefill_capacities(chunk) == (chunk,)
     with pytest.raises(ValueError, match="chunk must match"):
-        replace(selected, prefill_chunk_size=chunk // 2)
+        replace(selected, parameters=replace(selected.parameters, prefill_chunk=chunk // 2))

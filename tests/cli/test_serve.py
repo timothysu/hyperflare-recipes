@@ -50,7 +50,7 @@ class Prepared:
         plan = self.plan
         state = plan.live_rows * plan.costs.state_row_bytes
         held = plan.weights_bytes + plan.graph_bytes + self.extra + state + plan.page_bytes
-        return (RankUsage(self.pages or plan.pages, FREE - held),)
+        return (RankUsage(self.pages or plan.pages, plan.free_bytes - held),)
 
     def start_server(self, **kwargs):
         raise AssertionError("serving must start in the native executable")
@@ -156,24 +156,27 @@ def test_export_records_rebuild_settings_and_closes_preparation(host):
     assert host["plan"].speculation == host["plan"].recipe.speculation
     assert not host["plan"].mixed_prefill and host["plan"].mixed_shapes == ()
     assert host["prepared"].closed and host["prepared"].started is None
-    rebuild = types.SimpleNamespace(**host['options']['rebuild_manifest'])
-    assert rebuild.version == 1 and rebuild.recipe == host['plan'].recipe.name
-    assert rebuild.checkpoint_revision == host['plan'].checkpoint.revision
-    assert rebuild.tensor_parallel == 1 and len(rebuild.source_identity) == 64
-    assert rebuild.prefill_chunk == host['plan'].prefill_chunk
-    assert rebuild.speculation['draft_tokens'] == host['plan'].speculation.draft_tokens
-    assert 'history_drafts' not in host['options']
-    assert 'history_drafts' not in rebuild.speculation
+    manifest = host["options"]["preparation_manifest"]
+    assert manifest["version"] == 1 and manifest["recipe"] == host["plan"].recipe.name
+    assert manifest["checkpoint_revision"] == host["plan"].checkpoint.revision
+    assert len(manifest["source_identity"]) == 64
+    assert not manifest["local_checkpoint"]
+    params = {entry["key"]: entry["value"] for entry in manifest["parameters"]}
+    assert params["tensor_parallel"] == {"uint_value": 1}
+    assert params["prefill_chunk"] == {"uint_value": host["plan"].prefill_chunk}
+    assert params["speculation.draft_tokens"] == {"uint_value": host["plan"].speculation.draft_tokens}
+    assert params["compiled_forwards"] == {"bool_value": False}
+    assert "history_drafts" not in host["options"]
+    assert "speculation.history_drafts" not in params
     from google.protobuf.json_format import ParseDict
-    from ignition.preparation.runtime_core_pb2 import RebuildManifest
-    encoded = ParseDict(host['options']['rebuild_manifest'], RebuildManifest()).SerializeToString()
-    decoded = RebuildManifest.FromString(encoded)
-    assert 'history_drafts' not in {field.name for field, _ in decoded.speculation.ListFields()}
-    assert not rebuild.compiled_forwards and not rebuild.local_checkpoint
+    from ignition.preparation.runtime_core_pb2 import PreparationManifest
+    encoded = ParseDict(manifest, PreparationManifest()).SerializeToString()
+    decoded = PreparationManifest.FromString(encoded)
+    assert {entry.key for entry in decoded.parameters} == set(params)
     from ignition.preparation.rebuild_manifest import from_plan
-    local = ResolvedModel(host['plan'].recipe, host['plan'].checkpoint, Path('/local/checkpoint'))
-    local_manifest = types.SimpleNamespace(**from_plan(local, host['plan'], compiled_forwards=True))
-    assert local_manifest.local_checkpoint and not local_manifest.checkpoint_revision
+    local = ResolvedModel(host["plan"].recipe, host["plan"].checkpoint, Path("/local/checkpoint"))
+    local_manifest = from_plan(local, host["plan"], compiled_forwards=True)
+    assert local_manifest["local_checkpoint"] and not local_manifest["checkpoint_revision"]
 
 
 @pytest.mark.parametrize("budget", [None, 1536])
@@ -204,6 +207,7 @@ def test_export_server_options_match_core_contract(tmp_path, budget):
     ("kimi-k3-dspark", "Kimi-K3"),
     ("step5-preview-nvfp4", "Step-5-Preview"),
     ("nemotron-bolt-24gb", "NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB"),
+    ("nemotron-3.5-super-vl-nvfp4", "NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4"),
 ])
 @pytest.mark.parametrize("local", [False, True], ids=["checkpoint", "local-directory"])
 def test_server_options_advertise_canonical_names_independently_of_checkpoint_source(
@@ -357,33 +361,45 @@ def test_mixed_prefill_opt_in_reaches_export(host, capsys, overlap):
     assert host["exports"] == 2
     assert host["plan"].concurrency == 32 and host["plan"].speculative_token_capacity == 128
     assert host["plan"].mixed_prefill and len(host["plan"].mixed_shapes) == 123
-    assert host["plan"].stream_overlap == overlap
+    assert host["plan"].parameters.stream_overlap.enabled == overlap
     assert "mixed prefill on" in capsys.readouterr().err
     assert export("qwen3.8-flash", "--mixed-prefill", "--no-mtp", *options) == 0
     assert host["exports"] == 3 and host["plan"].speculation is None
-    assert host["plan"].stream_overlap == overlap
+    assert host["plan"].parameters.stream_overlap.enabled == overlap
     assert len(host["plan"].mixed_shapes) == 50
     assert all(not enabled for enabled, _, _, _ in host["plan"].mixed_shapes)
 
 
 @pytest.mark.parametrize("compression", [["--expert-scale-compression"], ["--expert-scale-compression", "csf"]])
 def test_expert_scale_compression_reaches_export(host, monkeypatch, capsys, compression):
-    original = serve.resolve_model(None, None)
-    checkpoint = replace(original.checkpoint, scale_compressed_device_bytes={"csf": original.checkpoint.device_bytes})
-    model = ResolvedModel(original.recipe, checkpoint)
+    step5 = resolve("step5-preview-nvfp4")
+    gpus = tuple(planning.Gpu(index, "NVIDIA RTX PRO 6000 Blackwell", f"GPU-{index:04d}",
+                              256 * GIB, 250 * GIB, (12, 0)) for index in range(4))
+    monkeypatch.setattr(planning, "discover_gpus", lambda: gpus)
+    original_prepare = serve.resolve_model(None, None).recipe.prepare
+    original_usage = serve.resolve_model(None, None).recipe.usage
+    snapshot = step5.snapshot(Configuration.load().directory("hub_cache"))
+    snapshot.mkdir(parents=True, exist_ok=True)
+    header = json.dumps({"weight": {"dtype": "U8", "shape": [1], "data_offsets": [0, 1]}}).encode()
+    header += b" " * (-len(header) % 8)
+    (snapshot / "model.safetensors").write_bytes(len(header).to_bytes(8, "little") + header + b"\0")
+    (snapshot / "model.safetensors.index.json").write_text(json.dumps({
+        "metadata": {"total_size": 1}, "weight_map": {"weight": "model.safetensors"}}))
+    recipe = replace(step5.recipe, prepare=original_prepare, usage=original_usage)
+    model = ResolvedModel(recipe, step5.checkpoint)
     monkeypatch.setattr(serve, "resolve_model", lambda *_: model)
-    assert export("qwen3.8-flash") == 0
-    assert export("qwen3.8-flash", *compression) == 0
+    assert export("step5-preview-nvfp4") == 0
+    assert export("step5-preview-nvfp4", *compression) == 0
     assert host["exports"] == 2
-    assert host["plan"].expert_scale_compression == "csf"
+    assert host["plan"].parameters.expert_scale_compression.encoding == "csf"
     assert "expert scales csf" in capsys.readouterr().err
 
 
 def test_serialized_branches_reach_the_plan_and_the_startup_line(host, capsys):
     assert export("qwen3.8-flash") == 0
-    assert host["plan"].stream_overlap and "branches serialized" not in capsys.readouterr().err
+    assert host["plan"].parameters.stream_overlap.enabled and "branches serialized" not in capsys.readouterr().err
     assert export("qwen3.8-flash", "--no-stream-overlap") == 0
-    assert host["plan"].stream_overlap is False
+    assert host["plan"].parameters.stream_overlap.enabled is False
     assert "branches serialized" in capsys.readouterr().err
 
 
@@ -398,7 +414,7 @@ def test_export_does_not_launch_a_server_and_preserves_the_serving_plan(host, tm
     assert host["exports"] == 1 and host["prepared"].started is None
     assert host["plan"].prefill_chunk == 4096 and host["compile_forwards"]
     assert host["plan"].mixed_prefill == mixed
-    assert host["plan"].stream_overlap == overlap
+    assert host["plan"].parameters.stream_overlap.enabled == overlap
     assert host["options"]["queue_capacity"] == 128
     assert host["options"]["served_names"] == ["Qwen3.8-Flash-Next"]
     assert host["options"]["reserve_bytes"] == reserve
@@ -647,7 +663,7 @@ def test_language_model_only_overrides_configured_image_capacity(monkeypatch, tm
 
     monkeypatch.setattr(planning, 'plan', inspect_plan)
     config = tmp_path / 'config.toml'
-    config.write_text('[defaults]\nimage_concurrency = 2\n[models."glm-5.3-flash"]\nimage_concurrency = 3\n')
+    config.write_text('')
     args = [command, 'glm-5.3-flash', '--config', str(config), '--gpus', '0',
             '--max-concurrency', '4', '--language-model-only', '--no-mtp']
     if ranks > 1:
@@ -737,7 +753,7 @@ def test_native_dense_activations_reach_plan(host, monkeypatch, native):
     monkeypatch.setattr(serve, "_serve_prepared", lambda *args: 0)
     flags = ["--native-dense-activations"] if native else []
     assert main(["debug-serve", "qwen3.8-flash", "--port", str(free_port()), *flags]) == 0
-    assert host["plan"].native_dense_activations is native
+    assert host["plan"].parameters.native_dense_activations.enabled is native
     assert host["plan"].to_dict()["native_dense_activations"] is native
 
 
@@ -748,27 +764,21 @@ def test_lock_gpu_clocks_reaches_preparation_plan(host):
 
 
 @pytest.mark.parametrize("command", ["export", "debug-serve"])
-def test_runtime_collective_policy_requires_ladder_before_preparation(host, capsys, command):
-    assert main([command, "qwen3.8-flash", "--collective-tuning", "runtime"]) == 2
-    assert "requires --collective-ladder PATH" in capsys.readouterr().err
-    assert "prepared" not in host and host["exports"] == 0
-
-
-@pytest.mark.parametrize("command", ["export", "debug-serve"])
-@pytest.mark.parametrize("configured,flag,expected", [
-    (False, [], False), (False, ["--force-moe-decode-a16"], True),
-    (True, [], True), (True, ["--no-force-moe-decode-a16"], False),
+@pytest.mark.parametrize("flag,expected", [
+    ([], False),
+    (["--force-moe-decode-a16"], True),
+    (["--no-force-moe-decode-a16"], False),
 ])
-def test_moe_decode_a16_configuration_and_flag_reach_preparation(host, tmp_path, monkeypatch,
-                                                               command, configured, flag, expected):
+def test_moe_decode_a16_flag_reaches_preparation(host, tmp_path, monkeypatch, command, flag, expected):
     config = tmp_path / "config.toml"
-    config.write_text(f"[preparation]\nforce_moe_decode_a16 = {str(configured).lower()}\n")
+    config.write_text("")
     monkeypatch.setattr(serve, "_serve_prepared", lambda *args: 0)
     assert main([command, "qwen3.8-flash", "--config", str(config), *flag]) == 0
-    assert host["plan"].force_moe_decode_a16 is expected
+    assert host["plan"].parameters.force_moe_decode_a16 is expected
     assert host["plan"].to_dict()["force_moe_decode_a16"] is expected
     if command == "export":
-        assert host["options"]["rebuild_manifest"].get("force_moe_decode_a16", False) is expected
+        params = {entry["key"]: entry["value"] for entry in host["options"]["preparation_manifest"]["parameters"]}
+        assert params["force_moe_decode_a16"] == {"bool_value": expected}
 
 
 def test_moe_decode_a16_rejects_mixed_before_preparation(host, capsys):

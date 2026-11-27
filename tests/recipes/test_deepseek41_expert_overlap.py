@@ -66,8 +66,7 @@ def test_layer_consumes_standalone_router_results_with_runtime_image_mask():
     metadata = SimpleNamespace(token_ids=torch.tensor([7, 129280, 9]))
     selection = (torch.zeros(3, 1, dtype=torch.int32), None, None)
     layer.attention_hc = lambda source, **kwargs: (source, source, source, source)
-    layer.attention = SimpleNamespace(_run=lambda source, m, selected, **kwargs:
-        (source * 2, source, selected, {}))
+    layer.attention = lambda source, m, selected, **kwargs: (source * 2, source, selected)
     layer.attention_reduce = lambda source: source
     layer.ffn_hc = lambda source, *args, **kwargs: (source, source, source, source)
     layer.router_projection = lambda source: source + 1

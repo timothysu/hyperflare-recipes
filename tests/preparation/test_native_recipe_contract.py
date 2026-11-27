@@ -56,21 +56,35 @@ def _vision_buffers(recipe):
 
 
 def _recipe_metadata(recipe, *, all_variants=True, config_options=None, completion_capacity=None):
+    from dataclasses import replace
+    from ignition.parameters import MixedPrefillParameters, SpeculationParameters
+
     module = importlib.import_module(f"hyperflare_recipes.recipes.{recipe}.contract")
     bootstrap = importlib.import_module(f"hyperflare_recipes.recipes.{recipe}.bootstrap")
+    recipe_def = importlib.import_module(f"hyperflare_recipes.recipes.{recipe}.recipe").RECIPE
     options = {}
+    params = recipe_def.parameters
     if recipe == "deepseek41":
-        options = dict(max_active=32, prefill_chunk_size=4096,
-            speculative_widths=tuple(range(1, 9)), speculative_token_capacity=128)
+        params = replace(
+            params,
+            max_concurrency=32,
+            prefill_chunk=4096,
+            speculation=SpeculationParameters(
+                draft_tokens=7, max_draft_tokens=7, token_capacity=128,
+                packed_verification=True, draft_prefix_selection="gpu", graph_budget=64,
+            ),
+        )
     fields = bootstrap.PreparationConfig.__dataclass_fields__
     if recipe == "qwen38_dense":
-        options.update(draft_snapshot=Path("metadata-draft"), max_active=32)
-    if recipe in ("qwen38", "glm53"):
-        options["mtp"] = True
+        params = replace(params, max_concurrency=32, vision=replace(params.vision, language_model_only=True))
+        options["draft_snapshot"] = Path("metadata-draft")
     if recipe == "qwen38":
-        options["mixed_prefill"] = True
+        params = replace(params, mixed_prefill=MixedPrefillParameters(enabled=True))
+    if recipe == "glm53":
+        params = replace(params, max_concurrency=4, context_parallel=replace(params.context_parallel, enabled=False))
     if "draft_checkpoint" in fields:
         options["draft_checkpoint"] = Path("metadata-draft")
+    options["parameters"] = params
     options.update(config_options or {})
     config = bootstrap.PreparationConfig(**options)
     capacity = config.max_active
@@ -213,12 +227,14 @@ def test_generated_recipe_catalog_passes_native_contract_validation(recipe):
         }
 
 
-@pytest.mark.parametrize("image_concurrency", [None, 0])
-def test_kimi_text_only_zero_image_capacity_passes_native_contract_validation(image_concurrency):
+@pytest.mark.parametrize("language_model_only", [True])
+def test_kimi_text_only_zero_image_capacity_passes_native_contract_validation(language_model_only):
+    from dataclasses import replace
     import flare_heliopause
+    from hyperflare_recipes.recipes.kimi3.recipe import RECIPE
 
-    config, contract, manifest = _recipe_metadata("kimi3", config_options=dict(
-        vision=False, image_concurrency=image_concurrency))
+    params = replace(RECIPE.parameters, vision=replace(RECIPE.parameters.vision, language_model_only=language_model_only))
+    config, contract, manifest = _recipe_metadata("kimi3", config_options=dict(parameters=params))
     assert config.image_concurrency == 0
     assert contract["vision"] == dict(feature_slots=0, features_per_request=0,
         max_images=0, patches_per_feature=0, patch_capacities=[])
@@ -228,10 +244,16 @@ def test_kimi_text_only_zero_image_capacity_passes_native_contract_validation(im
 
 
 def test_hy4_flash_text_only_passes_native_contract_validation():
+    from dataclasses import replace
     import flare_heliopause
+    from hyperflare_recipes.recipes.hy4_flash.recipe import RECIPE
 
+    params = replace(
+        RECIPE.parameters,
+        vision=replace(RECIPE.parameters.vision, language_model_only=True),
+    )
     config, contract, manifest = _recipe_metadata(
-        "hy4_flash", config_options=dict(language_model_only=True)
+        "hy4_flash", config_options=dict(parameters=params)
     )
     assert config.language_model_only is True
     assert contract["vision"] == dict(
@@ -329,9 +351,15 @@ def test_native_contract_accepts_omitted_or_zero_capacity_only_with_eight_token_
 
 
 def test_native_capacity_one_omits_survival_without_narrowing_state_row_storage():
+    from dataclasses import replace
     import flare_heliopause
+    from hyperflare_recipes.recipes.glm53.recipe import RECIPE
 
-    config, contract, manifest = _recipe_metadata("glm53", config_options=dict(mtp=False))
+    params = replace(
+        RECIPE.parameters, max_concurrency=4, speculation=None,
+        context_parallel=replace(RECIPE.parameters.context_parallel, enabled=False),
+    )
+    config, contract, manifest = _recipe_metadata("glm53", config_options=dict(parameters=params))
     assert config.completion_token_capacity == manifest["completion_token_capacity"] == 1
     fields = {buffer["name"]: buffer["shape"] for buffer in manifest["buffers"]}
     assert fields["completion_records"] == [2, 4, 17]

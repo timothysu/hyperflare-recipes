@@ -8,8 +8,9 @@ import json
 
 import pytest
 
-from ignition.cli import _parser, preparation
-from hyperflare_recipes.recipes import ResolvedModel, resolve
+from ignition.cli import parse_args, preparation
+from hyperflare_recipes.parameters import DraftQuantizationParameters
+from hyperflare_recipes.recipes import ResolvedModel, recipes, resolve
 from hyperflare_recipes.recipes.inkling2.recipe import RECIPE, MINI_RECIPE
 from tests.cli.test_planning import derive, gpu
 
@@ -42,8 +43,8 @@ def test_inkling_defaults_cover_tp4_seven_drafts_and_vision():
     assert RECIPE.max_concurrency == 32
     assert (RECIPE.max_images, RECIPE.image_bytes) == (4, 32 << 20)
     model = ResolvedModel(RECIPE, RECIPE.checkpoints[0])
-    args = _parser().parse_args(["export", model.checkpoint.alias])
-    speculation = preparation.speculation(args, model)
+    args = parse_args(["export", model.checkpoint.alias], recipes=recipes())
+    speculation = preparation.resolve_parameters(model, args).speculation
     assert (speculation.draft_tokens, speculation.token_capacity, speculation.graph_budget) == (7, 128, 64)
     assert speculation.packed_verification
     assert speculation.widths == tuple(range(1, 9))
@@ -53,8 +54,8 @@ def test_inkling_adapter_preserves_uncompiled_untuned_qualification(monkeypatch,
     from hyperflare_recipes.recipes.inkling2 import bootstrap
 
     devices = tuple(gpu(i, 95) for i in range(4))
-    plan = replace(derive(model=RECIPE, gpus=devices, selected=(0, 1, 2, 3), concurrency=8),
-                   autotune_effort="off")
+    plan = derive(model=RECIPE, gpus=devices, selected=(0, 1, 2, 3),
+                  parameters=replace(RECIPE.parameters, max_concurrency=8, autotune_effort="off"))
     captured = []
     configuration = bootstrap.PreparationConfig
 
@@ -91,11 +92,11 @@ def test_mini_proposal_head_quantization_plans_and_prepares(monkeypatch, tmp_pat
         argv += ["--draft-head-quantization", draft_head]
     if markov_head is not None:
         argv += ["--markov-head-quantization", markov_head]
-    args = _parser().parse_args(argv)
-    spec = preparation.speculation(args, model)
-    plan = derive(model=MINI_RECIPE, gpus=(gpu(0, 95),), selected=(0,), concurrency=8, speculation=spec)
-    assert plan.speculation.draft_head_quantization == draft_head
-    assert plan.speculation.markov_head_quantization == markov_head
+    args = parse_args(argv, recipes=recipes())
+    params = replace(preparation.resolve_parameters(model, args), max_concurrency=8)
+    plan = derive(model=MINI_RECIPE, gpus=(gpu(0, 95),), selected=(0,), parameters=params)
+    assert plan.parameters.draft_quantization.draft_head_quantization == draft_head
+    assert plan.parameters.draft_quantization.markov_head_quantization == markov_head
 
     captured = []
     configuration = bootstrap.PreparationConfig
@@ -116,17 +117,41 @@ def test_mini_proposal_head_quantization_plans_and_prepares(monkeypatch, tmp_pat
 
 
 def test_mini_rejects_undeclared_proposal_head_quantization():
-    from ignition.planning import UsageError
+    from ignition.errors import UsageError
     from hyperflare_recipes.recipes.inkling2.bootstrap import PreparationConfig
 
-    bad_markov = replace(MINI_RECIPE.speculation, markov_head_quantization="fp8")
+    bad_markov = replace(
+        MINI_RECIPE.parameters,
+        max_concurrency=8,
+        draft_quantization=replace(MINI_RECIPE.parameters.draft_quantization, markov_head_quantization="fp8"),
+    )
     with pytest.raises(UsageError, match="markov-head-quantization"):
-        derive(model=MINI_RECIPE, gpus=(gpu(0, 95),), selected=(0,), concurrency=8, speculation=bad_markov)
-    small_draft = replace(RECIPE.speculation, draft_head_quantization="nvfp4")
-    with pytest.raises(UsageError, match="draft-head-quantization"):
-        derive(model=RECIPE, gpus=tuple(gpu(i, 95) for i in range(4)), selected=(0, 1, 2, 3),
-               concurrency=8, speculation=small_draft)
+        derive(model=MINI_RECIPE, gpus=(gpu(0, 95),), selected=(0,), parameters=bad_markov)
+    with pytest.raises(UsageError, match="is not supported"):
+        parse_args(["export", RECIPE.checkpoints[0].alias, "--draft-head-quantization", "nvfp4"], recipes=recipes())
     with pytest.raises(ValueError, match="requires drafting"):
-        PreparationConfig(devices=(0,), drafting=False, draft_head_quantization="nvfp4")
+        PreparationConfig(
+            devices=(0,),
+            parameters=replace(
+                MINI_RECIPE.parameters,
+                speculation=None,
+                draft_quantization=DraftQuantizationParameters(
+                    draft_head_quantization="nvfp4",
+                    draft_head_choices=("nvfp4", "mxfp8"),
+                    markov_head_choices=("nvfp4",),
+                ),
+            ),
+        )
     with pytest.raises(ValueError, match="requires drafting"):
-        PreparationConfig(devices=(0,), drafting=False, markov_head_quantization="nvfp4")
+        PreparationConfig(
+            devices=(0,),
+            parameters=replace(
+                MINI_RECIPE.parameters,
+                speculation=None,
+                draft_quantization=DraftQuantizationParameters(
+                    markov_head_quantization="nvfp4",
+                    draft_head_choices=("nvfp4", "mxfp8"),
+                    markov_head_choices=("nvfp4",),
+                ),
+            ),
+        )

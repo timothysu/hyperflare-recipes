@@ -33,7 +33,7 @@ runtime_patches.apply = check_before_patches
 policy = configure_environment(sys.argv[1], sys.argv[2], [SimpleNamespace(uuid='GPU-selected')])
 assert policy['recipe'] == 'kimi31'
 assert policy['recipe_b12x'] == dict(RECIPE.b12x_environment)
-assert policy['collective_tuning'] == 'static' and policy['autotune_effort'] == 'default'
+assert policy['autotune_effort'] == 'default'
 assert policy['effective_b12x']['B12X_PCIE_DCP_BLOCK_LIMIT'] == '8'
 assert policy['effective_b12x']['B12X_COMPILE_CACHE_DIR'].endswith('/kernels/b12x')
 assert os.environ['CUDA_VISIBLE_DEVICES'] == 'GPU-selected'

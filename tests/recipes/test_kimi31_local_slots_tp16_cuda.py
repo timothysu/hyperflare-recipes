@@ -202,8 +202,7 @@ def exercise(rank, rendezvous, output, diagnose=False):
             inputs.source[:, :3] = _features(0, torch.arange(4, device=device) + 512)
             with RecordedPreparationSession(device=device, checkpoint="kimi31-dspark-sparse-verification",
                     workload_schema="four-interleaved-query-rows", numerical_policy="fp32-score-bits-bf16-mla",
-                    coordinator=coordinator, compile_workers=24, autotune_effort="default",
-                    collective_tuning="static") as session:
+                    coordinator=coordinator, compile_workers=24, autotune_effort="default") as session:
                 arena = ScratchArena(device)
                 session.register_scratch(arena)
                 metadata = Metadata.allocate(4, 1, pages, device, samples=8, max_query_tokens=8)

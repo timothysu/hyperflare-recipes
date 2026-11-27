@@ -3,6 +3,7 @@
 
 """Packed target head construction exposes expanded local rows to its consumers."""
 
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -11,6 +12,7 @@ import torch
 from hyperflare_recipes.components.vocabulary import PreparedVocabularyProjection
 from hyperflare_recipes.recipes.deepseek41.decoder import PreparedDecoder
 from hyperflare_recipes.recipes.deepseek41.bootstrap import PreparationConfig
+from hyperflare_recipes.recipes.deepseek41.recipe import RECIPE
 
 
 class CpuProjection:
@@ -27,8 +29,10 @@ class CpuProjection:
         return value if self.output is None else self.output.copy_(value)
 
 
-@pytest.mark.parametrize("batch,physical", PreparationConfig(max_active=4,
-    speculative_widths=tuple(range(1, 9)), speculative_token_capacity=32).packed_speculative_shapes)
+@pytest.mark.parametrize("batch,physical", PreparationConfig(
+    parameters=replace(RECIPE.parameters, max_concurrency=4,
+                       speculation=replace(RECIPE.speculation, draft_tokens=7, token_capacity=32))
+).packed_speculative_shapes)
 def test_packed_head_factory_uses_disjoint_logical_local_output(monkeypatch, batch, physical):
     monkeypatch.setattr("hyperflare_recipes.components.vocabulary.UnquantizedProjection", CpuProjection)
     decoder = PreparedDecoder.__new__(PreparedDecoder)

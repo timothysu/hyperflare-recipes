@@ -6,7 +6,7 @@
 import contextlib
 import hashlib
 import json
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from functools import partial
 from pathlib import Path
 from types import SimpleNamespace
@@ -47,7 +47,12 @@ from .decoder import PreparedDecoder, Scratch
 from .pool import ContinuationPool, continuation_layout, page_bytes
 from .weights import ModelWeights
 from .vision import FEATURES, PATCH_CAPACITIES, PreparedVision, PreparedVisionGeneration, VisionInputs, VisionScratch
+from .recipe import MiniMaxM3Parameters, RECIPE
 from ignition.preparation.bootstrap import BasePreparationConfig
+
+
+def _default_parameters() -> MiniMaxM3Parameters:
+    return RECIPE.parameters
 
 
 def _target_decoder(weights, tables, scratch, metadata, pool, **kwargs):
@@ -56,30 +61,44 @@ def _target_decoder(weights, tables, scratch, metadata, pool, **kwargs):
 
 @dataclass(frozen=True)
 class PreparationConfig(BasePreparationConfig):
-    image_concurrency: int | None = None
+    parameters: MiniMaxM3Parameters = field(default_factory=_default_parameters)
     devices: tuple[int, ...] = (0, 1, 2, 3)
     hosts: tuple[str, ...] | None = None
-    roce_ring: bool = False
-    roce_chain: bool = False
     context: int = 1048576
-    max_active: int = 32
-    stream_overlap: bool = True
-    expert_scale_compression: str | None = None
-    dspark: bool = True
-    vision: bool = True
     diagnostic_graphs: tuple[str, ...] | None = None
     diagnostic_support_graphs: tuple[str, ...] = ()
     diagnostic_cache_pages: int | None = None
-    speculative_token_capacity: int | None = 128
-    speculative_graph_budget: int = 64
     packed_verification: bool | None = None
     draft_prefix_selection: str | None = None
 
+    @property
+    def native_dense_activations(self) -> bool:
+        return self.parameters.native_dense_activations.enabled
+
+    @property
+    def stream_overlap(self) -> bool:
+        return self.parameters.stream_overlap.enabled
+
+    @property
+    def expert_scale_compression(self) -> str | None:
+        return self.parameters.expert_scale_compression.encoding
+
+    @property
+    def dspark(self) -> bool:
+        return self.parameters.speculation is not None
+
+    @property
+    def vision(self) -> bool:
+        return self.parameters.vision is not None and not self.parameters.vision.language_model_only
+
     def __post_init__(self):
+        if not isinstance(self.parameters, MiniMaxM3Parameters):
+            raise TypeError("MiniMax M3 PreparationConfig requires MiniMaxM3Parameters")
         if self.mtp_only and (not self.dspark
                 or max(self.speculative_widths, default=1) <= 1 or self.speculative_fixed_width == 1):
             raise ValueError("--mtp-only requires enabled learned speculation with positive draft depth")
-        object.__setattr__(self, "image_concurrency", image_capacity(self.max_active, self.image_concurrency))
+        if self.vision:
+            image_capacity(self.max_active, self.image_concurrency)
         if (not isinstance(self.devices, tuple) or len(self.devices) != 4
                 or self.hosts is not None and (not isinstance(self.hosts, tuple) or len(self.hosts) != 4)
                 or len(set(zip(self.hosts or ("",) * 4, self.devices))) != 4
@@ -128,7 +147,7 @@ class PreparationConfig(BasePreparationConfig):
         from ignition.components.capacity import packed_speculative_shapes
 
         return packed_speculative_shapes(self.max_active, max(self.speculative_widths),
-            self.speculative_token_capacity, self.speculative_graph_budget) if self.packed_verification else ()
+            self.speculative_token_capacity, self.speculative_graph_budget or 64) if self.packed_verification else ()
 
     @property
     def completion_token_capacity(self):
@@ -212,7 +231,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage):
                 ring=config.roce_ring, ring_open=config.roce_chain, core_storage=core_storage)
             vision_collective = collective if config.vision else None
         else:
-            collective = create_all_reduce_runtime(group, device, collective_tuning=config.collective_tuning, max_tokens=max(decode_tokens, draft_tokens), hidden_size=weights.config.hidden,
+            collective = create_all_reduce_runtime(group, device, max_tokens=max(decode_tokens, draft_tokens), hidden_size=weights.config.hidden,
                 element_bytes=4, ipc=core_storage.peer_storage)
             prefill_collective = create_dma_all_reduce_runtime(group, device, max_tokens=tokens,
                 hidden_size=weights.config.hidden, ipc=core_storage.peer_storage)
@@ -233,7 +252,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage):
             tuning_replica=config.tuning_replica, device=device, checkpoint=identity,
             workload_schema="minimax-m3", numerical_policy="default", coordinator=coordinator,
             headroom_bytes=config.headroom_bytes, benchmark_storage=core_storage,
-            collective_tuning=config.collective_tuning, collective_ladder=config.collective_ladder, autotune_effort=config.autotune_effort)
+            autotune_effort=config.autotune_effort)
         session.__enter__()
         register_benchmark_state(session, pool.reserved_backing, storage=pool.reserved_backing,
                                  restore=pool.clear_for_preparation)

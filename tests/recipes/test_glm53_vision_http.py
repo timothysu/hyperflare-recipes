@@ -64,15 +64,23 @@ def check_image_answers(address, model):
 
 @pytest.mark.parametrize("mtp", [False, True])
 def test_native_glm_image_answers(mtp, record_property):
+    from dataclasses import replace
     import flare_heliopause
     from hyperflare_recipes.recipes.glm53.bootstrap import PreparationConfig, prepare_rank
+    from hyperflare_recipes.recipes.glm53.recipe import RECIPE
 
     assert os.environ.get("CUDA_VISIBLE_DEVICES"), "assign a GPU explicitly"
     assert hasattr(flare_heliopause, "Server"), "build heliopause with its qualification feature"
     snapshot = Path(os.environ["FLARE_GLM53_SNAPSHOT"])
-    config = PreparationConfig(devices=(0,), context=8192, prefill_chunk_size=512, max_active=1,
-                               pages=128, snapshot_budget_bytes=2 << 30, headroom_bytes=4 << 30,
-                               compile_decoder=True, mtp=mtp)
+    params = replace(
+        PreparationConfig().parameters,
+        prefill_chunk=512,
+        max_concurrency=1,
+        compiled_forwards=True,
+        speculation=RECIPE.speculation if mtp else None,
+    )
+    config = PreparationConfig(parameters=params, devices=(0,), context=8192,
+                               pages=128, snapshot_budget_bytes=2 << 30, headroom_bytes=4 << 30)
     with prepare_rank(snapshot, config, rank=0, group=None) as prepared:
         server = prepared.start_server(bind="127.0.0.1:0", template_defaults={"reasoning_effort": "low"})
         answers = check_image_answers(server.address, prepared.server_config["model_id"])

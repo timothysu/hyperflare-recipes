@@ -242,7 +242,7 @@ def test_dense_declaration_survives_repeated_functional_finalization(monkeypatch
 
 
 @pytest.mark.parametrize("encoded", [False, True])
-def test_projection_chain_rebinds_contextual_plan_before_runtime_launch(monkeypatch, encoded):
+def test_projection_chain_binds_selected_plan_on_finalization(monkeypatch, encoded):
     from types import SimpleNamespace
     from hyperflare_recipes.components import projection_overlap as module
 
@@ -262,8 +262,7 @@ def test_projection_chain_rebinds_contextual_plan_before_runtime_launch(monkeypa
     monkeypatch.setattr(module, "_start", lambda *args: calls.append((args[-2][0], args[-3].nbytes)))
     source = torch.ones(2, 4)
     bases = torch.ones(2, 4), torch.ones(2, dtype=torch.uint8), torch.ones(2, dtype=torch.uint8)
-    for handle, size in ((3, 32), (7, 96)):
-        owner.plan = plan(handle, size)
-        chain._finalize_functional()
-        chain.start(source, encoded_bases=bases if encoded else None)
-        assert calls[-1] == (handle, size)
+    owner.plan = plan(7, 96)
+    chain._finalize_functional()
+    chain.start(source, encoded_bases=bases if encoded else None)
+    assert calls == [(7, 96)]

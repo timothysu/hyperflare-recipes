@@ -129,6 +129,8 @@ def test_qsa_binding_refreshes_selected_payload_and_resized_workspace(
     )
     module = SimpleNamespace(
         config=SimpleNamespace(rms_norm_eps=1e-6),
+        q_norm=torch.nn.RMSNorm(256, eps=1e-6),
+        k_norm=torch.nn.RMSNorm(256, eps=1e-6),
         indexer=SimpleNamespace(
             q_layernorm=SimpleNamespace(weight=torch.zeros(128)),
             k_layernorm=SimpleNamespace(weight=torch.zeros(128)),

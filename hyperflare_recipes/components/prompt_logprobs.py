@@ -217,9 +217,15 @@ class PreparedPromptScoring:
         rows = min(BLOCK_ROWS, source.shape[0])
         logits = zeros((rows, local), logits_dtype)
         self.offset = persistent_copy(torch.tensor([rank * local], dtype=torch.int32, device=source.device))
+        from .tensor_fp8 import TensorFP8Projection, TensorFP8Weight
+
         self.parts = []
-        projection_type = UnquantizedProjection if isinstance(weight, torch.Tensor) else QuantizedProjection
-        options = {} if isinstance(weight, torch.Tensor) else dict(activation_mode=activation_mode)
+        if isinstance(weight, torch.Tensor):
+            projection_type, options = UnquantizedProjection, {}
+        elif isinstance(weight, TensorFP8Weight):
+            projection_type, options = TensorFP8Projection, {}
+        else:
+            projection_type, options = QuantizedProjection, dict(activation_mode=activation_mode)
         for start in range(0, source.shape[0], rows):
             count = min(rows, source.shape[0] - start)
             view = source[start:start + count]

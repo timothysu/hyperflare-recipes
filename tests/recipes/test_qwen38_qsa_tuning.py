@@ -111,7 +111,9 @@ def test_qwen_qsa_request_tunes_active_candidates_and_replays(rows, batch):
     scratch = QSAScratch.allocate(rows, device, world_size=2)
     source = torch.zeros(rows, 2560, device=device, dtype=torch.bfloat16)
     norm = SimpleNamespace(weight=torch.zeros(128, device=device))
+    qk_norm = torch.nn.RMSNorm(256, eps=1e-6, device=device)
     module = SimpleNamespace(config=SimpleNamespace(rms_norm_eps=1e-6),
+                             q_norm=qk_norm, k_norm=qk_norm,
                              indexer=SimpleNamespace(q_layernorm=norm, k_layernorm=norm))
     weights = {"qkv_proj": torch.zeros(scratch.projected_qkv.shape[1], 2560,
                                       device=device, dtype=torch.bfloat16),

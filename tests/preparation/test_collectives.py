@@ -291,23 +291,6 @@ def test_race_winners_prefer_lower_latency_then_lower_candidate_index():
         _tuning_results([race("c", 0, 0, assignment=False), race("c", 0, 1, assignment=False)])
 
 
-def test_sharded_finalists_preserve_empty_shards_and_rank_order():
-    from dataclasses import replace
-    from b12x.preparation import FinalistPolicy, FinalistRecord, FrozenMapping, TuningRequirement
-    from ignition.preparation.collectives import _tuning_results
-
-    policy = FinalistPolicy(family_fields=("width",))
-    assignment = FrozenMapping({"width": 1})
-    first = TuningRequirement("qkv", (0, 1, 2, 3), assignment, 5., 0,
-        finalist_policy=policy,
-        finalists=(FinalistRecord(assignment=assignment, family=assignment, candidate_index=0, latency_us=5.),))
-    shards = (first, *(replace(first, assignment=None, latency_us=None, candidate_index=None,
-                              finalists=()) for _ in range(3)))
-    assert _tuning_results(shards) == shards
-    with pytest.raises(ValueError, match="policies differ"):
-        _tuning_results((first, replace(shards[1], finalist_policy=None)))
-
-
 def test_ranks_report_whether_a_value_matches_every_rank(monkeypatch):
     owner = coordinator(monkeypatch)
     monkeypatch.setattr(dist, "get_rank", lambda: 4)
@@ -465,19 +448,17 @@ def test_differing_tuning_races_report_bounded_counts_and_release_job(monkeypatc
     assert closed == [True]
 
 
-@pytest.mark.parametrize("mode", [None, "static", "runtime"])
-def test_joint_workspace_is_provisioned_only_for_runtime_selection(monkeypatch, mode):
+def test_create_all_reduce_runtime_uses_static_pcie_channel(monkeypatch):
     from b12x.comm.pcie import AllReduce
     from ignition.preparation.collectives import create_all_reduce_runtime
 
     calls = []
     result, group, device, ipc = object(), object(), object(), object()
     monkeypatch.setattr(AllReduce, "from_exchange_group", lambda **kwargs: calls.append(kwargs) or result)
-    options = {} if mode is None else {"collective_tuning": mode}
-    assert create_all_reduce_runtime(group, device, max_tokens=32, hidden_size=2560, ipc=ipc, **options) is result
+    assert create_all_reduce_runtime(group, device, max_tokens=32, hidden_size=2560, ipc=ipc) is result
     assert calls == [dict(exchange_group=group, device=device, single_channel=True,
                          max_size=32 * 2560 * 2, eager_buffer_bytes=32 * 2560 * 2,
-                         ipc=ipc, joint=mode == "runtime")]
+                         ipc=ipc)]
 
 
 @pytest.mark.parametrize("configured,widened", [(20_000_000, 600_000_000), (900_000_000, 900_000_000)])

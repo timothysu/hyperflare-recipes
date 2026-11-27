@@ -71,6 +71,132 @@ def test_qsa_metadata_and_state_geometry():
     assert (state.raw_interval_start_positions == -1).all()
 
 
+def test_qk_head_norm_mrope_validates_inputs():
+    """qk_head_norm_mrope rejects invalid geometry, eps, layouts, and cross-device operands before launch."""
+    from hyperflare_recipes.components.head_norm_rope import qk_head_norm_mrope
+
+    tokens, q_heads, kv_heads, head_dim = 4, 2, 1, 256
+    qkv = torch.zeros((tokens, (q_heads + kv_heads) * 2 * head_dim), dtype=torch.bfloat16)
+    qw = torch.zeros((head_dim,), dtype=torch.bfloat16)
+    kw = torch.zeros((head_dim,), dtype=torch.bfloat16)
+    pos = torch.zeros((tokens, 3), dtype=torch.int64)
+    cos = torch.ones((16, 32), dtype=torch.float32)
+    sin = torch.zeros((16, 32), dtype=torch.float32)
+
+    base = dict(q_heads=q_heads, kv_heads=kv_heads, eps=1e-6)
+    for bad in (
+        dict(q_heads=0),
+        dict(q_heads=True),
+        dict(kv_heads=0),
+        dict(kv_heads=False),
+        dict(eps=None),
+        dict(eps=-1e-6),
+        dict(eps=float("nan")),
+        dict(eps=True),
+        dict(head_dim=192),
+        dict(rotary_dim=0),
+        dict(rotary_dim=63),
+        dict(rotary_dim=512),
+        dict(mrope_section=(11, 21)),
+        dict(mrope_section=(-1, 17, 16)),
+        dict(mrope_section=(11, 11, 11)),
+    ):
+        with pytest.raises(ValueError):
+            qk_head_norm_mrope(qkv, qw, kw, pos, cos, sin, **{**base, **bad})
+
+    for bad_qkv in (
+        torch.zeros((), dtype=torch.bfloat16),
+        torch.zeros((tokens,), dtype=torch.bfloat16),
+        torch.zeros((0, qkv.shape[1]), dtype=torch.bfloat16),
+        torch.zeros((tokens, qkv.shape[1] - 1), dtype=torch.bfloat16),
+        torch.zeros_like(qkv, dtype=torch.float32),
+        qkv.T.contiguous().T,
+    ):
+        with pytest.raises(ValueError):
+            qk_head_norm_mrope(bad_qkv, qw, kw, pos, cos, sin, **base)
+
+    with pytest.raises(ValueError):
+        qk_head_norm_mrope(qkv, qw[::2], kw, pos, cos, sin, **base)
+    with pytest.raises(ValueError):
+        qk_head_norm_mrope(qkv, qw, torch.zeros((128,), dtype=torch.bfloat16), pos, cos, sin, **base)
+    with pytest.raises(ValueError):
+        qk_head_norm_mrope(qkv, qw, kw, torch.zeros((tokens, 2), dtype=torch.int64), cos, sin, **base)
+    with pytest.raises(ValueError):
+        qk_head_norm_mrope(qkv, qw, kw, pos, cos, torch.zeros((8, 32), dtype=torch.float32), **base)
+    with pytest.raises(ValueError, match="same device"):
+        qk_head_norm_mrope(qkv, qw.to("meta"), kw, pos, cos, sin, **base)
+
+
+def test_prepared_attention_validates_qk_norms(monkeypatch):
+    """PreparedAttention accepts matching ungrouped Qwen4ExpTextRMSNorm/RMSNorm and rejects invalid norms."""
+    from types import SimpleNamespace
+    from transformers.models.qwen4_exp.modeling_qwen4_exp import Qwen4ExpTextRMSNorm
+    import hyperflare_recipes.recipes.qwen38.attention as attention_mod
+
+    class DummyPlan:
+        def request(self, **kwargs):
+            return kwargs
+
+    class DummySession:
+        def declare(self, *args, **kwargs):
+            pass
+
+        def register_finalizer(self, *args, **kwargs):
+            pass
+
+    monkeypatch.setattr(attention_mod, "declare", lambda *args, **kwargs: None)
+    monkeypatch.setattr(attention_mod, "register_finalizer", lambda *args, **kwargs: None)
+    monkeypatch.setattr(attention_mod, "QuantizedProjection", lambda *args, **kwargs: None)
+    monkeypatch.setattr(attention_mod.qsa, "Caps", lambda **kwargs: SimpleNamespace(**kwargs))
+    monkeypatch.setattr(attention_mod.qsa, "invocation_from_tensors", lambda *args, **kwargs: kwargs)
+    monkeypatch.setattr(attention_mod.qsa, "plan", lambda *args, **kwargs: DummyPlan())
+    monkeypatch.setattr(attention_mod.paged_kv_write, "Caps", lambda **kwargs: kwargs)
+    monkeypatch.setattr(attention_mod.paged_kv_write, "plan", lambda *args, **kwargs: DummyPlan())
+
+    device = torch.device("cpu")
+    source = torch.zeros((16, 2560), dtype=torch.bfloat16)
+    scratch = QSAScratch.allocate(16, device)
+    state = QSAState.allocate(pages=1, slots=1, device=device)
+    metadata = QSAMetadata.allocate(tokens=16, batch=1, context=128, device=device)
+    rotary = RotaryTables(torch.ones(128, 32), torch.zeros(128, 32), torch.zeros(32, dtype=torch.int64))
+    weights = {name: object() for name in ("qkv_proj", "o_proj", "indexer.index_qk_proj")}
+    arena = ScratchArena("cpu")
+    session = DummySession()
+
+    def build(q_norm, k_norm):
+        module = SimpleNamespace(
+            config=SimpleNamespace(rms_norm_eps=1e-6),
+            q_norm=q_norm,
+            k_norm=k_norm,
+            indexer=SimpleNamespace(
+                q_layernorm=SimpleNamespace(weight=torch.zeros(128)),
+                k_layernorm=SimpleNamespace(weight=torch.zeros(128)),
+            ),
+        )
+        return PreparedAttention(
+            module, weights, source, scratch, state, metadata, rotary,
+            session=session, name="qsa", workspace=arena, max_cache_pages=2,
+        )
+
+    op_qwen = build(Qwen4ExpTextRMSNorm(256, eps=1e-6), Qwen4ExpTextRMSNorm(256, eps=1e-6))
+    assert op_qwen._qk_norm_zero_centered is True
+
+    op_torch = build(torch.nn.RMSNorm(256, eps=1e-6), torch.nn.RMSNorm(256, eps=1e-6))
+    assert op_torch._qk_norm_zero_centered is False
+
+    for bad_q, bad_k in (
+        (torch.nn.RMSNorm(256), torch.nn.RMSNorm(256)),
+        (torch.nn.RMSNorm(256, eps=-1e-6), torch.nn.RMSNorm(256, eps=-1e-6)),
+        (torch.nn.RMSNorm(256, eps=float("nan")), torch.nn.RMSNorm(256, eps=float("nan"))),
+        (torch.nn.RMSNorm(256, eps=1e-6), torch.nn.RMSNorm(256, eps=1e-5)),
+        (Qwen4ExpTextRMSNorm(256, eps=1e-6), torch.nn.RMSNorm(256, eps=1e-6)),
+        (Qwen4ExpTextRMSNorm(256, group_size=64, eps=1e-6), Qwen4ExpTextRMSNorm(256, group_size=64, eps=1e-6)),
+        (SimpleNamespace(eps=1e-6, weight=torch.zeros(256)), SimpleNamespace(eps=1e-6, weight=torch.zeros(256))),
+    ):
+        with pytest.raises(ValueError, match="QSA fused Q/K RMSNorm"):
+            build(bad_q, bad_k)
+
+
 def test_rotary_tables_match_canonical_multimodal_positions(manifest):
     from transformers.models.qwen4_exp.modeling_qwen4_exp import (
         Qwen4ExpTextRotaryEmbedding,

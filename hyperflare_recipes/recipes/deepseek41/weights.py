@@ -14,7 +14,7 @@ from hyperflare_recipes.components.vocabulary import mxfp8_draft_head, nvfp4_dra
 from hyperflare_recipes.components.markov_sampling import fp8_markov_head
 from ignition.preparation.persistent import persistent_copy, allocated_tensor_bytes
 
-from .config import ModelConfig
+from .config import ModelConfig, row_shard_attention_encoder_layers
 from ignition.preparation.rebuild_manifest import weight_container
 
 
@@ -78,12 +78,16 @@ class ModelWeights:
     draft: DSparkWeights | None
     allocated_bytes: int
     vision: dict | None = None
+    replicated_attention: dict | None = None
 
     @classmethod
     def load(cls, manifest, device, *, shard, progress=None, dspark=False, confidence=False,
              expert_scale_compression=None, draft_head_quantization=None, markov_head_quantization=None,
-             vocabulary_parallel_sampling=False, engram_full_projection=None):
+             vocabulary_parallel_sampling=False, engram_full_projection=None,
+             row_shard_attention=False):
         config = ModelConfig.load(manifest.metadata_path)
+        if row_shard_attention and shard.world_size > 1:
+            config.require_planned_attention_schedule()
         before = allocated_tensor_bytes(device)
         with DeepSeekWeightLoader(manifest, device, shard=shard, progress=progress, dspark=dspark,
                                  expert_scale_compression=expert_scale_compression,
@@ -106,8 +110,13 @@ class ModelWeights:
             vision = ({name: loader.load_tensor(name) for name in loader._sources
                        if name.startswith(("vision.", "aligner.", "image_"))}
                       if config.vision is not None else None)
+            replicated_attention = (
+                {i: loader.load_replicated_attention(i)
+                 for i in row_shard_attention_encoder_layers(config)}
+                if row_shard_attention and shard.world_size > 1 else None
+            )
         return cls(config, shard, embedding, norm, head, layers, draft,
-                   allocated_tensor_bytes(device) - before, vision)
+                   allocated_tensor_bytes(device) - before, vision, replicated_attention)
 
 
 class DeepSeekWeightLoader(BlockFP8WeightLoader):
@@ -139,6 +148,18 @@ class DeepSeekWeightLoader(BlockFP8WeightLoader):
                     or name.startswith(("vision.", "aligner.", "image_"))
                     or name in ("embed.weight", "norm.weight", "head.weight"))
                 and ".engram.embed." not in name}
+
+    def load_replicated_attention(self, layer):
+        text = self.config.text
+        attn = f"layers.{layer}.attn"
+        all_heads = (0, text["num_attention_heads"] * text["head_dim"])
+        all_groups = (0, text["o_groups"] * text["o_lora_rank"])
+        all_sink = (0, text["num_attention_heads"])
+        return {
+            "q_b_full": self.load_linear_group((attn + ".wq_b",), row_ranges=(all_heads,), pad=True),
+            "output_full": self.load_attention_output(attn, all_groups, pad=True),
+            "sink_full": self.load_padded_tensor(attn + ".attn_sink", rows=all_sink),
+        }
 
     def load_layer(self, layer, *, draft=False):
         prefix = f"mtp.{layer}" if draft else f"layers.{layer}"

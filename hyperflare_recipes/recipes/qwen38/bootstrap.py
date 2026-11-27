@@ -9,7 +9,7 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import torch
@@ -19,6 +19,11 @@ from hyperflare_recipes.components.prompt_logprobs import (
     PreparedScoredPrefill, PromptScoring, prefill_graph_count, prefill_modes,
 )
 
+from ignition.parameters import (
+    MixedPrefillParameters,
+    PromptLogprobsParameters,
+    VisionParameters,
+)
 from ignition.preparation.tuning_replicas import TuningReplica
 from ignition.preparation.tuning import with_autotune_effort
 
@@ -27,6 +32,8 @@ from ignition.preparation.collectives import (
     CollectivePreparation,
     create_all_gather_runtime,
     create_all_reduce_runtime,
+    create_dma_all_reduce_runtime,
+    create_result_broadcast_runtime,
     create_roce_runtime,
 )
 from ignition.components.capacity import speculative_token_capacity, batch_capacities, request_capacity, serving_modes
@@ -52,7 +59,7 @@ from .checkpoint_schema import (
 from ignition.preparation.scratch import ScratchArena
 from ignition.progress import phase
 
-from .recipe import RECIPE
+from .recipe import Qwen38Parameters, RECIPE
 from .attention import QSAState, RotaryTables
 from .decoder import DecoderScratch, ModelWeights, PreparedDecoder
 from .decoder_state import DecoderInputs, PreparedDecoderState, PreparedResume
@@ -69,35 +76,79 @@ from .vision import PreparedVision, VisionScratch
 from ignition.preparation.bootstrap import BasePreparationConfig
 
 
+# Prefill chunks of at least this many tokens all-reduce through the copy-engine ring.
+_DMA_PREFILL_TOKENS = 1024
+
+
+def _default_parameters() -> Qwen38Parameters:
+    return Qwen38Parameters(
+        max_concurrency=4,
+        max_concurrency_limit=64,
+        prefill_chunk=4096,
+        speculation=None,
+        vision=VisionParameters(),
+        prompt_logprobs=PromptLogprobsParameters(),
+        mixed_prefill=MixedPrefillParameters(),
+    )
+
+
+def _terminal_prefill_capacities(prefill_capacities: tuple[int, ...], *, has_terminal_op: bool) -> tuple[int, ...]:
+    """Select chunk capacities that split into non-terminal prefill and terminal_prefill graphs."""
+    if not has_terminal_op or not prefill_capacities or prefill_capacities[-1] < 512:
+        return ()
+    return (prefill_capacities[-1],)
+
+
 @dataclass(frozen=True)
 class PreparationConfig(BasePreparationConfig):
-    prompt_logprobs: bool = False
-    image_concurrency: int | None = None
-    force_moe_decode_a16: bool = False
-    online_mxfp8: bool = False
-    draft_head_quantization: str | None = None
+    parameters: Qwen38Parameters = field(default_factory=_default_parameters)
     device: int = 0
     devices: tuple[int, ...] | None = None
     # Each rank's host when ranks run on separate hosts; devices are then host-local ordinals.
     hosts: tuple[str, ...] | None = None
-    roce_ring: bool = False
-    roce_chain: bool = False
-    mixed_prefill: bool = False
     pages: int | None = None
-    mtp: bool = False
-    speculative_method: str = "mtp"
     draft_snapshot: Path | None = None
-    # Run shared experts, small-batch attention projections and selection, and GDN input projections
-    # on an auxiliary stream; without overlap every branch runs serially on the main stream.
-    stream_overlap: bool = True
-    shard_hyperconnections: bool = False
+
+    @property
+    def native_dense_activations(self) -> bool:
+        return self.parameters.native_dense_activations.enabled
+
+    @property
+    def force_moe_decode_a16(self) -> bool:
+        return self.parameters.force_moe_decode_a16
+
+    @property
+    def online_mxfp8(self) -> bool:
+        return self.parameters.online_mxfp8.enabled
+
+    @property
+    def draft_head_quantization(self) -> str | None:
+        return self.parameters.draft_quantization.draft_head_quantization
+
+    @property
+    def stream_overlap(self) -> bool:
+        return self.parameters.stream_overlap.enabled
+
+    @property
+    def shard_hyperconnections(self) -> bool:
+        return self.parameters.shard_hyperconnections
+
+    @property
+    def mtp(self) -> bool:
+        return self.parameters.speculation is not None
+
+    @property
+    def speculative_method(self) -> str:
+        if self.parameters.speculation is None or self.parameters.speculation.method is None:
+            return "mtp"
+        return self.parameters.speculation.method
 
     def __post_init__(self):
+        if not isinstance(self.parameters, Qwen38Parameters):
+            raise TypeError("Qwen3.8 PreparationConfig requires Qwen38Parameters")
         if self.mtp_only and (not self.mtp
                 or max(self.speculative_widths, default=1) <= 1 or self.speculative_fixed_width == 1):
             raise ValueError("--mtp-only requires enabled learned speculation with positive draft depth")
-        from ignition.components.capacity import image_capacity
-
         if self.draft_head_quantization not in (None, "nvfp4", "mxfp8"):
             raise ValueError("draft head quantization must be nvfp4 or mxfp8")
         if (self.online_mxfp8 or self.draft_head_quantization is not None) and (
@@ -111,7 +162,6 @@ class PreparationConfig(BasePreparationConfig):
             if self.mixed_prefill:
                 raise ValueError("DFlash2 requires separate prefill and verification graphs")
 
-        object.__setattr__(self, "image_concurrency", image_capacity(self.max_active, self.image_concurrency))
         from ignition.planning import host_shape_error
 
         error = host_shape_error(self.roce_ring, self.roce_chain, None if self.hosts is None else len(self.hosts))
@@ -142,8 +192,8 @@ class PreparationConfig(BasePreparationConfig):
             raise ValueError("prefill chunk size must be 64-aligned in [64,context]")
         if self.pages is not None and (type(self.pages) is not int or self.pages <= 0):
             raise ValueError("explicit page capacity must be a positive integer")
-        if type(self.mtp) is not bool or type(self.stream_overlap) is not bool:
-            raise TypeError("MTP and stream overlap switches must be booleans")
+        if type(self.stream_overlap) is not bool:
+            raise TypeError("stream_overlap must be a boolean")
         if type(self.mixed_prefill) is not bool:
             raise TypeError("mixed_prefill must be a boolean")
         world_size = 1 if self.devices is None else len(self.devices)
@@ -337,25 +387,71 @@ def _prepare_model(snapshot: Path, config: PreparationConfig | None = None, *, t
                    if has_dflash else 0)
     coordinator = CollectivePreparation(group) if group is not None else None
     ipc = None if core_storage is None else core_storage.peer_storage
-    collective = vocabulary_collective = hidden_gather_collective = None
+    collective = prefill_collective = vocabulary_collective = hidden_gather_collective = result_collective = shortlist_gather_collective = None
+    qsa_decode_gather_collective = qsa_prefill_gather_collective = None
     reduction_width = 10240 if config.shard_hyperconnections else 2560
+    result_layouts = ()
+    if group is not None:
+        slots_capacity = config.request_capacity
+        result_layouts = (dict(sampled=((slots_capacity,), torch.int64), valid=((slots_capacity,), torch.bool),
+                               maximum=((slots_capacity,), torch.float32), mass=((slots_capacity, 1), torch.float32)),)
+        if config.mtp:
+            from hyperflare_recipes.components.draft_sampling import (
+                PreparedDraftBlockBroadcast,
+                PreparedDraftDistribution,
+            )
+            from hyperflare_recipes.components.speculation import SpeculativeAcceptance
+
+            max_width = max(config.speculative_widths)
+            result_layouts += (SpeculativeAcceptance.broadcast_layout(slots_capacity, max_width),)
+            if max_width > 1:
+                result_layouts += (
+                    PreparedDraftDistribution.broadcast_layout(slots_capacity),
+                    PreparedDraftBlockBroadcast.broadcast_layout(slots_capacity, max_width - 1),
+                )
     if coordinator is not None and coordinator.spans_hosts:
+        from ignition.components.collectives import packed_broadcast_layout
+
         # Ranks on separate Sparks reduce and gather through one RoCEnante runtime: decode rows
         # one-shot, prefill chunks through the pipelined two-shot path.
-        collective = vocabulary_collective = create_roce_runtime(group, device,
+        result_bytes = max((packed_broadcast_layout(layout.values())[1] for layout in result_layouts), default=0)
+        collective = prefill_collective = vocabulary_collective = result_collective = create_roce_runtime(group, device,
             max_tokens=max(config.request_capacity, vocabulary_rows, hidden_rows), pipe_tokens=config.token_capacity, hidden_size=reduction_width,
             gather_bytes=max(vocabulary_rows * (248320 // shard.world_size) * 2,
-                             hidden_rows * (2560 // shard.world_size) * 2), core_storage=core_storage, ring=config.roce_ring, ring_open=config.roce_chain)
+                             hidden_rows * (2560 // shard.world_size) * 2,
+                             (result_bytes + 15) // 16 * 16), core_storage=core_storage, ring=config.roce_ring, ring_open=config.roce_chain)
         hidden_gather_collective = collective if has_dflash else None
+        shortlist_gather_collective = collective if has_dflash else None
     elif group is not None:
-        collective = create_all_reduce_runtime(group, device, collective_tuning=config.collective_tuning, max_tokens=max(config.token_capacity, draft_rows), hidden_size=reduction_width, ipc=ipc)
+        collective = create_all_reduce_runtime(group, device, max_tokens=max(config.token_capacity, draft_rows), hidden_size=reduction_width, ipc=ipc)
+        if config.prefill_chunk_size >= _DMA_PREFILL_TOKENS:
+            prefill_collective = create_dma_all_reduce_runtime(
+                group, device, max_tokens=config.prefill_chunk_size, hidden_size=reduction_width, ipc=ipc
+            )
         vocabulary_collective = create_all_gather_runtime(group, device, max_rows=vocabulary_rows, columns=248320, ipc=ipc)
+        result_collective = create_result_broadcast_runtime(group, device, layouts=result_layouts, ipc=ipc)
         if has_dflash:
             hidden_gather_collective = create_all_gather_runtime(group, device,
                 max_rows=hidden_rows, columns=2560, ipc=ipc)
+            shortlist_top_k = draft_config.text["dflash_config"]["selector_top_k"]
+            shortlist_cols = ((shortlist_top_k * 4 + 63) // 64) * 64
+            shortlist_gather_collective = create_all_gather_runtime(group, device,
+                max_rows=draft_rows, columns=shortlist_cols * shard.world_size, ipc=ipc)
+        if shard.world_size in (2, 4):
+            qsa_decode_max_rows = min(128, max(config.request_capacity, sample_rows))
+            if config.context % (64 * shard.world_size) == 0 and qsa_decode_max_rows > 0:
+                qsa_decode_gather_collective = create_all_gather_runtime(
+                    group, device, max_rows=qsa_decode_max_rows, columns=2048 * shard.world_size, ipc=ipc
+                )
+            if config.prefill_chunk_size >= 512 and config.prefill_chunk_size % (32 * shard.world_size) == 0:
+                qsa_prefill_gather_collective = create_all_gather_runtime(
+                    group, device,
+                    max_rows=config.prefill_chunk_size // shard.world_size,
+                    columns=1024 * shard.world_size, ipc=ipc,
+                )
     collectives = dict(runtime=collective, vocabulary_runtime=vocabulary_collective, coordinator=coordinator)
     session = preparation_session(
-        compile_workers=config.compile_workers, collective_tuning=config.collective_tuning, collective_ladder=config.collective_ladder, autotune_effort=config.autotune_effort, tuning_replica=config.tuning_replica,
+        compile_workers=config.compile_workers, autotune_effort=config.autotune_effort, tuning_replica=config.tuning_replica,
         native_dense_activations=config.native_dense_activations, lock_gpu_clocks=config.lock_gpu_clocks,
         device=device, checkpoint=REVISION, coordinator=coordinator,
         namespace={"config": manifest.metadata_sha256["config.json"], "headers": manifest.headers_sha256, "world_size": shard.world_size,
@@ -418,10 +514,14 @@ def _prepare_model(snapshot: Path, config: PreparationConfig | None = None, *, t
                 if has_dflash:
                     from .dflash import SpeculativePreparation
                     draft_options = dict(draft_weights=draft_weights, draft_config=draft_config, draft_head=draft_head,
-                                         draft_embedding=draft_embedding, gather_runtime=hidden_gather_collective)
+                                         draft_embedding=draft_embedding, gather_runtime=hidden_gather_collective,
+                                         result_runtime=result_collective, shortlist_runtime=shortlist_gather_collective,
+                                         qsa_gather_runtime=qsa_decode_gather_collective,
+                                         block_proposal_broadcast=True, shortlist_only=True)
                 else:
                     from .speculative_model import SpeculativePreparation
-                    draft_options = dict(mtp_weights=mtp_weights)
+                    draft_options = dict(mtp_weights=mtp_weights, result_runtime=result_collective,
+                                         qsa_gather_runtime=qsa_decode_gather_collective)
 
                 speculation = SpeculativePreparation(weights=weights, **draft_options,
                     pool=state, requests=requests, inputs=inputs, scratch=scratch, workspaces=workspaces,
@@ -434,7 +534,11 @@ def _prepare_model(snapshot: Path, config: PreparationConfig | None = None, *, t
         scoring = PromptScoring.allocate(config, device, buffers, frame=frame, group=group, ipc=ipc,
             runtime=collective, coordinator=coordinator)
         graph_modes = serving_modes(config.mtp, config.mtp_only)
+        terminal_capacities = _terminal_prefill_capacities(
+            config.prefill_capacities, has_terminal_op=hasattr(contract_proto, "TERMINAL_PREFILL"),
+        )
         graph_count = (4 + len(graph_modes) * (prefill_graph_count(config.prefill_capacities, scoring)
+                                              + len(terminal_capacities)
                                               + 4 * len(config.batch_capacities))
                        + (len(config.batch_capacities) if False in graph_modes else 0)
                        + (len(config.speculative_shapes) if config.mtp else 0)
@@ -474,35 +578,59 @@ def _prepare_model(snapshot: Path, config: PreparationConfig | None = None, *, t
                     () if enabled else reversed(config.batch_capacities), scoring)
                 for kind, mode, capacities in modes:
                     for capacity in capacities:
-                        rows = 1 if mode == "prefill" else capacity
-                        name = f"{kind}{capacity}" + (suffix if mode == "prefill" else "")
-                        metadata = PreparedDecoderState(inputs, requests, state, tokens=capacity, rows=rows, mode=mode,
-                            maintain_draft_state=enabled and has_mtp)
-                        s = scratch.rows(capacity, rows)
-                        injection = None
-                        if mode == "prefill":
-                            injection = PreparedEmbeddingInjection(features, requests, inputs.vision_token_indices[:capacity],
-                                inputs.row_slot_ids, inputs.row_generations, inputs.query_lengths, inputs.live_rows,
-                                s.embedding, rows=rows)
-                            injection.prepare()
-                        decoder = PreparedDecoder(weights, s, metadata, cache, rotary, table, workspaces,
-                            completion, frame, sequence, session=session, name=name,
-                            embedding_injection=injection, max_cache_pages=planned_pages,
-                            sampling_workspace=sampling_workspace,
-                            scoring=scoring if kind == "scored_prefill" else None, **collectives)
-                        if enabled:
-                            forward = speculation.prefill(decoder, name)
-                            if has_mtp:
-                                forward.functional(session=session)
-                        else:
-                            from .decoder import PreparedDecoderForward
-                            decoder.functional(session=session)
-                            decoder.release_outputs()
-                            forward = PreparedDecoderForward(decoder)
-                        add(name, forward, kind, rows,
-                            capacity if mode == "prefill" else 1,
-                            forward_fields, enabled=enabled)
-                        decoders.append(decoder)
+                        variants = (
+                            (("prefill", False), ("terminal_prefill", True))
+                            if kind == "prefill" and capacity in terminal_capacities
+                            else ((kind, True),)
+                        )
+                        for graph_kind, sample in variants:
+                            rows = 1 if mode == "prefill" else capacity
+                            name = f"{graph_kind}{capacity}" + (suffix if mode == "prefill" else "")
+                            metadata = PreparedDecoderState(inputs, requests, state, tokens=capacity, rows=rows, mode=mode,
+                                maintain_draft_state=enabled and has_mtp)
+                            s = scratch.rows(capacity, rows)
+                            injection = None
+                            if mode == "prefill":
+                                injection = PreparedEmbeddingInjection(features, requests, inputs.vision_token_indices[:capacity],
+                                    inputs.row_slot_ids, inputs.row_generations, inputs.query_lengths, inputs.live_rows,
+                                    s.embedding, rows=rows)
+                                injection.prepare()
+                            decoder_collectives = (
+                                {**collectives, "runtime": prefill_collective, "barrier_runtime": collective}
+                                if prefill_collective is not None and mode == "prefill" and capacity >= _DMA_PREFILL_TOKENS
+                                else dict(collectives)
+                            )
+                            if (mode == "prefill" and qsa_prefill_gather_collective is not None
+                                    and capacity >= 512 and capacity % (32 * shard.world_size) == 0):
+                                decoder_collectives.update(
+                                    qsa_gather_runtime=qsa_prefill_gather_collective, qsa_shard_mode="row"
+                                )
+                            elif mode == "decode" and qsa_decode_gather_collective is not None and capacity <= 128:
+                                decoder_collectives.update(
+                                    qsa_gather_runtime=qsa_decode_gather_collective, qsa_shard_mode="group"
+                                )
+                            decoder = PreparedDecoder(weights, s, metadata, cache, rotary, table, workspaces,
+                                completion, frame, sequence, session=session, name=name,
+                                embedding_injection=injection, max_cache_pages=planned_pages,
+                                sampling_workspace=sampling_workspace, result_runtime=result_collective,
+                                scoring=scoring if graph_kind == "scored_prefill" else None,
+                                sample=sample, **decoder_collectives)
+                            # Retain speculative prefill absorption on non-terminal chunks so
+                            # classic MTP Layer-48 KV and DFlash2 draft KV rings remain complete
+                            # at any dynamically selected prefix checkpoint cut.
+                            if enabled:
+                                forward = speculation.prefill(decoder, name)
+                                if has_mtp:
+                                    forward.functional(session=session)
+                            else:
+                                from .decoder import PreparedDecoderForward
+                                decoder.functional(session=session)
+                                decoder.release_outputs()
+                                forward = PreparedDecoderForward(decoder)
+                            add(name, forward, graph_kind, rows,
+                                capacity if mode == "prefill" else 1,
+                                forward_fields, enabled=enabled)
+                            decoders.append(decoder)
 
             if speculation is not None:
                 forward_fields = (*inputs.buffers(), "sampling_grammar_mask",
@@ -530,7 +658,7 @@ def _prepare_model(snapshot: Path, config: PreparationConfig | None = None, *, t
                     weights=weights, pool=state, requests=requests, inputs=inputs, scratch=scratch,
                     workspaces=workspaces, rotary=rotary, cache=cache, table=table, session=session,
                     completion=completion, frame=frame, sequence=sequence, max_cache_pages=planned_pages,
-                    collectives=collectives, sampling_workspace=sampling_workspace)
+                    collectives=collectives, result_runtime=result_collective, sampling_workspace=sampling_workspace)
                 for enabled, batch, width, prefill in config.mixed_shapes:
                     name = f"mixed{batch}x{width}p{prefill}" + ("" if enabled else "-no-mtp")
                     operation = PreparedMixedRound(mixed_owner, batch, width, prefill, name,
@@ -553,6 +681,7 @@ def _prepare_model(snapshot: Path, config: PreparationConfig | None = None, *, t
                     resume = PreparedResume(inputs, requests, state, scratch.sample_hidden[:capacity],
                         scratch.logits[:capacity], weights.tree.lm_head.weight, completion, frame, sequence,
                         session=session, name=name, vocabulary_runtime=vocabulary_collective,
+                        result_runtime=result_collective,
                         local_logits=None if scratch.local_logits is None else scratch.local_logits[:capacity],
                         coordinator=coordinator, sampling_workspace=sampling_workspace)
                     resume.functional(session=session)
@@ -686,7 +815,7 @@ def _prepare_model(snapshot: Path, config: PreparationConfig | None = None, *, t
                 speculative_fixed_width=config.speculative_fixed_width)
         resources = (scoring, weights, table, session, state, requests, inputs, workspaces, rotary,
             cache, final_cache, admission, transfer, features, vision_inputs,
-            functions, compiled_functions, decoders, owners, stream, graph_pool, speculation, mtp_weights, draft_weights, draft_head, draft_config, collective, vocabulary_collective, hidden_gather_collective, coordinator)
+            functions, compiled_functions, decoders, owners, stream, graph_pool, speculation, mtp_weights, draft_weights, draft_head, draft_config, collective, prefill_collective, vocabulary_collective, hidden_gather_collective, result_collective, shortlist_gather_collective, qsa_decode_gather_collective, qsa_prefill_gather_collective, coordinator)
         report(f"prepared {len(graphs)} graphs with {page_capacity} preparation KV pages")
         from .export import disposable_ranges
 
@@ -705,8 +834,8 @@ def _prepare_model(snapshot: Path, config: PreparationConfig | None = None, *, t
             export_events=table.events(), core_data=table if rank == 0 else None,
             resources=resources, server_config=server_config, memory_report=memory, session=session,
             close_resources=(table, *((scoring,) if scoring is not None else ()),
-                             *((hidden_gather_collective,) if hidden_gather_collective is not None
-                               and hidden_gather_collective is not collective else ()),
+                             *tuple(runtime for runtime in (prefill_collective, hidden_gather_collective, result_collective, shortlist_gather_collective, qsa_decode_gather_collective, qsa_prefill_gather_collective)
+                                    if runtime is not None and runtime is not collective),
                              *((vocabulary_collective, collective) if collective is not None else ())))
     except BaseException:
         torch.cuda.synchronize(device)

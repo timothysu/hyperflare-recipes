@@ -26,6 +26,7 @@ class SpeculativePreparation(DFlash2Preparation):
             page_tokens=PAGE_TOKENS, completion=completion, frame=frame, sequence=sequence,
             session=session, workspace=workspace,
             verification_width=verification_width, study_width=study_width,
+            block_proposal_broadcast=True, shortlist_only=True,
         )
 
     def release_examples(self):

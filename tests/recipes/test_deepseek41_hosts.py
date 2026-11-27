@@ -25,14 +25,23 @@ def test_four_hosts_may_each_use_their_own_gpu_zero():
 @pytest.mark.parametrize("draft_tokens", [5, 7])
 @pytest.mark.parametrize("remote", [False, True])
 def test_recipe_dispatches_the_complete_plan_to_the_rank_group(monkeypatch, remote, draft_tokens, world):
+    from dataclasses import replace
+    from ignition.parameters import SpeculationParameters
     from ignition.preparation import rank_group
-    from ignition.declaration import Speculation
+    from hyperflare_recipes.parameters import ExpertScaleCompressionParameters
 
     gpus = tuple(planning.Gpu(i, "GB10", f"GPU-{i}", 128 << 30, 120 << 30, (12, 1)) for i in range(world))
-    plan = planning.fit(recipe.RECIPE, recipe.RECIPE.checkpoints[0], gpus, concurrency=16,
-        reserve_bytes=6 << 30, speculation=Speculation(draft_tokens=draft_tokens, token_capacity=128,
-            packed_verification=True, draft_prefix_selection="gpu"),
-        expert_scale_compression="csf")
+    params = replace(
+        recipe.RECIPE.parameters,
+        max_concurrency=16,
+        speculation=SpeculationParameters(
+            draft_tokens=draft_tokens, max_draft_tokens=7, token_capacity=128,
+            packed_verification=True, draft_prefix_selection="gpu", graph_budget=64,
+        ),
+        expert_scale_compression=ExpertScaleCompressionParameters(encoding="csf"),
+    )
+    plan = planning.fit(recipe.RECIPE, recipe.RECIPE.checkpoints[0], gpus,
+                        parameters=params, reserve_bytes=6 << 30)
     ranks = SimpleNamespace(hosts=("hertz", "faraday", "ampere", "maxwell", "kelvin", "curie")[:world]) if remote else None
     calls, result, storage = [], object(), object()
     monkeypatch.setattr(rank_group, "prepare_group", lambda *args, **kwargs: calls.append((args, kwargs)) or result)
@@ -51,9 +60,17 @@ def test_recipe_dispatches_the_complete_plan_to_the_rank_group(monkeypatch, remo
 
 @pytest.mark.parametrize("draft_tokens", [0, 5, 7])
 def test_remote_channels_cover_vocab_and_sampling_results_without_pcie(monkeypatch, draft_tokens):
-    config = bootstrap.PreparationConfig(devices=(0,) * 4, hosts=("a", "b", "c", "d"), max_active=16,
-        dspark=draft_tokens > 0, speculative_widths=tuple(range(1, draft_tokens + 2)),
-        speculative_token_capacity=128)
+    from dataclasses import replace
+    from ignition.parameters import SpeculationParameters
+
+    spec = None if draft_tokens == 0 else SpeculationParameters(
+        draft_tokens=draft_tokens, max_draft_tokens=7, token_capacity=128,
+        packed_verification=True, draft_prefix_selection="gpu", graph_budget=64,
+    )
+    config = bootstrap.PreparationConfig(
+        devices=(0,) * 4, hosts=("a", "b", "c", "d"),
+        parameters=replace(recipe.RECIPE.parameters, max_concurrency=16, speculation=spec),
+    )
     calls, runtime, storage = [], object(), object()
     monkeypatch.setattr(bootstrap, "create_roce_runtime",
         lambda group, device, **kwargs: calls.append(kwargs) or runtime)
@@ -81,8 +98,11 @@ def test_remote_channels_cover_vocab_and_sampling_results_without_pcie(monkeypat
 
 
 def test_local_target_and_draft_channels_preserve_their_element_widths(monkeypatch):
-    config = bootstrap.PreparationConfig(max_active=1,
-        speculative_widths=tuple(range(1, 9)))
+    from dataclasses import replace
+
+    config = bootstrap.PreparationConfig(
+        parameters=replace(recipe.RECIPE.parameters, max_concurrency=1),
+    )
     channels = []
     def gather(group, device, **kwargs):
         result = object()
@@ -109,17 +129,3 @@ def test_draft_factory_uses_its_bf16_channel_without_changing_target(monkeypatch
     draft(vocabulary_runtime=target_runtime)
     assert calls[0]['vocabulary_runtime'] is draft_runtime
     assert target.keywords['mla_compute_mode'] == calls[0]['mla_compute_mode'] == 'bf16'
-
-
-@pytest.mark.parametrize("mode", ["static", "runtime"])
-def test_local_reduction_workspace_follows_collective_tuning(monkeypatch, mode):
-    config = bootstrap.PreparationConfig(collective_tuning=mode, max_active=1)
-    calls = []
-    monkeypatch.setattr(bootstrap, "create_all_reduce_runtime",
-                        lambda *args, **kwargs: calls.append(kwargs) or object())
-    for name in ("create_all_gather_runtime", "create_dma_all_reduce_runtime", "create_result_broadcast_runtime"):
-        monkeypatch.setattr(bootstrap, name, lambda *args, **kwargs: object())
-    bootstrap._collective_runtimes(config, None, None,
-        coordinator=SimpleNamespace(spans_hosts=False),
-        core_storage=SimpleNamespace(peer_storage=object()), verification_samples=8)
-    assert calls[0]["collective_tuning"] == mode

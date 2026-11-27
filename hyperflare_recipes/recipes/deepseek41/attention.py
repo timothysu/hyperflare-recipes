@@ -4,6 +4,7 @@
 
 """Windowed MLA, source-shared compression, and two-level sparse selection."""
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 
 import torch
@@ -27,6 +28,7 @@ from hyperflare_recipes.components.projection_overlap import (
 from hyperflare_recipes.components.rms_norm import PreparedRMSNorm
 from ignition.components.state import gather_rows, gather_rows_three, save_hidden
 from hyperflare_recipes.components.window_indices import PreparedWindowIndices, WindowIndices
+from ignition.preparation.examples import declaration_tensor
 from ignition.preparation.persistent import persistent_copy
 from ignition.preparation.tensor_metadata import record_numeric_tensor
 from ignition.preparation.tuning import declare, register_finalizer
@@ -39,7 +41,20 @@ from .pool import PAGE_TOKENS
 
 
 # Bound indexer workspace while amortizing prefill selection launches.
-INDEXER_QUERY_ROWS = 128
+INDEXER_QUERY_ROWS = 512
+
+
+@dataclass(frozen=True)
+class ShardAttentionInputs:
+    """Rank-local slices of shared encoder attention geometry across microbatch halves."""
+
+    window_indices: tuple[torch.Tensor, torch.Tensor]
+    window_lengths: tuple[torch.Tensor, torch.Tensor]
+    angles: dict[tuple[bool, int], tuple[torch.Tensor, torch.Tensor]]
+    index_lengths: tuple[torch.Tensor, torch.Tensor] | None = None
+    compressed_lengths: tuple[torch.Tensor, torch.Tensor] | None = None
+    page_table: tuple[torch.Tensor, torch.Tensor] | None = None
+    active_width_a: torch.Tensor | None = None
 
 
 @dataclass(frozen=True)
@@ -239,36 +254,46 @@ class AttentionScratch:
 
 
 class PreparedCompressor:
-    def __init__(self, layer, weights, source, metadata, pool, slots, *, session, name, deferred=False):
+    def __init__(self, layer, weights, source, metadata, pool, slots, *, session, name,
+                 deferred=False, examples=None, proj_tokens=None, compress_tokens=None):
         self.pool, self.layer = pool, layer
         self.weight = weights["norm"]
         self.deferred = deferred
         ratio = pool.config.text["compress_ratios"][layer]
         self.ratio = ratio
-        tokens, rows = source.shape[0], metadata.starts.numel()
+        total_tokens, rows = source.shape[0], metadata.starts.numel()
+        c_tokens = total_tokens if compress_tokens is None else compress_tokens
+        p_tokens = c_tokens if proj_tokens is None else proj_tokens
+        if not 0 < p_tokens <= c_tokens <= total_tokens:
+            raise ValueError("compressor projection and compression capacities must fit the source rows")
         device = source.device
         def zeros(shape, dtype):
             return torch.zeros(shape, device=device, dtype=dtype)
-        self.values = zeros((tokens, 512), torch.float32 if ratio == 2 else torch.bfloat16)
-        self.project_values = UnquantizedProjection(source, weights["values"], self.values,
+        values_dtype = torch.float32 if ratio == 2 else torch.bfloat16
+        self.values = declaration_tensor(examples, f"compressor.values.r{ratio}",
+            (c_tokens, 512), values_dtype, device)
+        self.project_values = UnquantizedProjection(source[:p_tokens], weights["values"], self.values[:p_tokens],
             session=session, name=f"{name}.values").functional(session=session)
-        self.output = zeros((tokens, 512), torch.bfloat16)
-        self.emitted = zeros(tokens, torch.bool)
-        self.slots = zeros(tokens, torch.int64).fill_(-1)
+        self.output = declaration_tensor(examples, "compressor.output", (c_tokens, 512), torch.bfloat16, device)
+        self.emitted = declaration_tensor(examples, "compressor.emitted", (c_tokens,), torch.bool, device)
+        self.slots = declaration_tensor(examples, "compressor.slots", (c_tokens,), torch.int64, device)
+        if examples is None:
+            self.slots.fill_(-1)
         self.state_ids = persistent_copy(torch.arange(rows, dtype=torch.int64, device=device))
         record_numeric_tensor(self.state_ids)
         self.arguments = dict(values=self.values, weight=weights["norm"], query_start_loc=metadata.query_start_loc,
-            positions=metadata.starts, state_ids=self.state_ids, destination_slots=slots,
+            positions=metadata.starts, state_ids=self.state_ids, destination_slots=slots[:c_tokens],
             live_counts=metadata.live_counts, out=self.output, emitted=self.emitted, emitted_slots=self.slots)
         if ratio == 2:
-            self.gates = zeros(self.values.shape, self.values.dtype)
-            self.project_gates = UnquantizedProjection(source, weights["gates"], self.gates,
+            self.gates = declaration_tensor(examples, "compressor.gates",
+                self.values.shape, self.values.dtype, device)
+            self.project_gates = UnquantizedProjection(source[:p_tokens], weights["gates"], self.gates[:p_tokens],
                 session=session, name=f"{name}.gates").functional(session=session)
             self.pending = {key: zeros((rows, 512) if key != "pending_position" else (rows,),
                 torch.float32 if key != "pending_position" else torch.int64)
                 for key in ("pending_values", "pending_gates", "pending_position")}
             self.arguments.update(gates=self.gates, **self.pending)
-        self.plan = mla_compress.plan(mla_compress.Caps(device=device, max_tokens=tokens,
+        self.plan = mla_compress.plan(mla_compress.Caps(device=device, max_tokens=c_tokens,
             max_requests=rows, max_states=rows, ratio=ratio))
 
         declaration = self.arguments
@@ -276,9 +301,9 @@ class PreparedCompressor:
         def prepare(state):
             arguments = {key: value if key in ("weight", "state_ids") else torch.zeros_like(value)
                          for key, value in declaration.items()}
-            arguments["query_start_loc"].copy_(torch.arange(rows + 1, device=device) * tokens // rows)
-            arguments["live_counts"].copy_(torch.tensor([tokens, rows], dtype=torch.int32, device=device))
-            arguments["destination_slots"].copy_(torch.arange(tokens, device=device))
+            arguments["query_start_loc"].copy_(torch.arange(rows + 1, device=device) * c_tokens // rows)
+            arguments["live_counts"].copy_(torch.tensor([c_tokens, rows], dtype=torch.int32, device=device))
+            arguments["destination_slots"].copy_(torch.arange(c_tokens, device=device))
             if ratio == 2:
                 arguments["pending_position"].fill_(-1)
             binding = state.bind(**arguments)
@@ -293,6 +318,61 @@ class PreparedCompressor:
         self.values = self.output = self.emitted = self.slots = self.arguments = None
         if self.ratio == 2:
             self.gates = self.pending = None
+
+    def project_shard(self, source_shard):
+        values = self.project_values(source_shard)
+        gates = self.project_gates(source_shard) if self.ratio == 2 else None
+        return values, gates
+
+    def init_pending(self, metadata, device):
+        if self.ratio != 2:
+            return None
+        rows = metadata.starts.numel()
+        pending = {
+            key: torch.empty(
+                (rows, 512) if key != "pending_position" else (rows,),
+                dtype=torch.float32 if key != "pending_position" else torch.int64,
+                device=device,
+            )
+            for key in ("pending_values", "pending_gates", "pending_position")
+        }
+        gather_rows_three(
+            tuple(self.pool.region(f"layer{self.layer}.{key}") for key in pending),
+            metadata.state_rows,
+            tuple(pending.values()),
+        )
+        return pending
+
+    def compress_half(self, values_half, gates_half, metadata, slots_half, *, half_idx, pending=None):
+        from b12x.attention.mla_compress._impl import _run_ratio1, _run_ratio2
+
+        m = metadata
+        h = values_half.shape[0]
+        offset = 0 if half_idx == 0 else h
+        nt = (m.live_counts[:1] - offset).clamp(0, h).to(torch.int32)
+        qsl = torch.cat((m.query_start_loc[:1], nt), dim=0)
+        counts = torch.cat((nt, m.live_counts[1:2]), dim=0)
+        starts = m.starts if half_idx == 0 else m.starts + h
+        output = torch.empty((h, 512), dtype=torch.bfloat16, device=values_half.device)
+        emitted = torch.empty(h, dtype=torch.bool, device=values_half.device)
+        emitted_slots = torch.empty((h,), dtype=torch.int64, device=values_half.device)
+        if self.ratio == 2:
+            if pending is None:
+                raise ValueError("ratio 2 half-chunk compression requires pending carry tensors")
+            _run_ratio2(self.plan.handle, values_half, gates_half, self.weight, qsl, starts,
+                self.state_ids, slots_half, counts, *pending.values(), output, emitted, emitted_slots)
+            if half_idx == 1 and not self.deferred:
+                active = m.lengths > 0
+                has_carry = active & (pending["pending_position"] >= 0)
+                for key in ("pending_values", "pending_gates"):
+                    save_hidden(pending[key].view(pending[key].shape[0], -1),
+                                self.pool.region(f"layer{self.layer}.{key}"), m.state_rows, has_carry)
+                save_hidden(pending["pending_position"].view(pending["pending_position"].shape[0], -1),
+                            self.pool.region(f"layer{self.layer}.pending_position"), m.state_rows, active)
+        else:
+            _run_ratio1(self.plan.handle, values_half, self.weight, qsl, starts,
+                self.state_ids, slots_half, counts, output, emitted, emitted_slots)
+        return output, emitted_slots
 
     def __call__(self, source, metadata, slots):
         from b12x.attention.mla_compress._impl import _run_ratio1, _run_ratio2
@@ -341,28 +421,67 @@ class PreparedGlobalKV:
     """Project and store every source row before decoder queries are packed."""
 
     def __init__(self, layer, weights, source, scratch, metadata, pool, rotary, *,
-                 session, name, indices, deferred=False):
+                 session, name, indices, deferred=False, examples=None,
+                 proj_tokens=None, compress_tokens=None):
         self.rotary = rotary
         self.ratio = pool.config.text["compress_ratios"][layer]
         if indices.metadata is not metadata or indices.position.shape != (source.shape[0],):
             raise ValueError("global KV indices must describe every source row")
+        c_tokens = source.shape[0] if compress_tokens is None else compress_tokens
         slots = indices.compressed(self.ratio).slots
         self.angles = indices.rotary_angles(rotary, compressed=True, ratio=self.ratio)
         self.compressor = PreparedCompressor(layer, weights["compressor"], source, metadata,
-            pool, slots, session=session, name=f"{name}.compress", deferred=deferred)
-        self.index_key = UnquantizedProjection(self.compressor.output, weights["index_k"], scratch.index_keys,
-            session=session, name=f"{name}.index_key").functional(session=session)
+            pool, slots, session=session, name=f"{name}.compress", deferred=deferred,
+            examples=examples, proj_tokens=proj_tokens, compress_tokens=compress_tokens)
+        self.index_key = UnquantizedProjection(self.compressor.output, weights["index_k"],
+            scratch.index_keys[:c_tokens], session=session, name=f"{name}.index_key").functional(session=session)
         self.eps = pool.config.text["rms_norm_eps"]
         self.index_norm_weight = weights["index_norm"]
         record_numeric_tensor(self.index_norm_weight)
         self.index_norm = (None if self.angles.split else PreparedRMSNorm(
-            scratch.index_keys, weights["index_norm"], scratch.normalized_keys,
+            scratch.index_keys[:c_tokens], weights["index_norm"], scratch.normalized_keys[:c_tokens],
             eps=self.eps, session=session, name=name + ".index_norm").functional())
         self.writer = PreparedCompressedCacheWriter(self.compressor.output,
             pool.pages[f"layer{layer}.latent_page"], self.compressor.slots,
             page_size=PAGE_TOKENS // self.ratio, kind="indexed", session=session,
             name=f"{name}.compressed_write").functional(session=session)
         self.compressor.functional(session=session)
+
+    def plans(self):
+        result = [self.compressor.project_values.plan, self.compressor.plan,
+                  self.index_key.plan, self.writer.plan]
+        if self.index_norm is not None:
+            result.append(self.index_norm.plan)
+        if hasattr(self.compressor, "project_gates"):
+            result.append(self.compressor.project_gates.plan)
+        return tuple(p for p in result if p is not None)
+
+    def run_half(self, values_half, gates_half, indexer, metadata, geometry, *,
+                 half_idx, pending=None, angles=None):
+        h = values_half.shape[0]
+        sl = slice(0, h) if half_idx == 0 else slice(h, 2 * h)
+        latent, slots = self.compressor.compress_half(
+            values_half, gates_half, metadata, geometry.slots[sl],
+            half_idx=half_idx, pending=pending)
+        keys_raw = self.index_key(latent)
+        half_angles = None if angles is None else angles[sl]
+        if half_angles is not None and self.angles.split:
+            keys = _index_norm_and_rotate(keys_raw, self.index_norm_weight, latent, half_angles, self.eps)
+            indexer.write_keys(keys, slots)
+        elif half_angles is not None:
+            keys = self.index_norm(keys_raw)
+            self.angles.apply(keys, half_angles)
+            indexer.write_keys(keys, slots)
+            self.angles.apply(latent, half_angles)
+        else:
+            keys = torch.empty_like(keys_raw) if self.index_norm is None else self.index_norm(keys_raw)
+            if self.index_norm is None:
+                normalize(keys_raw, self.index_norm_weight, keys, self.eps)
+            self.rotary.apply(keys, geometry.position[sl], compressed=True)
+            indexer.write_keys(keys, slots)
+            self.rotary.apply(latent, geometry.position[sl], compressed=True)
+        self.writer(latent, slots)
+        return latent
 
     def __call__(self, source, indexer, metadata, geometry, angles=None):
         latent, slots, records = self.compressor(source, metadata, geometry.slots)
@@ -402,14 +521,29 @@ def _commit_window(Staged, Window, State, Starts, Lengths, STRIDE: tl.constexpr,
 class PreparedAttention:
     def __init__(self, layer, weights, source, scratch, metadata, pool, rotary, *, mode,
                  world, session, name, workspace, replay_start=None, window_staging=None,
-                 mla_compute_mode="auto", window_metadata=None, examples=None, pipelined_mode=None):
+                 mla_compute_mode="auto", window_metadata=None, examples=None, pipelined_mode=None,
+                 qkv_encoded=None, shard_tokens=None, replicated_weights=None):
         self.layer, self.weights, self.scratch, self.metadata = layer, weights, scratch, metadata
         self.pool, self.rotary, self.mode = pool, rotary, mode
         self.replay_start = replay_start
         if pipelined_mode not in (None, "full", "mla_wo"):
             raise ValueError(f"unsupported pipelined attention mode: {pipelined_mode!r}")
+        if qkv_encoded is not None and pipelined_mode != "full":
+            raise ValueError("preencoded qkv_a requires full pipelined attention")
         if pipelined_mode == "full" and ("compressor" in weights or "index_q" in weights):
             raise ValueError("full pipelined attention requires a non-source, non-indexer layer")
+        if pipelined_mode == "mla_wo" and "compressor" not in weights and "index_q" not in weights:
+            raise ValueError("mla_wo pipelined attention requires a source or indexer layer")
+        if (shard_tokens is None) != (replicated_weights is None):
+            raise ValueError("row-sharded attention requires both shard_tokens and replicated_weights")
+        self.row_shard_attention = shard_tokens is not None
+        if self.row_shard_attention:
+            if mode != "prefill" or pipelined_mode not in ("full", "mla_wo"):
+                raise ValueError("row-sharded attention requires prefill mode with pipelined attention")
+            if qkv_encoded is not None:
+                raise ValueError("row-sharded attention owns shard-local qkv_a quantization and rejects preencoded qkv_a")
+            if "index_q" in weights and layer >= pool.config.text["candidate_source_layer_id"]:
+                raise ValueError("row-sharded attention indexer requires an encoder layer before candidate selection")
         self.pipelined_mode = pipelined_mode
         config = pool.config
         draft = mode == "draft"
@@ -420,8 +554,36 @@ class PreparedAttention:
         if pipelined_mode is not None and (tokens < 2 or tokens % 2 != 0):
             raise ValueError("pipelined attention requires an even token capacity >= 2")
         self.half_tokens = tokens // 2
-        prefix_tokens = self.half_tokens if pipelined_mode == "full" else tokens
-        mla_tokens = self.half_tokens if pipelined_mode in ("full", "mla_wo") else tokens
+        if self.row_shard_attention:
+            if type(shard_tokens) is not int or shard_tokens <= 0 or self.half_tokens % shard_tokens != 0:
+                raise ValueError("row-sharded attention shard_tokens must be a positive divisor of half_tokens")
+            if (not isinstance(replicated_weights, Mapping)
+                    or any(replicated_weights.get(k) is None for k in ("q_b_full", "output_full", "sink_full"))):
+                raise ValueError("row-sharded attention requires q_b_full, output_full, and sink_full weights")
+            num_heads = config.text.get("num_attention_heads", 64)
+            head_dim = config.text.get("head_dim", 512)
+            o_groups = config.text.get("o_groups", 8)
+            q_b_weight = replicated_weights["q_b_full"]
+            output_weight = replicated_weights["output_full"]
+            sink_weight = replicated_weights["sink_full"]
+            q_b_out = getattr(q_b_weight, "out_features", None)
+            out_groups = getattr(output_weight, "groups", None)
+            if ((q_b_out is not None and q_b_out != num_heads * head_dim)
+                    or (out_groups is not None and out_groups != o_groups)
+                    or not isinstance(sink_weight, torch.Tensor)
+                    or sink_weight.shape != (num_heads,)
+                    or sink_weight.dtype != torch.float32
+                    or sink_weight.device != device):
+                raise ValueError("row-sharded attention replicated weights must span all heads and output groups")
+            self.shard_tokens = shard_tokens
+            prefix_tokens = shard_tokens
+            mla_tokens = shard_tokens
+            window_tokens = self.half_tokens
+        else:
+            self.shard_tokens = 0
+            prefix_tokens = self.half_tokens if pipelined_mode == "full" else tokens
+            mla_tokens = self.half_tokens if pipelined_mode in ("full", "mla_wo") else tokens
+            window_tokens = prefix_tokens
         rows = metadata.starts.numel()
         def zeros(shape, dtype):
             return torch.zeros(shape, dtype=dtype, device=device)
@@ -434,8 +596,8 @@ class PreparedAttention:
                 raise ValueError("verification window staging must match the contiguous cache geometry")
             self.window_cache = window_staging
         else:
-            self.window_cache = self.window if mode == "decode" else zeros(
-                (rows, self.window_page_size * 528), torch.uint8)
+            self.window_cache = self.window if mode == "decode" else declaration_tensor(
+                examples, "attention.window_cache", (rows, self.window_page_size * 528), torch.uint8, device)
         window_width = self.window_page_size if draft else 128
         self.owns_window_metadata = window_metadata is None
         if window_metadata is None:
@@ -462,9 +624,21 @@ class PreparedAttention:
         self.index_lengths = zeros(tokens, torch.int32) if geometry is None else geometry.index_lengths
         self.page_table = metadata.token_page_table
         self.projections = {}
+        if self.row_shard_attention:
+            query_buf = declaration_tensor(
+                examples, "row_shard.attn_query", (prefix_tokens, num_heads, head_dim), torch.bfloat16, device)
+            attended_buf = declaration_tensor(
+                examples, "row_shard.attn_attended", (mla_tokens, num_heads, head_dim), torch.bfloat16, device)
+        else:
+            q_b_weight = weights["q_b"]
+            output_weight = weights["output"]
+            sink_weight = weights["sink"]
+            query_buf = scratch.query[:prefix_tokens]
+            attended_buf = scratch.attended[:mla_tokens]
         use_b12x_mxfp8 = not sm103_projection.is_sm103(device)
-        paired_mxfp8 = use_b12x_mxfp8 and all(isinstance(getattr(weights[key], "weight", None), mxfp8.MXFP8Rows)
-                           for key in ("qkv_a", "q_b"))
+        paired_mxfp8 = use_b12x_mxfp8 and all(
+            isinstance(getattr(w, "weight", None), mxfp8.MXFP8Rows)
+            for w in (weights["qkv_a"], q_b_weight))
         use_a16_qkv = (paired_mxfp8 and prefix_tokens <= 28
                        and not getattr(session, "native_dense_activations", False))
         self.norm_quant = (PreparedMLANormQuant(scratch.projected[:prefix_tokens],
@@ -473,18 +647,22 @@ class PreparedAttention:
             eps=self.eps, session=session, name=name + ".qkv_norm",
             release_dependents=prefix_tokens <= 8, examples=examples)
             if paired_mxfp8 and not use_a16_qkv and self.eps == 1e-20 and mla_norm_mxfp8.is_supported(device) else None)
-        for key, values, out in (
-            ("qkv_a", source[:prefix_tokens], scratch.projected[:prefix_tokens]),
-            ("q_b", scratch.query_low[:prefix_tokens], scratch.query[:prefix_tokens].view(prefix_tokens, -1)),
+        for key, w, values, out in (
+            ("qkv_a", weights["qkv_a"], source[:prefix_tokens], scratch.projected[:prefix_tokens]),
+            ("q_b", q_b_weight, scratch.query_low[:prefix_tokens], query_buf.view(prefix_tokens, -1)),
         ):
             packed_mxfp8 = use_b12x_mxfp8 and isinstance(
-                getattr(weights[key], "weight", None), mxfp8.MXFP8Rows)
+                getattr(w, "weight", None), mxfp8.MXFP8Rows)
             use_quantized_seam = packed_mxfp8 and not use_a16_qkv
-            self.projections[key] = QuantizedProjection(values, weights[key], out,
+            qkv_preencoded = key == "qkv_a" and qkv_encoded is not None
+            if qkv_preencoded and not use_quantized_seam:
+                raise ValueError("preencoded qkv_a requires an MXFP8 quantized attention seam")
+            self.projections[key] = QuantizedProjection(values, w, out,
                 session=session, name=f"{name}.{key}", workspace=workspace, activation_mode="auto",
-                mxfp8_min_amax=(1e-4 if use_quantized_seam and (key != "q_b" or self.norm_quant is None)
-                                else None),
-                encoded=self.norm_quant.encoded if key == "q_b" and self.norm_quant is not None else None,
+                mxfp8_min_amax=(1e-4 if use_quantized_seam and not qkv_preencoded
+                                and (key != "q_b" or self.norm_quant is None) else None),
+                encoded=(qkv_encoded if qkv_preencoded else
+                         (self.norm_quant.encoded if key == "q_b" and self.norm_quant is not None else None)),
                 rhs_prefetch_ready=use_quantized_seam,
                 allow_bf16_atomic_reduction=not packed_mxfp8,
                 examples=examples, example_role="attention." + key)
@@ -504,14 +682,14 @@ class PreparedAttention:
                 scratch.window_values[:prefix_tokens], eps=self.eps, session=session, name=name + ".kv_norm")
                 if self.norm_quant is None else None)
         self.output_projection = PreparedGroupedOutputProjection(
-            scratch.attended[:mla_tokens], weights["output"], scratch.output[:mla_tokens],
+            attended_buf, output_weight, scratch.output[:mla_tokens],
             session=session, name=name + ".output", workspace=workspace,
             inv_rope=self.angles is not None,
-            heads_per_group=scratch.attended.shape[1] // getattr(weights["output"], "groups", 1),
+            heads_per_group=attended_buf.shape[1] // getattr(output_weight, "groups", 1),
             nope_dim=448, rope_dim=64, positions=self.token_offsets[:mla_tokens],
             cos_sin_cache=None if self.angles is None else self.angles.values[:mla_tokens])
-        self.window_writer = PreparedCompressedCacheWriter(scratch.window_values[:prefix_tokens], self.window_cache,
-            self.window_slots[:prefix_tokens], page_size=self.window_page_size, kind="swa", session=session,
+        self.window_writer = PreparedCompressedCacheWriter(scratch.window_values[:window_tokens], self.window_cache,
+            self.window_slots[:window_tokens], page_size=self.window_page_size, kind="swa", session=session,
             name=f"{name}.window_write",
             history=self.window if mode in ("verify", "draft") else None,
             history_rows=metadata.state_rows if mode in ("verify", "draft") else None,
@@ -520,19 +698,24 @@ class PreparedAttention:
         self.selectors = []
         if "compressor" in weights:
             self.global_kv = PreparedGlobalKV(layer, weights, source, scratch, metadata, pool, rotary,
-                session=session, name=name, indices=window_metadata, deferred=mode == "verify")
+                session=session, name=name, indices=window_metadata, deferred=mode == "verify",
+                examples=examples,
+                proj_tokens=self.shard_tokens if self.row_shard_attention else None,
+                compress_tokens=self.half_tokens if self.row_shard_attention else None)
+        self.kv_pack_cols = 512 + (0 if self.global_kv is None else (2048 if self.ratio == 2 else 512))
         if "index_q" in weights:
-            self.index_query = QuantizedProjection(scratch.query_low, weights["index_q"],
-                scratch.index_query.view(tokens, -1), session=session, name=f"{name}.index_query",
+            idx_tokens = self.shard_tokens if self.row_shard_attention else tokens
+            self.index_query = QuantizedProjection(scratch.query_low[:idx_tokens], weights["index_q"],
+                scratch.index_query[:idx_tokens].view(idx_tokens, -1), session=session, name=f"{name}.index_query",
                 workspace=workspace, activation_mode="auto",
                 examples=examples, example_role="attention.index_query")
-            self.index_weight = UnquantizedProjection(source, weights["index_weights"], scratch.index_weights,
-                session=session, name=f"{name}.index_weight")
+            self.index_weight = UnquantizedProjection(source[:idx_tokens], weights["index_weights"],
+                scratch.index_weights[:idx_tokens], session=session, name=f"{name}.index_weight")
             candidate_source = config.text["candidate_source_layer_id"]
-            if layer >= candidate_source and scratch.candidates.shape[0] < tokens:
+            if layer >= candidate_source and scratch.candidates.shape[0] < idx_tokens:
                 raise ValueError("hierarchical selection exceeds candidate row capacity")
-            for first in range(0, tokens, INDEXER_QUERY_ROWS):
-                last = min(tokens, first + INDEXER_QUERY_ROWS)
+            for first in range(0, idx_tokens, INDEXER_QUERY_ROWS):
+                last = min(idx_tokens, first + INDEXER_QUERY_ROWS)
                 candidates = {}
                 if layer == candidate_source:
                     candidates = dict(candidates_out=scratch.candidates[first:last], counts_out=scratch.candidate_counts[first:last])
@@ -549,9 +732,9 @@ class PreparedAttention:
             indexed_indices=scratch.selected[:mla_tokens], indexed_lengths=self.index_lengths[:mla_tokens],
             page_table=self.page_table[:mla_tokens],
             indexed_page_size=128 // self.ratio)
-        self.attention = PreparedCompressedMLA(scratch.query[:mla_tokens], self.window_cache,
-            self.window_indices[:mla_tokens], self.window_lengths[:mla_tokens], weights["sink"],
-            scratch.attended[:mla_tokens],
+        self.attention = PreparedCompressedMLA(query_buf[:mla_tokens], self.window_cache,
+            self.window_indices[:mla_tokens], self.window_lengths[:mla_tokens], sink_weight,
+            attended_buf,
             window_page_size=self.window_page_size,
             # Speculative rows use explicit indices into staged caches. Their
             # prepared row bound belongs to the decode contract, including
@@ -593,7 +776,7 @@ class PreparedAttention:
                 selectors=self.selectors if overlap_indexer else (),
                 selector_rows=INDEXER_QUERY_ROWS)
 
-        self.query_shape = (prefix_tokens, scratch.query.shape[1], scratch.query.shape[2])
+        self.query_shape = (prefix_tokens, query_buf.shape[1], query_buf.shape[2])
         self.candidate_source = config.text["candidate_source_layer_id"]
         self.q_b_fused_rope = False
         self.index_query_fused_rope = False
@@ -621,12 +804,14 @@ class PreparedAttention:
         register_finalizer(session, self.release_examples)
 
     def _finalize_standalone_rope(self):
-        if (self.concurrent_query is None and self.angles is not None and self.angles.split
+        if (not self.row_shard_attention and self.concurrent_query is None
+                and self.angles is not None and self.angles.split
                 and self.projections["q_b"].encoded is None
                 and self.projections["q_b"].encoded_layout is None):
             self.q_b_fused_rope = register_tc_gemv_rope(
                 self.projections["q_b"].plan, head_dim=512, rope_dim=64)
-        if (self.selectors and (self.concurrent_query is None or not self.concurrent_query.has_indexer)
+        if (not self.row_shard_attention and self.selectors
+                and (self.concurrent_query is None or not self.concurrent_query.has_indexer)
                 and self.index_angles is not None and self.index_angles.split
                 and self.index_query.encoded is None and self.index_query.encoded_layout is None):
             self.index_query_fused_rope = register_tc_gemv_rope(
@@ -675,14 +860,183 @@ class PreparedAttention:
             gather_rows(self.window, metadata.state_rows, window_cache[:, :128 * 528])
         return window_cache
 
-    def run_half(self, source_half, metadata, selection, *, indices, window_cache, half_idx):
+    def _run_shard_qkv_core(self, source_shard, *, indices, shard_rows, half_idx=None, shard_inputs=None):
+        qkv = self.projections["qkv_a"]
+        qkv_encoded_bases = (None if qkv.encoded_layout is None else tuple(
+            torch.empty(shape, dtype=dtype, device=source_shard.device) for shape, dtype in qkv.encoded_layout))
+        projected = qkv(source_shard, encoded_bases=qkv_encoded_bases)
+        encoded_bases = None
+        angle_key = (bool(self.ratio), 0)
+        layer_angles = (
+            shard_inputs.angles[angle_key][half_idx]
+            if shard_inputs is not None and half_idx is not None and angle_key in shard_inputs.angles
+            else torch.index_select(indices.angles[angle_key], 0, shard_rows)
+        )
+        if self.fused_qkv_norm_rope:
+            query_low, window_values = _q_kv_norm_rope(
+                projected, self.q_norm_weight, self.kv_norm_weight, layer_angles, self.eps)
+        elif self.norm_quant is None:
+            query_low = self.query_norm(projected[:, :1280])
+            window_values = self.window_norm(projected[:, 1280:])
+            self.angles.apply(window_values, layer_angles)
+        else:
+            query_low, window_values, encoded_bases = self.norm_quant(projected)
+            self.angles.apply(window_values, layer_angles)
+        query = self.projections["q_b"](query_low, encoded_bases=encoded_bases).view(self.query_shape)
+        self.angles.apply(query, layer_angles)
+        return query, query_low, window_values, layer_angles
+
+    def run_shard_qkv_q(self, source_shard, *, indices, shard_rows, half_idx=None, shard_inputs=None):
+        """Run rank-local [st, 5120] through qkv_a, norm_quant, KV RoPE, q_b_full, and Q RoPE."""
+        if not getattr(self, "row_shard_attention", False):
+            raise ValueError("run_shard_qkv_q requires row-sharded attention")
+        query, _, window_values, layer_angles = self._run_shard_qkv_core(
+            source_shard, indices=indices, shard_rows=shard_rows, half_idx=half_idx, shard_inputs=shard_inputs)
+        return query, window_values, layer_angles
+
+    def run_shard_mla_wo_local(self, source_shard, *, indices, shard_rows, half_idx=None, shard_inputs=None):
+        """Run rank-local QKV, compressor projections, and indexer query/weight projections."""
+        if not getattr(self, "row_shard_attention", False):
+            raise ValueError("run_shard_mla_wo_local requires row-sharded attention")
+        query, query_low, window_values, layer_angles = self._run_shard_qkv_core(
+            source_shard, indices=indices, shard_rows=shard_rows, half_idx=half_idx, shard_inputs=shard_inputs)
+        if self.global_kv is not None:
+            values_sh, gates_sh = self.global_kv.compressor.project_shard(source_shard)
+            if self.ratio == 2:
+                kv_pack_sh = torch.cat((window_values, values_sh.view(torch.bfloat16), gates_sh.view(torch.bfloat16)), dim=1)
+            else:
+                kv_pack_sh = torch.cat((window_values, values_sh), dim=1)
+        else:
+            kv_pack_sh = window_values
+        if self.selectors:
+            iq_sh = self.index_query(query_low).view(self.shard_tokens, 32, 128)
+            idx_angles = (
+                shard_inputs.angles[(True, 0)][half_idx]
+                if shard_inputs is not None and half_idx is not None and (True, 0) in shard_inputs.angles
+                else torch.index_select(indices.angles[(True, 0)], 0, shard_rows)
+            )
+            self.index_angles.apply(iq_sh, idx_angles)
+            iw_sh = self.index_weight(source_shard)
+            iw_sh.mul_(128 ** -.5 * 32 ** -.5)
+        else:
+            iq_sh = iw_sh = None
+        return query, kv_pack_sh, iq_sh, iw_sh, layer_angles
+
+    def run_shard_mla_wo(self, query_shard, window_values_full, metadata, selection, *,
+                         indices, window_cache, half_idx, shard_rows, layer_angles, shard_inputs=None):
+        """Write full half-chunk SWA KV cache [h, 512], then run rank-local [st, 64, 512] MLA + Wo."""
+        if not getattr(self, "row_shard_attention", False):
+            raise ValueError("run_shard_mla_wo requires row-sharded attention")
+        m = metadata
+        h = self.half_tokens
+        sl = slice(0, h) if half_idx == 0 else slice(h, 2 * h)
+        self.window_writer(window_values_full, indices.window_slots[sl], cache=window_cache)
+        selected, _, _ = selection
+        geometry = indices.compressed(self.ratio) if self.ratio else None
+        if shard_inputs is not None:
+            win_idx = shard_inputs.window_indices[half_idx]
+            win_len = shard_inputs.window_lengths[half_idx]
+        else:
+            win_idx = torch.index_select(indices.window_indices, 0, shard_rows)
+            win_len = torch.index_select(indices.window_lengths, 0, shard_rows)
+        if self.ratio:
+            if isinstance(selected, tuple):
+                idx_sel = selected[half_idx]
+            elif selected.shape[0] == self.shard_tokens:
+                idx_sel = selected
+            elif selected.shape[0] == 2 * self.shard_tokens:
+                idx_sel = selected[:self.shard_tokens] if half_idx == 0 else selected[self.shard_tokens:]
+            else:
+                idx_sel = torch.index_select(selected, 0, shard_rows)
+            idx_len = (
+                shard_inputs.index_lengths[half_idx]
+                if shard_inputs is not None and shard_inputs.index_lengths is not None
+                else torch.index_select(geometry.index_lengths, 0, shard_rows)
+            )
+            pt_sh = (
+                shard_inputs.page_table[half_idx]
+                if shard_inputs is not None and shard_inputs.page_table is not None
+                else torch.index_select(m.token_page_table, 0, shard_rows)
+            )
+        else:
+            idx_sel = idx_len = pt_sh = None
+        attended = self.attention(
+            query_shard, win_idx, win_len,
+            indexed_indices=idx_sel,
+            indexed_lengths=idx_len,
+            page_table=pt_sh,
+            window=window_cache,
+        )
+        return self.output_projection(
+            attended, positions=self.token_offsets[:self.shard_tokens], cos_sin_cache=layer_angles)
+
+    def run_shard_mla_wo_source(self, query_shard, kv_pack_full, iq_sh, iw_sh, metadata, selection, *,
+                                indices, window_cache, half_idx, shard_rows, layer_angles,
+                                pending_compress=None, shard_inputs=None):
+        """Compress half-chunk global KV, run rank-local MXFP4 selection, then run MLA + Wo."""
+        if not getattr(self, "row_shard_attention", False):
+            raise ValueError("run_shard_mla_wo_source requires row-sharded attention")
+        if self.global_kv is not None:
+            window_values_full = kv_pack_full[:, :512].contiguous()
+            geometry = indices.compressed(self.ratio)
+            if self.ratio == 2:
+                values_half = kv_pack_full[:, 512:1536].contiguous().view(torch.float32)
+                gates_half = kv_pack_full[:, 1536:2560].contiguous().view(torch.float32)
+            else:
+                values_half = kv_pack_full[:, 512:1024].contiguous()
+                gates_half = None
+            self.global_kv.run_half(
+                values_half, gates_half, self.selectors[0], metadata, geometry,
+                half_idx=half_idx, pending=pending_compress, angles=indices.angles[(True, self.ratio)])
+        else:
+            window_values_full = kv_pack_full
+        if self.selectors:
+            geometry = indices.compressed(self.ratio)
+            pt_sh = (
+                shard_inputs.page_table[half_idx]
+                if shard_inputs is not None and shard_inputs.page_table is not None
+                else torch.index_select(metadata.token_page_table, 0, shard_rows)
+            )
+            len_sh = (
+                shard_inputs.compressed_lengths[half_idx]
+                if shard_inputs is not None and shard_inputs.compressed_lengths is not None
+                else torch.index_select(geometry.lengths, 0, shard_rows)
+            )
+            if half_idx == 0:
+                active = (
+                    shard_inputs.active_width_a
+                    if shard_inputs is not None and shard_inputs.active_width_a is not None
+                    else geometry.lengths[:self.half_tokens].amax().view(1)
+                )
+            else:
+                active = geometry.active_width
+            outputs = []
+            for ordinal, selector in enumerate(self.selectors):
+                first = ordinal * INDEXER_QUERY_ROWS
+                last = min(self.shard_tokens, first + INDEXER_QUERY_ROWS)
+                outputs.append(selector(iq_sh[first:last], iw_sh[first:last],
+                                        pt_sh[first:last], len_sh[first:last], active))
+            sel_sh = outputs[0] if len(outputs) == 1 else torch.cat(outputs, dim=0)
+            half_selection = (sel_sh, selection[1], selection[2])
+        else:
+            sel_sh = None
+            half_selection = selection
+        att_sh = self.run_shard_mla_wo(
+            query_shard, window_values_full, metadata, half_selection,
+            indices=indices, window_cache=window_cache, half_idx=half_idx,
+            shard_rows=shard_rows, layer_angles=layer_angles, shard_inputs=shard_inputs)
+        return att_sh, sel_sh
+
+    def run_half(self, source_half, metadata, selection, *, indices, window_cache, half_idx,
+                 qkv_encoded_bases=None):
         """Run one half-chunk [h, 5120] through QKV, SWA cache write, MLA, and Wo."""
         m = metadata
         h = self.half_tokens
         sl = slice(0, h) if half_idx == 0 else slice(h, 2 * h)
         qkv = self.projections["qkv_a"]
-        qkv_encoded_bases = (None if qkv.encoded_layout is None else tuple(
-            torch.empty(shape, dtype=dtype, device=source_half.device) for shape, dtype in qkv.encoded_layout))
+        if qkv_encoded_bases is None and qkv.quantizer_plan is not None and qkv.encoded_layout is not None:
+            qkv_encoded_bases = tuple(
+                torch.empty(shape, dtype=dtype, device=source_half.device) for shape, dtype in qkv.encoded_layout)
         projected = qkv(source_half, encoded_bases=qkv_encoded_bases)
         encoded_bases = None
         layer_angles = indices.angles[(bool(self.ratio), 0)][sl]
@@ -757,10 +1111,10 @@ class PreparedAttention:
                         candidate_outputs.append(next_candidates)
                         count_outputs.append(next_counts)
                     outputs.append(result)
-                selected = torch.cat(outputs, dim=0)
+                selected = outputs[0] if len(outputs) == 1 else torch.cat(outputs, dim=0)
                 if self.layer == self.candidate_source:
-                    candidates = torch.cat(candidate_outputs, dim=0)
-                    candidate_counts = torch.cat(count_outputs, dim=0)
+                    candidates = candidate_outputs[0] if len(candidate_outputs) == 1 else torch.cat(candidate_outputs, dim=0)
+                    candidate_counts = count_outputs[0] if len(count_outputs) == 1 else torch.cat(count_outputs, dim=0)
         return (query, window_cache, (selected, candidates, candidate_counts), geometry, layer_angles, records)
 
     def run_mla_wo_half(self, prefix_state, metadata, *, indices, half_idx):
@@ -865,10 +1219,10 @@ class PreparedAttention:
                         candidate_outputs.append(next_candidates)
                         count_outputs.append(next_counts)
                     outputs.append(result)
-                selected = torch.cat(outputs, dim=0)
+                selected = outputs[0] if len(outputs) == 1 else torch.cat(outputs, dim=0)
                 if self.layer == self.candidate_source:
-                    candidates = torch.cat(candidate_outputs, dim=0)
-                    candidate_counts = torch.cat(count_outputs, dim=0)
+                    candidates = candidate_outputs[0] if len(candidate_outputs) == 1 else torch.cat(candidate_outputs, dim=0)
+                    candidate_counts = count_outputs[0] if len(count_outputs) == 1 else torch.cat(count_outputs, dim=0)
                 dependency = selected
         if self.concurrent_query is not None and not joined_query:
             query = self.concurrent_query.finish(pending, dependency).view(self.query_shape)

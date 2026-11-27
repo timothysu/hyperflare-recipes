@@ -178,24 +178,35 @@ class PreparedLatticeSelector:
         return self
 
     def prepare(self, hidden, logits, anchor, anchor_valid):
+        scores, _, _ = self.prepare_with_shortlists(hidden, logits, anchor, anchor_valid)
+        return scores
+
+    def prepare_with_shortlists(self, hidden, logits, anchor, anchor_valid):
         values = logits[:, 1:].float()
         unary, ids = values.topk(self.top_k, dim=-1, sorted=True)
         logp = unary - values.logsumexp(-1, keepdim=True)
         pass_hidden = hidden[:, 1:]
         embedded = self.lookup(ids.flatten()).view(self.batch, self.slots, self.top_k, -1)
         scores = self.lattice(embedded, logp, pass_hidden, anchor, anchor_valid)
-        return scores
+        return scores, unary, ids
 
     def prepare_shortlists(self, logits, *, features=None):
-        unary, ids = logits[:, 1:].float().topk(self.top_k, dim=-1, sorted=True)
+        if isinstance(features, tuple) and len(features) == 3:
+            _, unary, ids = features
+        else:
+            unary, ids = logits[:, 1:].float().topk(self.top_k, dim=-1, sorted=True)
         prefix_shape = (self.batch, 1, self.top_k)
         unary = torch.cat((torch.full(prefix_shape, -torch.inf, dtype=unary.dtype, device=unary.device), unary), 1)
         ids = torch.cat((torch.zeros(prefix_shape, dtype=ids.dtype, device=ids.device), ids), 1)
         return unary, ids
 
-    def apply_shortlist(self, logits, predecessor, position, selector_features, unary, ids):
-        scores = selector_features
+    def score_shortlist(self, predecessor, position, selector_features, unary, ids):
+        del unary
+        scores = selector_features[0] if isinstance(selector_features, tuple) else selector_features
         step = position - 1
         previous = (ids[:, position - 1] == predecessor[:, None]).int().argmax(-1) if step else torch.zeros_like(predecessor)
-        selected = scores[torch.arange(self.batch, device=logits.device), step, previous]
+        return scores[torch.arange(self.batch, device=scores.device), step, previous]
+
+    def apply_shortlist(self, logits, predecessor, position, selector_features, unary, ids):
+        selected = self.score_shortlist(predecessor, position, selector_features, unary, ids)
         return torch.full_like(logits, -torch.inf).scatter(1, ids[:, position], selected)

@@ -157,33 +157,57 @@ def test_packed_tp4_defaults_match_deepseek_dspark_capacities():
     assert config.packed_verification and config.draft_prefix_selection == "gpu"
     assert RECIPE.speculation.draft_tokens == 5
     assert RECIPE.checkpoints[0].repository == "MiniMaxAI/MiniMax-M3.1-Flash"
-    assert PreparationConfig(dspark=False).speculative_shapes == ()
-    assert PreparationConfig(dspark=False).packed_speculative_shapes == ()
+    plain = PreparationConfig(parameters=replace(RECIPE.parameters, speculation=None))
+    assert plain.speculative_shapes == ()
+    assert plain.packed_speculative_shapes == ()
 
 
 def test_rectangular_verification_is_retained_for_explicit_diagnostics():
+    from ignition.parameters import SpeculationParameters
     from hyperflare_recipes.recipes.minimax_m3.bootstrap import PreparationConfig
+    from hyperflare_recipes.recipes.minimax_m3.recipe import RECIPE
 
-    config = PreparationConfig(max_active=4, speculative_widths=tuple(range(1, 9)),
-        speculative_token_capacity=32, diagnostic_graphs=("speculative4x8",), speculative_fixed_width=8)
+    params = replace(
+        RECIPE.parameters,
+        max_concurrency=4,
+        speculation=SpeculationParameters(
+            draft_tokens=7, max_draft_tokens=7, adaptive=False,
+            token_capacity=32, packed_verification=False, draft_prefix_selection="cpu",
+        ),
+    )
+    config = PreparationConfig(parameters=params, diagnostic_graphs=("speculative4x8",))
     assert config.packed_speculative_shapes == ()
     assert set(config.speculative_shapes) == {(batch, width) for batch in (1, 2, 4) for width in range(1, 9)}
 
 
-@pytest.mark.parametrize("options", [dict(packed_verification=False), dict(draft_prefix_selection="cpu"),
-                                    dict(speculative_fixed_width=6)])
-def test_serving_dspark_requires_adaptive_packed_gpu_rounds(options):
+@pytest.mark.parametrize("mutator", [
+    lambda cls, cfg: cls(packed_verification=False),
+    lambda cls, cfg: cls(draft_prefix_selection="cpu"),
+    lambda cls, cfg: cls(parameters=replace(
+        cfg.parameters,
+        speculation=replace(cfg.parameters.speculation, adaptive=False, draft_prefix_selection="cpu"),
+    )),
+])
+def test_serving_dspark_requires_adaptive_packed_gpu_rounds(mutator):
     from hyperflare_recipes.recipes.minimax_m3.bootstrap import PreparationConfig
 
+    base = PreparationConfig()
     with pytest.raises(ValueError, match="adaptive packed GPU"):
-        PreparationConfig(**options)
+        mutator(PreparationConfig, base)
 
 
 def test_multihost_placements_keep_the_complete_tp4_catalog():
     from hyperflare_recipes.recipes.minimax_m3.bootstrap import PreparationConfig
+    from hyperflare_recipes.recipes.minimax_m3.recipe import RECIPE
 
-    config = PreparationConfig(devices=(0, 0, 0, 0), hosts=("rank0", "rank1", "rank2", "rank3"),
-        max_active=4, prefill_chunk_size=4096, image_concurrency=4, speculative_token_capacity=32)
+    params = replace(
+        RECIPE.parameters,
+        max_concurrency=4,
+        prefill_chunk=4096,
+        vision=replace(RECIPE.parameters.vision, image_concurrency=4),
+        speculation=replace(RECIPE.parameters.speculation, token_capacity=32),
+    )
+    config = PreparationConfig(parameters=params, devices=(0, 0, 0, 0), hosts=("rank0", "rank1", "rank2", "rank3"))
     assert config.image_concurrency == 4
     assert set(config.speculative_shapes) == {(batch, 1) for batch in (1, 2, 4)}
     assert config.packed_speculative_shapes
@@ -191,23 +215,42 @@ def test_multihost_placements_keep_the_complete_tp4_catalog():
         replace(config, hosts=("rank0", "rank1", "rank1", "rank3"))
     with pytest.raises(ValueError, match="placements"):
         replace(config, hosts=None)
-    with pytest.raises(ValueError, match="separate hosts"):
-        PreparationConfig(roce_ring=True)
+    with pytest.raises(ValueError, match="at least two hosts"):
+        PreparationConfig(parameters=replace(RECIPE.parameters, roce_ring=True))
 
 
 def test_recipe_routes_multihost_preparation_through_shared_rank_group(monkeypatch):
     from types import SimpleNamespace
+    from hyperflare_recipes.parameters import NativeDenseActivationsParameters
     from hyperflare_recipes.recipes.minimax_m3.recipe import RECIPE, prepare
     import ignition.preparation.rank_group as rank_group
 
     rendezvous = SimpleNamespace(hosts=("rank0", "rank1", "rank2", "rank3"))
-    plan = SimpleNamespace(speculation=RECIPE.speculation, compile_workers=2, autotune_effort="audit", tuning_replica=None,
-        native_dense_activations=True, collective_tuning="static", collective_ladder=None, lock_gpu_clocks=False,
-        image_concurrency=4, language_model_only=False, world_size=4, roce_ring=False,
-        context=1048576, concurrency=4, prefill_chunk=4096, snapshots=4,
-        costs=RECIPE.ranks[4], headroom_bytes=8 << 30, reserve_bytes=4 << 30,
-        stream_overlap=True, expert_scale_compression=None, speculative_token_capacity=32,
-        checkpoint=RECIPE.checkpoints[0])
+    params = replace(
+        RECIPE.parameters,
+        max_concurrency=4,
+        prefill_chunk=4096,
+        compile_workers=2,
+        autotune_effort="audit",
+        native_dense_activations=NativeDenseActivationsParameters(enabled=True),
+        speculation=replace(RECIPE.speculation, token_capacity=32),
+        vision=replace(RECIPE.parameters.vision, image_concurrency=4, language_model_only=False),
+    )
+    plan = SimpleNamespace(
+        recipe=RECIPE,
+        parameters=params,
+        speculation=params.speculation,
+        tuning_replica=None,
+        world_size=4,
+        context=1048576,
+        concurrency=4,
+        prefill_chunk=4096,
+        snapshots=4,
+        costs=RECIPE.ranks[4],
+        headroom_bytes=8 << 30,
+        reserve_bytes=4 << 30,
+        checkpoint=RECIPE.checkpoints[0],
+    )
     captured = {}
     def prepare_group(snapshot, config, prepare_rank, **kwargs):
         captured.update(snapshot=snapshot, config=config, **kwargs)

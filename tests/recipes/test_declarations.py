@@ -13,27 +13,28 @@ from types import SimpleNamespace
 import pytest
 
 from ignition import planning
-from hyperflare_recipes.recipes import resolve
-from ignition.declaration import Speculation
+from ignition.parameters import SpeculationParameters
+from hyperflare_recipes.parameters import ExpertScaleCompressionParameters, StreamOverlapParameters
+from hyperflare_recipes.recipes import recipes, resolve
 
 HUB = Path.home() / ".cache/huggingface/hub"
 QWEN = resolve("qwen3.8-flash")
 GLM = resolve("glm-5.3-flash")
 
 
-@pytest.mark.parametrize("alias,drafts,graphs,options", [
-    ("qwen3.8-flash", 5, 34, {"mtp": True}),
-    ("glm-5.3-flash", 5, 34, {"mtp": True}),
-    ("step5-preview-nvfp4", 3, 24, {}),
+@pytest.mark.parametrize("alias,drafts,graphs", [
+    ("qwen3.8-flash", 5, 34),
+    ("glm-5.3-flash", 5, 34),
+    ("step5-preview-nvfp4", 3, 24),
 ])
-def test_rectangular_recipe_defaults_prepare_bounded_speculative_coverage(alias, drafts, graphs, options):
+def test_rectangular_recipe_defaults_prepare_bounded_speculative_coverage(alias, drafts, graphs):
     from importlib import import_module
 
     recipe = resolve(alias).recipe
     selected = recipe.speculation
     config = import_module(f"hyperflare_recipes.recipes.{recipe.name}.bootstrap").PreparationConfig(
-        max_active=recipe.concurrency, speculative_widths=selected.widths,
-        speculative_token_capacity=selected.token_capacity, **options)
+        parameters=recipe.parameters,
+    )
     assert config.max_active == 32 and config.speculative_token_capacity == 128
     assert selected.draft_tokens == drafts and not selected.packed_verification
     shapes = set(config.speculative_shapes)
@@ -52,7 +53,9 @@ def test_qwen_state_rows_and_pages_match_the_prepared_layouts(world_size):
     from hyperflare_recipes.recipes.qwen38.state import HybridStateLayout
 
     recipe = QWEN.recipe
-    assert recipe.speculation == Speculation(draft_tokens=5, token_capacity=128) and recipe.max_draft_tokens == 7
+    assert recipe.speculation == SpeculationParameters(
+        draft_tokens=5, max_draft_tokens=7, token_capacity=128, method="mtp", supported_methods=("mtp", "dflash2"),
+    ) and recipe.max_draft_tokens == 7
     assert recipe.speculation.adaptive
 
     def layer(speculative_tokens):
@@ -141,7 +144,7 @@ def test_glm_state_rows_and_pages_match_the_continuation_pool(world_size):
     from hyperflare_recipes.recipes.glm53.pool import continuation_layout
 
     recipe = GLM.recipe
-    assert recipe.speculation == Speculation(draft_tokens=5, token_capacity=128) and recipe.max_draft_tokens == 7
+    assert recipe.speculation == SpeculationParameters(draft_tokens=5, max_draft_tokens=7, token_capacity=128) and recipe.max_draft_tokens == 7
     assert recipe.page_tokens == 256
     layer_types = tuple("indexed_attention" if index % 4 == 3 else "linear_attention" for index in range(45))
     target = layer_types.count("indexed_attention")
@@ -159,11 +162,11 @@ def test_glm_state_rows_and_pages_match_the_continuation_pool(world_size):
 def test_weights_exclude_the_draft_model_unless_drafts_are_learned(model):
     recipe, checkpoint = model.recipe, model.checkpoint
     world = recipe.tensor_parallel[0]
-    learned = recipe.weights_bytes(checkpoint, world, recipe.speculation)
+    learned = recipe.weights_bytes(checkpoint, world, recipe.parameters)
     loaded = checkpoint.device_bytes + checkpoint.expansion_bytes
     assert learned == -(-loaded // world) and 0 < checkpoint.draft_bytes < checkpoint.device_bytes
     for speculation in (None,):
-        assert recipe.weights_bytes(checkpoint, world, speculation) == -(
+        assert recipe.weights_bytes(checkpoint, world, replace(recipe.parameters, speculation=speculation)) == -(
             -(loaded - checkpoint.draft_bytes) // world)
     # Both recipes commit verified tokens into one live recurrent row.
     assert recipe.live_rows(4, recipe.speculation) == 1 + 4
@@ -186,11 +189,26 @@ def test_glm_stored_bytes_match_the_cached_checkpoint(alias):
         tensor.nbytes for tensor in tensors if tensor.name.startswith("model.language_model.layers.45."))
 
 
-def fitted(model, gpus, **settings):
+_DEFAULT = object()
+
+
+def fitted(model, gpus, *, concurrency=4, reserve_bytes=0, prefill_chunk=None,
+           speculation=_DEFAULT, stream_overlap=None, expert_scale_compression=_DEFAULT):
     devices = tuple(planning.Gpu(index, "NVIDIA RTX PRO 6000 Blackwell", f"GPU-{index}", 96 << 30, 95 << 30, (12, 0))
                     for index in range(gpus))
-    arguments = {"concurrency": 4, "reserve_bytes": 0, "speculation": model.recipe.speculation, **settings}
-    return planning.fit(model.recipe, model.checkpoint, devices, **arguments)
+    updates = {"max_concurrency": concurrency}
+    if prefill_chunk is not None:
+        updates["prefill_chunk"] = prefill_chunk
+    if speculation is not _DEFAULT:
+        updates["speculation"] = speculation
+    if stream_overlap is not None:
+        updates["stream_overlap"] = StreamOverlapParameters(enabled=stream_overlap)
+    if expert_scale_compression is not _DEFAULT:
+        encoding = None if expert_scale_compression == "native" else expert_scale_compression
+        if expert_scale_compression is not None:
+            updates["expert_scale_compression"] = ExpertScaleCompressionParameters(encoding=encoding)
+    params = replace(model.recipe.parameters, **updates)
+    return planning.fit(model.recipe, model.checkpoint, devices, parameters=params, reserve_bytes=reserve_bytes)
 
 
 @pytest.mark.parametrize("compile_forwards", [False, True])
@@ -238,7 +256,8 @@ def test_qwen_adapter_passes_speculation_overrides(monkeypatch, tmp_path):
         QWEN.recipe.prepare(tmp_path, plan, compile_forwards=True, kernel_cache=None, progress=None)
         return plan, seen.pop()
 
-    plan, config = configured(Speculation(2, adaptive=False))
+    plan, config = configured(SpeculationParameters(2, max_draft_tokens=7, adaptive=False, method="mtp",
+                                                    supported_methods=("mtp", "dflash2")))
     assert config.mtp and (config.speculative_widths, config.speculative_fixed_width) == ((1, 2, 3), 3)
     assert config.speculative_shapes == tuple((b, w) for b in (1, 2, 4) for w in (3, 2, 1) if w == 1 or b * w <= 4)
 
@@ -334,7 +353,7 @@ def test_tensor_parallel_adapters_prepare_a_rank_group(monkeypatch, tmp_path, gl
     assert config.page_capacity == plan.minimum_pages and config.prefill_chunk_size == 2048
     assert config.mtp and (config.speculative_widths, config.speculative_fixed_width) == ((1, 2, 3, 4, 5, 6), None)
 
-    plan = fitted(GLM, 4, speculation=Speculation(2, adaptive=False, ))
+    plan = fitted(GLM, 4, speculation=SpeculationParameters(2, max_draft_tokens=7, adaptive=False))
     GLM.recipe.prepare(tmp_path, plan, compile_forwards=True, kernel_cache=None, progress=None)
     config, *_ = seen.pop()
     assert config.mtp and (config.speculative_widths, config.speculative_fixed_width) == ((1, 2, 3), 3)
@@ -377,10 +396,10 @@ def test_flash_checkpoint_declares_the_sizes_its_shards_divide():
     gpus = tuple(planning.Gpu(index, "NVIDIA RTX PRO 6000 Blackwell", f"GPU-{index}", 96 << 30, 95 << 30, (12, 0))
                  for index in range(8))
     with pytest.raises(CapacityError, match="needs 2 or 4 GPUs; 8 selected"):
-        planning.plan(recipe, flash.checkpoint, gpus, selected=tuple(range(8)), concurrency=4,
-                      reserve_bytes=0, prefill_chunk=None, speculation=recipe.speculation)
-    planning.plan(recipe, pro.checkpoint, gpus, selected=tuple(range(8)), concurrency=4,
-                  reserve_bytes=0, prefill_chunk=None, speculation=recipe.speculation)
+        planning.plan(recipe, flash.checkpoint, gpus, selected=tuple(range(8)),
+                      parameters=replace(recipe.parameters, max_concurrency=4), reserve_bytes=0)
+    planning.plan(recipe, pro.checkpoint, gpus, selected=tuple(range(8)),
+                  parameters=replace(recipe.parameters, max_concurrency=4), reserve_bytes=0)
 
 
 def test_checkpoint_costs_stay_within_the_recipe_sizes():
@@ -400,9 +419,13 @@ def test_checkpoint_costs_stay_within_the_recipe_sizes():
 
 
 def test_recipes_declare_whether_they_overlap_branches():
-    overlapping = {alias: resolve(alias).recipe.stream_overlap for alias in (
-        "qwen3.8-flash", "glm-5.3-flash", "deepseek-v4-flash", "deepseek-v4.1-flash", "mimo-v2.6-pro-mopd",
-        "mimo-v2.6-flash-rl")}
+    overlapping = {
+        alias: getattr(resolve(alias).recipe.parameters, "stream_overlap", None) is not None
+        for alias in (
+            "qwen3.8-flash", "glm-5.3-flash", "deepseek-v4-flash", "deepseek-v4.1-flash", "mimo-v2.6-pro-mopd",
+            "mimo-v2.6-flash-rl",
+        )
+    }
     # MiMo composes every branch on the main stream; the others overlap shared experts or projection chains.
     assert overlapping == {"qwen3.8-flash": True, "glm-5.3-flash": True, "deepseek-v4-flash": True,
                            "deepseek-v4.1-flash": True, "mimo-v2.6-pro-mopd": False, "mimo-v2.6-flash-rl": False}
@@ -416,7 +439,7 @@ def test_adapters_carry_stream_overlap_into_the_preparation_config(monkeypatch, 
     model = resolve(alias)
     for overlap in (True, False):
         plan = fitted(model, 4, stream_overlap=overlap)
-        assert plan.stream_overlap is overlap
+        assert plan.parameters.stream_overlap.enabled is overlap
         assert model.recipe.prepare(tmp_path, plan, compile_forwards=True, kernel_cache=None, progress=None) == "group"
         assert seen.pop().stream_overlap is overlap
 
@@ -437,7 +460,7 @@ def test_deepseek41_native_checkpoint_and_scale_compression(monkeypatch, tmp_pat
     native = fitted(model, 4, speculation=speculation, expert_scale_compression="native")
     plan = fitted(model, 4, speculation=speculation, expert_scale_compression=compression)
     assert plan.max_images == 4 and plan.image_concurrency == min(4, plan.concurrency)
-    assert plan.expert_scale_compression == expected
+    assert plan.parameters.expert_scale_compression.encoding == expected
     assert (plan.weights_bytes < native.weights_bytes) == (expected == "csf")
     monkeypatch.setattr("ignition.preparation.rank_group.prepare_group",
                         lambda snapshot, config, prepare, **options: config)
@@ -445,7 +468,12 @@ def test_deepseek41_native_checkpoint_and_scale_compression(monkeypatch, tmp_pat
     assert config.expert_scale_compression == expected and config.dspark == drafting
     assert config.image_concurrency == plan.image_concurrency
     with pytest.raises(ValueError, match="scale compression"):
-        PreparationConfig(expert_scale_compression="zip")
+        PreparationConfig(
+            parameters=replace(
+                model.recipe.parameters,
+                expert_scale_compression=ExpertScaleCompressionParameters(encoding="zip"),
+            )
+        )
 
 
 @pytest.mark.parametrize("flags,expected", [
@@ -457,27 +485,26 @@ def test_deepseek41_native_checkpoint_and_scale_compression(monkeypatch, tmp_pat
 ])
 @pytest.mark.parametrize("command", ["export", "debug-serve"])
 def test_deepseek41_recipe_defaults_and_adapter_preserve_packed_gpu_planning(monkeypatch, tmp_path, flags, expected, command):
-    from ignition.cli import _parser, preparation
+    from ignition.cli import parse_args, preparation
     from ignition.cli.config import Configuration
 
     model = resolve("deepseek-v4.1-flash")
     assert (model.recipe.concurrency, model.recipe.max_concurrency, model.recipe.prefill_chunk) == (32, 64, 4096)
-    assert model.recipe.speculation == Speculation(7, token_capacity=128, packed_verification=True,
-                                                  draft_prefix_selection="gpu", graph_budget=64)
-    args = _parser().parse_args([command, model.checkpoint.alias, *flags])
+    assert model.recipe.speculation == SpeculationParameters(
+        7, max_draft_tokens=7, token_capacity=128, packed_verification=True,
+        draft_prefix_selection="gpu", graph_budget=64,
+    )
+    args = parse_args([command, model.checkpoint.alias, *flags], recipes=recipes())
     config_path = tmp_path / "flare.toml"
     config_path.write_text("")
     configuration = Configuration.load(config_path)
-    concurrency = configuration.max_concurrency(model.checkpoint.alias, model.recipe.concurrency, args.max_concurrency)
+    params = preparation.resolve_parameters(model, args, configuration)
     devices = tuple(planning.Gpu(index, "NVIDIA RTX PRO 6000 Blackwell", f"GPU-{index}",
                                  96 << 30, 95 << 30, (12, 0)) for index in range(4))
-    plan = preparation.derive(configuration, model, preparation.Host(devices, None), gpus="0,1,2,3",
-        concurrency=concurrency, speculation=preparation.speculation(args, model, configuration),
-        image_concurrency=args.image_concurrency, mla_compute_mode=args.mla_compute_mode,
-        expert_scale_compression=args.expert_scale_compression)
+    plan = preparation.derive(configuration, model, preparation.Host(devices, None), gpus="0,1,2,3", parameters=params)
     assert (plan.concurrency, plan.image_concurrency, plan.speculation.draft_tokens,
             plan.speculative_token_capacity, plan.speculation.graph_budget,
-            plan.mla_compute_mode, plan.expert_scale_compression) == expected
+            plan.parameters.mla_compute_mode, plan.parameters.expert_scale_compression.encoding) == expected
     monkeypatch.setattr("ignition.preparation.rank_group.prepare_group",
                         lambda snapshot, config, prepare, **options: config)
     config = model.recipe.prepare(tmp_path, plan, compile_forwards=True, kernel_cache=None, progress=None)
@@ -502,9 +529,8 @@ def test_parallel_recipe_defaults_capture_ragged_rows_at_declared_width(alias, o
     recipe = resolve(alias).recipe
     selected = recipe.speculation
     config = import_module(f"hyperflare_recipes.recipes.{recipe.name}.bootstrap").PreparationConfig(
-        max_active=recipe.concurrency, speculative_widths=selected.widths,
-        speculative_token_capacity=selected.token_capacity,
-        speculative_graph_budget=selected.graph_budget, **options)
+        parameters=recipe.parameters, **options,
+    )
     assert selected.packed_verification and selected.graph_budget == 64
     shapes = set(config.speculative_round_shapes)
     assert {(batch, 1, batch) for batch in (1, 2, 4, 8, 16, 32)} <= shapes

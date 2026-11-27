@@ -94,7 +94,7 @@ def rank_main(rank, rendezvous, args):
             runtime = create_head_exchange(dist.group.WORLD, device, max_rows=max(args.rows),
                 heads=WORLD, head_dim=TOPK * 4, ipc=storage.peer_storage)
             alignment_runtime = create_all_reduce_runtime(dist.group.WORLD, device,
-                collective_tuning='static', max_tokens=1, hidden_size=8, ipc=storage.peer_storage)
+                max_tokens=1, hidden_size=8, ipc=storage.peer_storage)
             runtimes = [runtime, alignment_runtime]
             with RecordedPreparationSession(device=device, checkpoint='candidate-row-pipeline',
                     workload_schema='padded-versus-underfull-with-consensus', numerical_policy='fp32-pairs',

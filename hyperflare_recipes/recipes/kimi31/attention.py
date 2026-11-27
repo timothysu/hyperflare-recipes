@@ -56,12 +56,12 @@ class PreparedDSA(PreparedMLAProjection):
     """
 
     def __init__(self, weights, source, metadata, cache, *, index_cache, eps, mode, session, name, workspace,
-                 buffers, latents=None, coordinator=None, context=None, peers=None):
+                 buffers, latents=None, coordinator=None, context=None, peers=None, chunk_rows=None):
         if mode not in ("decode", "verify", "prefill"):
             raise ValueError("Kimi K3.1 sparse attention requires decode, verify, or prefill")
         super().__init__(weights, source, metadata, cache, eps=eps, mode=mode, session=session, name=name,
             workspace=workspace, buffers=buffers, latents=latents, coordinator=coordinator,
-            context=context, peers=peers)
+            context=context, peers=peers, chunk_rows=chunk_rows)
         self.shards = ContextShards() if context is None else context.shards
         if self.shards.world not in (4, 8, 16):
             raise ValueError("Kimi K3.1 sparse attention requires DCP4, DCP8, or DCP16 context ranks")
@@ -121,21 +121,25 @@ class PreparedDSA(PreparedMLAProjection):
                     part["stage"] = PreparedPrefillRecordStage(peers, cache, metadata.page_table[0], owners,
                         slots, counts, declared, session=session, name=f"{name}.stage{start}")
                     record_view = declared.view(-1, 1, RECORD_BYTES)
+                    declared_pages = pages
+                elif self.history is not None:
+                    # Interleaved history already materializes every visible record in local HBM;
+                    # attend directly through the global slot page table without gathering copies.
+                    record_view = self.history_records.view(-1, 1, RECORD_BYTES)
+                    declared_pages = slots
                 else:
                     selected = storage.buffer("records", (rows, TOPK, RECORD_BYTES), FP8)
-                    local_history = self.history is not None
                     part["gather"] = PreparedPeerRecordGather(
-                        torch.tensor([self.history_records.data_ptr()], dtype=torch.int64, device=source.device)
-                        if local_history else peers, owners, slots, counts, selected,
-                        peer_records=self.history_records.shape[0] if local_history else cache.shape[0] * cache.shape[1],
-                        session=session, name=f"{name}.records{start}",
-                        dependencies=(self.history_records, self.history.completed) if local_history else ())
+                        peers, owners, slots, counts, selected,
+                        peer_records=cache.shape[0] * cache.shape[1],
+                        session=session, name=f"{name}.records{start}")
                     record_view = selected.view(-1, 1, RECORD_BYTES)
+                    declared_pages = pages
                 caps = dense_mla.Caps(mode="decode", q_dtype=torch.bfloat16, num_q_heads=heads,
                     max_total_q=rows, max_batch=rows, max_cache_tokens=TOPK, max_page_table_width=TOPK,
                     num_cache_pages=record_view.shape[0], **common)
                 part["attention"] = PreparedDenseMLA(self.absorbed[start:end], record_view,
-                    self.attended[start:end], pages, counts, starts, caps=caps, scale=192 ** -.5,
+                    self.attended[start:end], declared_pages, counts, starts, caps=caps, scale=192 ** -.5,
                     session=session, name=f"{name}.attention{start}", workspace=workspace,
                     kv_scale=constants.scale, q_scale=constants.scale)
             else:
@@ -192,18 +196,23 @@ class PreparedDSA(PreparedMLAProjection):
         for part in self.parts.values():
             for name in ("owners", "slots", "counts", "quantized", "gathered", "partial", "lse"):
                 part.pop(name, None)
-            if self.history is not None:
-                part["gather"].peers = None
 
     def __call__(self, source, metadata=None, *, shared_index=None):
         return self._run(source, metadata, shared_index=shared_index, observe_selection=False).output
 
-    def _run(self, source, metadata, *, shared_index=None, observe_selection=True):
+    def run_core(self, source, local, metadata, *, shared_index=None):
+        """Run latent gather, sparse selection, and MLA core without the output projection."""
+        result = self._run(source, metadata, shared_index=shared_index, observe_selection=False,
+                           local=local, run_finish=False)
+        return result.attended, result.projected.gate
+
+    def _run(self, source, metadata, *, shared_index=None, observe_selection=True, local=None, run_finish=True):
         """Keep the full selected-ID list when a caller observes the sparse-attention stages."""
         if metadata is None:
             raise ValueError("sparse MLA execution requires invocation metadata")
         fuse_quant = self.mode != "prefill" and not observe_selection
-        projected = self.project(source, metadata, skip_tail_copy=fuse_quant)
+        projected = (self.project(source, metadata, skip_tail_copy=fuse_quant) if local is None
+                     else self.project_from_local(local, metadata, skip_tail_copy=fuse_quant))
         slots = (self.shards.token_slots(metadata.positions, metadata.token_page_table)
                  if shared_index is None else shared_index.slots)
         write_records(projected.latent, slots, self.cache.view(-1, RECORD_BYTES))
@@ -268,17 +277,21 @@ class PreparedDSA(PreparedMLAProjection):
                     self.cache.shape[0], local=self.mode != "prefill", global_records=history is not None,
                     logical_ids=self.reuse_records)
             if self.mode == "prefill":
+                attention_deps = ()
                 if self.reuse_records:
                     records = part["stage"](metadata.page_table[0], visible_end, owners, slots, counts,
                                             record_slab, first=start == 0)
                     pages = torch.where(visible_end <= self.slab_rows, owners.clamp_min(0), part["pages"])
+                elif history is not None:
+                    records = history
+                    pages = slots.clamp_min(0)
+                    attention_deps = (self.history.completed,)
                 else:
-                    records = part["gather"](owners, slots, counts, records=history,
-                        dependencies=() if history is None else (self.history.completed,))
+                    records = part["gather"](owners, slots, counts)
                     pages = part["pages"]
                 output = part["attention"](projected.absorbed[start:end],
                     cache=records.view(-1, 1, RECORD_BYTES), page_table=pages,
-                    lengths=counts, starts=part["starts"])
+                    lengths=counts, starts=part["starts"], dependencies=attention_deps)
             else:
                 if gathered is None:
                     quantized = (quantize_absorbed_with_rope(projected.absorbed[start:end], projected.rope[start:end])
@@ -297,4 +310,5 @@ class PreparedDSA(PreparedMLAProjection):
             owners = torch.where(owners >= 0, owners % self.shards.world, -1)
         last_stage = _AttentionStage(quantized, gathered, partial, lse, selected,
             selected_scores, owners, slots, counts, index)
-        return _AttentionResult(self.finish(attended, projected), projected, attended, last_stage)
+        output = self.finish(attended, projected) if run_finish else None
+        return _AttentionResult(output, projected, attended, last_stage)

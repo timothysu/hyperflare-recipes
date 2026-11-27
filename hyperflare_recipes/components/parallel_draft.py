@@ -187,6 +187,7 @@ class PreparedParallelDraftRound:
         args = (o.requests, o.inputs.row_slot_ids[:b], o.inputs.row_generations[:b], o.inputs.live_rows)
         target = None if self.proposal_only else PreparedSpeculativeDistributions(
             self.decoder.scratch.logits.view(b, w, -1), *args, self.drafts,
+            token_limits=o.inputs.query_lengths[:b],
             workspace=None
         )
         head = getattr(getattr(o.weights, "draft", None), "markov_head", None)
@@ -215,16 +216,32 @@ class PreparedParallelDraftRound:
             target.prepare()
         draft_logits_example = None
         shortlist_example = None
+        shortlist_scores_example = None
+        direct_shortlist = (self.shortlisted_selector is not None
+                            and self.shortlisted_selector.top_k <= DRAFT_CANDIDATES
+                            and callable(getattr(self.shortlisted_selector, "score_shortlist", None)))
         if self.draft is not None and (proposals or fuse_markov):
-            draft_logits_example = torch.empty(self.draft.logit_shape, dtype=self.draft.logit_dtype,
-                                               device=self.owner.requests.histogram.device)
+            if getattr(self.draft, "shortlist_output", False):
+                if not direct_shortlist or fuse_markov:
+                    raise ValueError("shortlist-only draft output requires direct shortlist proposal scoring")
+            else:
+                draft_logits_example = torch.empty(self.draft.logit_shape, dtype=self.draft.logit_dtype,
+                                                   device=self.owner.requests.histogram.device)
             if self.shortlisted_selector is not None:
+                device = self.owner.requests.histogram.device
                 shortlist_example = torch.empty((b, self.draft_inputs.shape[1], self.shortlisted_selector.top_k),
-                                                dtype=torch.int64, device=draft_logits_example.device)
+                                                dtype=torch.int64, device=device)
+                if direct_shortlist:
+                    shortlist_scores_example = torch.empty(
+                        (b, self.shortlisted_selector.top_k),
+                        dtype=torch.float32, device=device)
         for index, proposal in enumerate(proposals):
             bias = (None if self.markov is None else torch.empty((b, o.requests.vocab_size),
                 dtype=torch.float32, device=self.owner.requests.histogram.device))
-            if self.shortlisted_selector is not None and self.shortlisted_selector.top_k <= DRAFT_CANDIDATES:
+            if direct_shortlist:
+                proposal.bind_shortlist_scores(shortlist_scores_example,
+                                               shortlist_example[:, index + o.logit_offset])
+            elif self.shortlisted_selector is not None and self.shortlisted_selector.top_k <= DRAFT_CANDIDATES:
                 proposal.bind_shortlist(shortlist_example[:, index + o.logit_offset])
             elif (self.draft is not None and self.selector is None
                     and (self.markov is None or bias is not None)):
@@ -250,8 +267,8 @@ class PreparedParallelDraftRound:
                 name=self.name + ".proposal_tokens")
         broadcast_proposals = proposals
         if proposals and getattr(o, "block_proposal_broadcast", False):
-            if o.markov_runtime is not None or self.selector is not None:
-                raise ValueError("block proposal broadcast requires replicated Markov work without a selector")
+            if o.markov_runtime is not None:
+                raise ValueError("block proposal broadcast requires replicated proposal work")
             runtime = getattr(o, "result_runtime", None)
             if runtime is None:
                 runtime = o.collectives["vocabulary_runtime"]
@@ -442,12 +459,15 @@ class PreparedParallelDraftRound:
                 o.inputs.page_tables[safe], draft_inputs, o.inputs.live_rows,
                 token_capacity=b * block, sample_count=b * block, rotary_offset=offsets)
             result = self.draft(draft_metadata)
-            draft_logits, selector_features = result[:2]
+            draft_output, selector_features = result[:2]
             features = result[2] if len(result) == 3 else None
-            draft_logits = draft_logits.view(b, -1, draft_logits.shape[-1])
-            unary = shortlist_ids = None
-            if self.shortlisted_selector is not None:
-                unary, shortlist_ids = self.shortlisted_selector.prepare_shortlists(draft_logits, features=selector_features)
+            unary = shortlist_ids = draft_logits = None
+            if getattr(self.draft, "shortlist_output", False):
+                unary, shortlist_ids = draft_output
+            else:
+                draft_logits = draft_output.view(b, -1, draft_output.shape[-1])
+                if self.shortlisted_selector is not None:
+                    unary, shortlist_ids = self.shortlisted_selector.prepare_shortlists(draft_logits, features=selector_features)
             markov_token = torch.where(active, candidates[:, 0], 0)
             block_state = None
             if self.full_proposal is not None:
@@ -481,8 +501,13 @@ class PreparedParallelDraftRound:
             for i, sampler in enumerate(proposals):
                 position = i + o.logit_offset
                 bias = self.markov(markov_token) if self.markov is not None else None
-                source_logits = draft_logits[:, position]
-                if sampler.has_source_logits:
+                shortlist_scores = None
+                source_logits = None if draft_logits is None else draft_logits[:, position]
+                if getattr(sampler, "has_shortlist_scores", False):
+                    proposal_logits = None
+                    shortlist_scores = self.shortlisted_selector.score_shortlist(
+                        markov_token, position, selector_features, unary, shortlist_ids)
+                elif sampler.has_source_logits:
                     proposal_logits = torch.empty((b, 1, o.requests.vocab_size), dtype=torch.float32, device=device)
                 else:
                     proposal_logits = source_logits.float()
@@ -503,6 +528,7 @@ class PreparedParallelDraftRound:
                     source_logits=source_logits if sampler.has_source_logits else None,
                     shortlist_ids=None if shortlist_ids is None else shortlist_ids[:, position],
                     candidates=drafts, seed=seed, offset=base_offset + 4 * i, sampled=sampled,
+                    **({"shortlist_scores": shortlist_scores} if shortlist_scores is not None else {}),
                     **({"source_bias": bias} if sampler.has_source_logits and bias is not None else {}))
                 drafts[:, i].copy_(sampled)
                 if block_state is None:

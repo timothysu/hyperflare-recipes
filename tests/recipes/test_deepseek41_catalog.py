@@ -4,6 +4,7 @@
 """V4.1 registers packed rounds while retaining target-only DSpark continuations."""
 
 from collections import defaultdict
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -103,7 +104,11 @@ def test_default_catalog_contains_only_packed_rounds_and_width_one_continuations
 
 
 def test_small_physical_budget_keeps_every_width_one_batch(register_catalog):
-    records, _, _, constructed, _ = register_catalog(PreparationConfig(speculative_token_capacity=6))
+    from dataclasses import replace
+
+    base = PreparationConfig()
+    config = replace(base, parameters=replace(base.parameters, speculation=replace(base.parameters.speculation, token_capacity=6)))
+    records, _, _, constructed, _ = register_catalog(config)
     packed = [s for _, _, s in records if "speculative_prefix_limits" in s.inputs]
     assert {(s.batch_capacity, s.packed_token_capacity) for s in packed} == {
         (1, 2), (1, 3), (1, 4), (1, 5), (1, 6),
@@ -113,9 +118,14 @@ def test_small_physical_budget_keeps_every_width_one_batch(register_catalog):
     assert {round.batch for round in constructed if round.options.get("proposal_only")} == {1, 2, 4}
 
 
-@pytest.mark.parametrize("fixed", [None, 1])
-def test_zero_drafts_retains_dspark_context_without_proposal_storage(register_catalog, fixed):
-    config = PreparationConfig(speculative_widths=(1,), speculative_fixed_width=fixed)
+@pytest.mark.parametrize("adaptive", [True, False])
+def test_zero_drafts_retains_dspark_context_without_proposal_storage(register_catalog, adaptive):
+    from dataclasses import replace
+    from ignition.parameters import SpeculationParameters
+
+    base = PreparationConfig()
+    spec = SpeculationParameters(draft_tokens=0, max_draft_tokens=7, adaptive=adaptive, token_capacity=128)
+    config = replace(base, parameters=replace(base.parameters, speculation=spec))
     assert not config.packed_verification
     assert config.draft_prefix_selection == "cpu"
     records, buffers, storage, constructed, hosts = register_catalog(config)
@@ -125,29 +135,39 @@ def test_zero_drafts_retains_dspark_context_without_proposal_storage(register_ca
 
 
 def test_no_mtp_omits_the_dspark_catalog(register_catalog):
-    config = PreparationConfig(dspark=False)
+    from dataclasses import replace
+
+    base = PreparationConfig()
+    config = replace(base, parameters=replace(base.parameters, speculation=None))
     assert config.speculative_shapes == () and config.draft_tokens == 0
     assert not config.packed_verification
     assert register_catalog(config) == ([], {}, None, [], [])
 
 
-@pytest.mark.parametrize("options", [
-    {"draft_prefix_selection": "cpu"}, {"packed_verification": False},
-    {"speculative_fixed_width": 6}, {"speculation_reference_graphs": True},
+@pytest.mark.parametrize("mutator", [
+    lambda c: replace(c, parameters=replace(c.parameters, speculation=replace(c.parameters.speculation, draft_prefix_selection="cpu"))),
+    lambda c: replace(c, parameters=replace(c.parameters, speculation=replace(c.parameters.speculation, packed_verification=False, draft_prefix_selection="cpu"))),
+    lambda c: replace(c, parameters=replace(c.parameters, speculation=replace(c.parameters.speculation, adaptive=False, draft_prefix_selection="cpu"))),
+    lambda c: replace(c, speculation_reference_graphs=True),
 ])
-def test_positive_dspark_rejects_other_catalogs(options):
+def test_positive_dspark_rejects_other_catalogs(mutator):
+    from dataclasses import replace
+
+    base = PreparationConfig()
     with pytest.raises(ValueError, match="requires (packed GPU|adaptive packed GPU)"):
-        PreparationConfig(**options)
+        mutator(base)
 
 
 def test_invalid_prefix_selection_is_rejected():
+    from dataclasses import replace
+
+    base = PreparationConfig()
     with pytest.raises(ValueError, match="draft prefix selection must be cpu or gpu"):
-        PreparationConfig(draft_prefix_selection="automatic")
+        replace(base.parameters.speculation, draft_prefix_selection="automatic")
 
 
-@pytest.mark.parametrize("options", [
-    {"dspark": False}, {"speculative_widths": (1,)},
-])
-def test_gpu_prefix_selection_requires_positive_draft_depth(options):
-    with pytest.raises(ValueError, match="requires positive DSpark draft depth"):
-        PreparationConfig(**options, draft_prefix_selection="gpu")
+def test_gpu_prefix_selection_requires_positive_draft_depth():
+    from ignition.parameters import SpeculationParameters
+
+    with pytest.raises(ValueError, match="GPU draft prefix selection requires"):
+        SpeculationParameters(draft_tokens=0, packed_verification=True, draft_prefix_selection="gpu")

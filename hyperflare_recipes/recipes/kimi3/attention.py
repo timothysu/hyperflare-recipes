@@ -95,8 +95,11 @@ class PreparedMLAProjection:
     """Kimi latent projections, optional rotary positions, and absorbed query arithmetic."""
 
     def __init__(self, weights, source, metadata, cache, *, eps, mode, session, name, workspace, buffers, latents=None,
-                 coordinator=None, context=None, peers=None, gated=True, rotary=None):
+                 coordinator=None, context=None, peers=None, gated=True, rotary=None, chunk_rows=None):
         tokens, hidden = source.shape
+        if chunk_rows is not None and (mode != "prefill" or not 0 < chunk_rows < tokens or tokens % chunk_rows):
+            raise ValueError("MLA chunked projections require prefill with chunk_rows dividing tokens")
+        self.chunk_rows = chunk_rows
         heads = weights["key"].shape[0]
         device = source.device
 
@@ -139,17 +142,59 @@ class PreparedMLAProjection:
             self.gathered_latents = buffer("gathered_latents", latents.world_size * width, rows=rows)
             self.latent_gather = PreparedChunkedAllGather(self.send, self.gathered_latents, runtime=latents,
                 session=session, coordinator=coordinator, name=name + ".gather_latents")
+        proj_rows = tokens if chunk_rows is None else chunk_rows
+        output_decl = buffer("output", hidden)
         self.projections = {key: prepare_projection(x, weights[key], y, session=session,
             name=name + "." + key, workspace=workspace)
-            for key, x, y in (("latent_gate", source, self.local), ("q_b", self.query_norm, self.query.view(tokens, -1)),
-                             ("output", self.expanded, buffer("output", hidden)))}
+            for key, x, y in (
+                ("latent_gate", source[:proj_rows], self.local[:proj_rows]),
+                ("q_b", self.query_norm, self.query.view(tokens, -1)),
+                ("output", self.expanded[:proj_rows], output_decl[:proj_rows]))}
         self.buffer = buffer
         self.absorb = BatchedUnquantizedProjection(
             self.query[:, :, :128].transpose(0, 1), weights["key"],
             self.absorbed[:, :, :512].transpose(0, 1), major="n", session=session, name=name + ".absorb")
         self.expand = BatchedUnquantizedProjection(
-            self.attended.transpose(0, 1), weights["value"],
-            self.expanded.view(tokens, heads, 128).transpose(0, 1), major="n", session=session, name=name + ".expand")
+            self.attended[:proj_rows].transpose(0, 1), weights["value"],
+            self.expanded[:proj_rows].view(proj_rows, heads, 128).transpose(0, 1),
+            major="n", session=session, name=name + ".expand")
+
+    def input_plans(self):
+        proj = self.projections["latent_gate"]
+        return tuple(p for p in (proj.plan, getattr(proj, "quantizer_plan", None)) if p is not None)
+
+    def output_plans(self):
+        proj = self.projections["output"]
+        return tuple(p for p in (proj.plan, getattr(proj, "quantizer_plan", None)) if p is not None)
+
+    def project_input_chunk(self, source_chunk):
+        return self.projections["latent_gate"](source_chunk)
+
+    def project_from_local(self, local, metadata=None, *, skip_tail_copy=False):
+        tokens = local.shape[0]
+        query_norm = torch.empty((tokens, self.latent_width - RECORD_BYTES), dtype=local.dtype, device=local.device)
+        latent = torch.empty((tokens, RECORD_BYTES), dtype=local.dtype, device=local.device)
+        if self.latent_gather is None:
+            inputs, gate = local[:, :self.latent_width], local[:, self.latent_width:]
+            rms_norm_columns(inputs[:, :-RECORD_BYTES], self.weights["query_norm"], query_norm, self.eps)
+            rms_norm_columns(inputs[:, -RECORD_BYTES:-64], self.weights["kv_norm"], latent[:, :512], self.eps)
+            latent[:, 512:].copy_(inputs[:, -64:])
+        else:
+            width, world = self.latent_columns, self.latent_world
+            gate = local[:, width:]
+            gathered = self.latent_gather(local[:, :width].contiguous()).view(tokens, world, width)
+            query = self.latent_width - RECORD_BYTES
+            unpack_and_rms_norm_qkv(gathered, query // world, RECORD_BYTES // world,
+                self.weights["query_norm"], self.weights["kv_norm"], query_norm, latent, self.eps)
+        query = self.projections["q_b"](query_norm).view(tokens, self.heads, 192)
+        if self.rotary is not None:
+            self.rotary(query[:, :, 128:], latent[:, 512:], metadata.positions)
+        absorbed = torch.empty((tokens, self.heads, RECORD_BYTES), dtype=local.dtype, device=local.device)
+        self.absorb(query[:, :, :128].transpose(0, 1), absorbed[:, :, :512].transpose(0, 1))
+        if skip_tail_copy:
+            return MLAProjectionOutput(query_norm, latent, absorbed, gate, query[:, :, 128:])
+        absorbed[:, :, 512:].copy_(query[:, :, 128:])
+        return MLAProjectionOutput(query_norm, latent, absorbed, gate, None)
 
     def functional(self, *, session):
         for projection in self.projections.values():
@@ -168,47 +213,37 @@ class PreparedMLAProjection:
                 setattr(self, name, None)
 
     def project(self, source, metadata=None, *, skip_tail_copy=False):
-        local = self.projections["latent_gate"](source)
-        tokens = source.shape[0]
-        query_norm = torch.empty((tokens, self.latent_width - RECORD_BYTES), dtype=source.dtype, device=source.device)
-        latent = torch.empty((tokens, RECORD_BYTES), dtype=source.dtype, device=source.device)
-        if self.latent_gather is None:
-            inputs, gate = local[:, :self.latent_width], local[:, self.latent_width:]
-            rms_norm_columns(inputs[:, :-RECORD_BYTES], self.weights["query_norm"], query_norm, self.eps)
-            rms_norm_columns(inputs[:, -RECORD_BYTES:-64], self.weights["kv_norm"], latent[:, :512], self.eps)
-            latent[:, 512:].copy_(inputs[:, -64:])
+        if self.chunk_rows is None:
+            local = self.projections["latent_gate"](source)
         else:
-            width, world = self.latent_columns, self.latent_world
-            gate = local[:, width:]
-            gathered = self.latent_gather(local[:, :width].contiguous()).view(tokens, world, width)
-            query = self.latent_width - RECORD_BYTES
-            unpack_and_rms_norm_qkv(gathered, query // world, RECORD_BYTES // world,
-                self.weights["query_norm"], self.weights["kv_norm"], query_norm, latent, self.eps)
-        query = self.projections["q_b"](query_norm).view(tokens, self.heads, 192)
-        if self.rotary is not None:
-            self.rotary(query[:, :, 128:], latent[:, 512:], metadata.positions)
-        absorbed = torch.empty((tokens, self.heads, RECORD_BYTES), dtype=source.dtype, device=source.device)
-        self.absorb(query[:, :, :128].transpose(0, 1), absorbed[:, :, :512].transpose(0, 1))
-        if skip_tail_copy:
-            return MLAProjectionOutput(query_norm, latent, absorbed, gate, query[:, :, 128:])
-        absorbed[:, :, 512:].copy_(query[:, :, 128:])
-        return MLAProjectionOutput(query_norm, latent, absorbed, gate, None)
+            step = self.chunk_rows
+            local = torch.cat([self.project_input_chunk(source[b:b + step]) for b in range(0, source.shape[0], step)], dim=0)
+        return self.project_from_local(local, metadata, skip_tail_copy=skip_tail_copy)
+
+    def finish_chunk(self, attended_chunk, gate_chunk):
+        tokens = attended_chunk.shape[0]
+        expanded = torch.empty((tokens, self.heads * 128), dtype=attended_chunk.dtype, device=attended_chunk.device)
+        self.expand(attended_chunk.transpose(0, 1), expanded.view(tokens, self.heads, 128).transpose(0, 1))
+        if self.gated:
+            sigmoid_gate(expanded, gate_chunk)
+        return self.projections["output"](expanded)
 
     def finish(self, attended, projected):
-        tokens = attended.shape[0]
-        expanded = torch.empty((tokens, self.heads * 128), dtype=attended.dtype, device=attended.device)
-        self.expand(attended.transpose(0, 1), expanded.view(tokens, self.heads, 128).transpose(0, 1))
-        if self.gated:
-            sigmoid_gate(expanded, projected.gate)
-        return self.projections["output"](expanded)
+        if self.chunk_rows is None:
+            return self.finish_chunk(attended, projected.gate)
+        step = self.chunk_rows
+        return torch.cat([
+            self.finish_chunk(attended[b:b + step], projected.gate[b:b + step])
+            for b in range(0, attended.shape[0], step)
+        ], dim=0)
 
 
 class PreparedMLA(PreparedMLAProjection):
     def __init__(self, weights, source, metadata, cache, *, eps, mode, session, name, workspace, buffers, latents=None,
-                 coordinator=None, context=None, peers=None):
+                 coordinator=None, context=None, peers=None, chunk_rows=None):
         super().__init__(weights, source, metadata, cache, eps=eps, mode=mode, session=session, name=name,
                          workspace=workspace, buffers=buffers, latents=latents, coordinator=coordinator,
-                         context=context, peers=peers)
+                         context=context, peers=peers, chunk_rows=chunk_rows)
         tokens, heads = source.shape[0], weights["key"].shape[0]
         device, buffer = source.device, self.buffer
         self.shards = ContextShards() if context is None else context.shards
@@ -265,6 +300,29 @@ class PreparedMLA(PreparedMLAProjection):
                      "token_pages", "token_lengths"):
             if hasattr(self, name):
                 setattr(self, name, None)
+
+    def run_core(self, source, local, metadata):
+        if metadata is None:
+            raise ValueError("MLA execution requires invocation metadata")
+        m, shards = metadata, self.shards
+        projected = self.project_from_local(local, m)
+        slots = shards.token_slots(m.positions, m.token_page_table)
+        write_records(projected.latent, slots, self.cache.view(-1, RECORD_BYTES))
+        if shards.world == 1:
+            lengths = torch.where(m.lengths > 0, m.starts + m.lengths, 0)
+            attended = self.attention(projected.absorbed, page_table=m.page_table,
+                lengths=lengths, starts=m.query_start_loc)
+        elif self.mode == "prefill":
+            attended = self.prefill(projected.latent, projected.absorbed, m)
+        else:
+            tokens = source.shape[0]
+            quantized = projected.absorbed.float().clamp(-448., 448.).to(FP8)
+            gathered = self.gather(quantized.view(tokens, -1)).view(tokens, self.heads * shards.world, RECORD_BYTES)
+            lengths = shards.local_tokens(m.positions + 1).to(torch.int32)
+            partial, lse = self.attention(gathered, page_table=m.token_page_table,
+                lengths=lengths, starts=self.token_starts)
+            attended = self.combine(partial, lse)
+        return attended, projected.gate
 
     def __call__(self, source, metadata=None):
         if metadata is None:

@@ -14,7 +14,7 @@ from ignition.preparation.scratch import ScratchArena
 from ignition.preparation.tuning import register_finalizer
 
 
-def _run_shared_expert(source, weights, scales, gains, scale_kinds, outputs,
+def _run_shared_expert(source, weights, scales, gains, activation_scales, scale_kinds, outputs,
                        workspace, plans, activation, limit, round_silu, auxiliary,
                        encoded, encoding_offsets, quantizers):
     from hyperflare_recipes.components.sm103_projection import bf16_out, packed_out_workspace
@@ -44,14 +44,14 @@ def _run_shared_expert(source, weights, scales, gains, scale_kinds, outputs,
             from hyperflare_recipes.components.block_fp8 import _project_out, _quantize_out
 
             _quantize_out(value, bases[0], bases[1])
-            activation_scales = bases[1]
+            activation_scales_local = bases[1]
             weight_scales = scales[index]
             if len(bases) == 4:
-                bases[2].copy_(activation_scales.T)
+                bases[2].copy_(activation_scales_local.T)
                 bases[3].copy_(weight_scales.T)
-                activation_scales = bases[2]
+                activation_scales_local = bases[2]
                 weight_scales = bases[3]
-            _project_out(bases[0], activation_scales, weights[index], weight_scales,
+            _project_out(bases[0], activation_scales_local, weights[index], weight_scales,
                          output, workspace, plans[index])
         elif scale_kinds[index] == 3:
             from b12x.preparation.types import plan_from_handle
@@ -60,7 +60,7 @@ def _run_shared_expert(source, weights, scales, gains, scale_kinds, outputs,
             output.copy_(_project(value, weights[index], scales[index], plan_from_handle(plans[index])))
         else:
             packed_out_workspace(
-                value, weights[index], scales[index], gains[index], None, output,
+                value, weights[index], scales[index], gains[index], activation_scales[index], output,
                 workspace, ("none", "multiplier", "reciprocal")[scale_kinds[index]], None, plans[index], "any")
 
     gate_up, intermediate, projected = outputs[:3]
@@ -79,6 +79,7 @@ def _run_shared_expert(source, weights, scales, gains, scale_kinds, outputs,
 def _start_shared_expert(
     source: torch.Tensor, weights: list[torch.Tensor],
     scales: list[torch.Tensor | None], gains: list[torch.Tensor | None],
+    activation_scales: list[torch.Tensor | None],
     scale_kinds: list[int], outputs: list[torch.Tensor], workspace: torch.Tensor,
     plans: list[int], activation: str, limit: float, round_silu: bool, auxiliary_stream: int,
     launch_order: int,
@@ -88,13 +89,13 @@ def _start_shared_expert(
     auxiliary = torch.cuda.ExternalStream(auxiliary_stream, device=source.device)
     auxiliary.wait_stream(main)
     if not launch_order:
-        _run_shared_expert(source, weights, scales, gains, scale_kinds, outputs,
+        _run_shared_expert(source, weights, scales, gains, activation_scales, scale_kinds, outputs,
                            workspace, plans, activation, limit, round_silu, auxiliary,
                            encoded, encoding_offsets, quantizers)
 
 
 @_start_shared_expert.register_fake
-def _fake_start_shared_expert(source, weights, scales, gains, scale_kinds, outputs,
+def _fake_start_shared_expert(source, weights, scales, gains, activation_scales, scale_kinds, outputs,
                              workspace, plans, activation, limit, round_silu, auxiliary_stream, launch_order,
                              encoded, encoding_offsets, quantizers):
     pass
@@ -104,6 +105,7 @@ def _fake_start_shared_expert(source, weights, scales, gains, scale_kinds, outpu
 def _join_shared_expert(
     source: torch.Tensor, routed: torch.Tensor, weights: list[torch.Tensor],
     scales: list[torch.Tensor | None], gains: list[torch.Tensor | None],
+    activation_scales: list[torch.Tensor | None],
     scale_kinds: list[int], outputs: list[torch.Tensor], workspace: torch.Tensor,
     plans: list[int], activation: str, limit: float, round_silu: bool, auxiliary_stream: int,
     launch_order: int,
@@ -112,14 +114,14 @@ def _join_shared_expert(
     main = torch.cuda.current_stream(source.device)
     auxiliary = torch.cuda.ExternalStream(auxiliary_stream, device=source.device)
     if launch_order:
-        _run_shared_expert(source, weights, scales, gains, scale_kinds, outputs,
+        _run_shared_expert(source, weights, scales, gains, activation_scales, scale_kinds, outputs,
                            workspace, plans, activation, limit, round_silu, auxiliary,
                            encoded, encoding_offsets, quantizers)
     main.wait_stream(auxiliary)
 
 
 @_join_shared_expert.register_fake
-def _fake_join_shared_expert(source, routed, weights, scales, gains, scale_kinds, outputs,
+def _fake_join_shared_expert(source, routed, weights, scales, gains, activation_scales, scale_kinds, outputs,
                             workspace, plans, activation, limit, round_silu, auxiliary_stream, launch_order,
                             encoded, encoding_offsets, quantizers):
     pass
@@ -172,7 +174,7 @@ class ConcurrentSharedExpert:
         if gate_projection is not None:
             self.projections += (gate_projection,)
             self.outputs.append(gate_projection.output)
-        self.weights, self.scales, self.gains, self.scale_kinds = [], [], [], []
+        self.weights, self.scales, self.gains, self.activation_scales, self.scale_kinds = [], [], [], [], []
         for projection in self.projections:
             if projection.bias is not None:
                 raise ValueError("shared-expert overlap requires unbiased projections")
@@ -181,14 +183,16 @@ class ConcurrentSharedExpert:
                 if scales.dtype == torch.float8_e8m0fnu:
                     scales = scales.view(torch.uint8)
                 kind = projection.weight.global_scale_kind if fp4 else "none"
+                activation_scale = projection.activation_scale
             elif isinstance(projection, BlockFP8Projection):
                 values, scales = projection.weight.values, projection.weight.scales
-                gain, kind = None, "block_fp8"
+                gain, activation_scale, kind = None, None, "block_fp8"
             else:
-                values, scales, gain, kind = projection.weight, None, None, "none"
+                values, scales, gain, activation_scale, kind = projection.weight, None, None, None, "none"
             self.weights.append(values)
             self.scales.append(scales)
             self.gains.append(gain)
+            self.activation_scales.append(activation_scale)
             self.scale_kinds.append(("none", "multiplier", "reciprocal", "block_fp8").index(kind))
             for main_plan in self.parallel_plans:
                 workspace.register_parallel(main_plan, projection.plan)
@@ -265,12 +269,12 @@ class ConcurrentSharedExpert:
             workspace = torch.empty(self.workspace_nbytes, dtype=torch.uint8, device=source.device)
             encoded = [torch.empty(shape, dtype=dtype, device=source.device) for shape, dtype in self.encoded_layouts]
             pending = PendingSharedExpert(source, outputs, workspace, encoded)
-            _start_shared_expert(source, self.weights, self.scales, self.gains, self.scale_kinds,
-                outputs, workspace, self.plans, self.activation, self.limit, self.round_silu,
+            _start_shared_expert(source, self.weights, self.scales, self.gains, self.activation_scales,
+                self.scale_kinds, outputs, workspace, self.plans, self.activation, self.limit, self.round_silu,
                 self.stream_handle, self.launch_order, encoded, self.encoding_offsets, self.quantizers)
             return pending
-        _start_shared_expert(source, self.weights, self.scales, self.gains, self.scale_kinds,
-                            self.outputs, self.workspace, self.plans, self.activation, self.limit,
+        _start_shared_expert(source, self.weights, self.scales, self.gains, self.activation_scales,
+                            self.scale_kinds, self.outputs, self.workspace, self.plans, self.activation, self.limit,
                             self.round_silu, self.stream_handle, self.launch_order,
                             [], self.encoding_offsets, self.quantizers)
 
@@ -281,13 +285,13 @@ class ConcurrentSharedExpert:
             routed = routed.values
         if self.outputs is None:
             pending = source
-            _join_shared_expert(pending.source, routed, self.weights, self.scales, self.gains,
+            _join_shared_expert(pending.source, routed, self.weights, self.scales, self.gains, self.activation_scales,
                 self.scale_kinds, pending.outputs, pending.workspace, self.plans, self.activation,
                 self.limit, self.round_silu, self.stream_handle, self.launch_order,
                 pending.encoded, self.encoding_offsets, self.quantizers)
             return pending.outputs[2]
-        _join_shared_expert(source, routed, self.weights, self.scales, self.gains, self.scale_kinds,
-                           self.outputs, self.workspace, self.plans, self.activation, self.limit,
+        _join_shared_expert(source, routed, self.weights, self.scales, self.gains, self.activation_scales,
+                           self.scale_kinds, self.outputs, self.workspace, self.plans, self.activation, self.limit,
                            self.round_silu, self.stream_handle, self.launch_order,
                            [], self.encoding_offsets, self.quantizers)
         return self.mlp.down_projection.output

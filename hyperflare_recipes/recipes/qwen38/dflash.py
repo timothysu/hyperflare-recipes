@@ -144,12 +144,19 @@ class PreparedTarget:
         self.session = session
         self.state = PreparedTargetState(owner, metadata)
         wide = metadata.max_query_tokens > 1
+        qsa_shard = (
+            dict(qsa_gather_runtime=owner.qsa_gather_runtime, qsa_shard_mode="group")
+            if (getattr(owner, "qsa_gather_runtime", None) is not None
+                and self.state.tokens <= 128
+                and owner.context % (64 * owner.target_weights.shard.world_size) == 0)
+            else {}
+        )
         self.forward = PreparedDecoder(owner.target_weights, scratch, self.state,
             owner.cache, owner.rotary, owner.table, workspace,
             owner.completion, owner.frame, owner.sequence, session=session, name=name,
             max_cache_pages=owner.max_cache_pages, verification=True,
             gdn_records=owner.records if wide else None, gdn_in_place=not wide,
-            **collectives)
+            **qsa_shard, **collectives)
         self.forward.capture_context(metadata, owner.weights.config.draft)
         self.auxiliary = self.forward.auxiliary
         self.scratch = SimpleNamespace(logits=self.forward.scratch.logits,
@@ -208,9 +215,12 @@ class SpeculativePreparation(DFlash2Preparation):
                  workspaces, rotary, cache, table, session, completion, frame, sequence,
                  context, prefill_capacity, max_cache_pages, draft_head=None,
                  runtime=None, vocabulary_runtime=None, coordinator=None, verification_width=8,
-                 sampling_workspace=None, gather_runtime=None):
+                 sampling_workspace=None, gather_runtime=None, result_runtime=None,
+                 shortlist_runtime=None, qsa_gather_runtime=None,
+                 block_proposal_broadcast=False, shortlist_only=False):
         self.target_weights, self.cache, self.rotary, self.table = weights, cache, rotary, table
         self.context, self.max_cache_pages = context, max_cache_pages
+        self.qsa_gather_runtime = qsa_gather_runtime
         device = pool.backing.device
         self.decoders, self.owners = [], []
         self.previous_accepted = torch.ones(requests.capacity, dtype=torch.int32, device=device)
@@ -231,7 +241,9 @@ class SpeculativePreparation(DFlash2Preparation):
             page_tokens=64, completion=completion, frame=frame, sequence=sequence,
             session=session, workspace=workspaces, verification_width=verification_width,
             runtime=runtime, vocabulary_runtime=vocabulary_runtime, coordinator=coordinator,
-            block_size=draft_config.block_size, gather_runtime=gather_runtime)
+            block_size=draft_config.block_size, gather_runtime=gather_runtime,
+            result_runtime=result_runtime, shortlist_runtime=shortlist_runtime,
+            block_proposal_broadcast=block_proposal_broadcast, shortlist_only=shortlist_only)
 
     def buffers(self):
         return {}

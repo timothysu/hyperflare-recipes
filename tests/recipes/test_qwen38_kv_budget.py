@@ -3,17 +3,26 @@
 
 """Preparation KV backing covers graph shapes without sizing the serving cache."""
 
+from dataclasses import replace
+
 import pytest
 
+from ignition.parameters import MixedPrefillParameters
 from hyperflare_recipes.recipes.qwen38.bootstrap import PreparationConfig
+from hyperflare_recipes.recipes.qwen38.recipe import RECIPE
 
 
 @pytest.mark.parametrize('concurrency', [1, 3, 4, 32, 64])
 @pytest.mark.parametrize('prefill', [64, 4096, 16384])
 @pytest.mark.parametrize('width', [1, 6, 8])
 def test_preparation_pages_cover_prefill_and_partial_verification_pages(concurrency, prefill, width):
-    config = PreparationConfig(max_active=concurrency, prefill_chunk_size=prefill,
-                               mtp=True, speculative_widths=tuple(sorted({1, width})))
+    params = replace(
+        PreparationConfig().parameters,
+        max_concurrency=concurrency,
+        prefill_chunk=prefill,
+        speculation=replace(RECIPE.speculation, draft_tokens=width - 1),
+    )
+    config = PreparationConfig(parameters=params)
     # A row beginning at the last token of a page needs a second page for wider verification.
     row_pages = (63 + width + 63) // 64
     assert config.preparation_pages >= prefill // 64 + config.request_capacity * row_pages
@@ -40,7 +49,16 @@ def test_explicit_preparation_capacity_is_preserved():
 
 @pytest.mark.parametrize('concurrency', [1, 3, 4, 16, 64])
 def test_preparation_state_backing_covers_live_rows_and_snapshot_destinations(concurrency):
-    config = PreparationConfig(max_active=concurrency, mtp=True, mixed_prefill=True)
+    base = PreparationConfig().parameters
+    config = PreparationConfig(
+        parameters=replace(
+            base,
+            max_concurrency=concurrency,
+            speculation=RECIPE.speculation,
+            mixed_prefill=MixedPrefillParameters(enabled=True),
+        )
+    )
     assert config.preparation_state_rows == 1 + 2 * config.request_capacity
     assert config.preparation_state_rows == PreparationConfig(
-        max_active=concurrency, snapshot_budget_bytes=32 << 30).preparation_state_rows
+        parameters=replace(base, max_concurrency=concurrency), snapshot_budget_bytes=32 << 30
+    ).preparation_state_rows

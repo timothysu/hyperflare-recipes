@@ -49,6 +49,63 @@ class RouterScratch:
         return RouterScratch(*(getattr(self, field)[:tokens] for field in self.__dataclass_fields__))
 
 
+ROUTE_PACK_BYTES = 16
+
+
+@dataclass(frozen=True)
+class RouteRecord:
+    """One row-interleaved record of selected expert IDs and FP32 route-weight bits."""
+
+    words: torch.Tensor
+
+    @classmethod
+    def _validate_geometry(cls, rows: int, top_k: int) -> None:
+        if type(rows) is not int or type(top_k) is not int or rows <= 0 or top_k <= 0 or 8 * top_k % ROUTE_PACK_BYTES:
+            raise ValueError("a route record needs positive rows and a row of whole 16-byte packs")
+
+    @classmethod
+    def allocate(cls, rows: int, top_k: int, device, *, buffers=None) -> RouteRecord:
+        cls._validate_geometry(rows, top_k)
+        def zeros():
+            return (torch.zeros((rows, 2 * top_k), dtype=torch.int32, device=device) if buffers is None
+                    else buffers.zeros((rows, 2 * top_k), torch.int32))
+        return cls(zeros())
+
+    @classmethod
+    def empty(cls, rows: int, top_k: int, device) -> RouteRecord:
+        cls._validate_geometry(rows, top_k)
+        return cls(torch.empty((rows, 2 * top_k), dtype=torch.int32, device=device))
+
+    @property
+    def top_k(self) -> int:
+        return self.words.shape[1] // 2
+
+    @property
+    def packed(self) -> torch.Tensor:
+        """The records as the contiguous BF16 rows a shard gather moves."""
+        return self.words.view(torch.bfloat16)
+
+    def router_scratch(self, selected_logits: torch.Tensor) -> RouterScratch:
+        """The router outputs over this record's ID and weight words."""
+        return RouterScratch(selected_logits, self.words[:, :self.top_k],
+                             self.words[:, self.top_k:].view(torch.float32))
+
+    def rows(self, count: int) -> RouteRecord:
+        if type(count) is not int or not 0 < count <= self.words.shape[0]:
+            raise ValueError("route record rows exceed capacity")
+        return RouteRecord(self.words[:count])
+
+    def read(self, ids: torch.Tensor, weights: torch.Tensor) -> None:
+        """Copy the records into the contiguous route buffers a consumer reads."""
+        ids.copy_(self.words[:, :self.top_k])
+        weights.copy_(self.words[:, self.top_k:].view(torch.float32))
+
+    def write(self, ids: torch.Tensor, weights: torch.Tensor) -> None:
+        """Copy the routes a router produced into the records a gather sends."""
+        self.words[:, :self.top_k].copy_(ids)
+        self.words[:, self.top_k:].view(torch.float32).copy_(weights)
+
+
 class PreparedRouter:
     """Native top-k routing, FP32 weights, and descending-ID ties.
 
@@ -154,7 +211,8 @@ class PreparedRoutedExperts:
 
     def __init__(self, source, experts, ids, weights, output, *, session: PreparationSession, name: str,
                  workspace: ScratchArena | torch.Tensor | None = None, router_plan=None,
-                 a4_prefill=False, routing=None, router=None, route_output=None, activation_mode=None):
+                 a4_prefill=False, routing=None, router=None, route_output=None, activation_mode=None,
+                 a_scales=None, reserve_sms: int = 0):
         from b12x.moe.fused_moe._binding_ops import materialize_scale_templates
 
         materialize_scale_templates(experts)
@@ -185,6 +243,8 @@ class PreparedRoutedExperts:
         # A16 experts prepared with A4 capability run large prefill calls with quantized activations.
         precision = {} if experts.plan.activation.outer_scale == "token" else {"a4_prefill": a4_prefill}
         self.source = source
+        self.a_scales = a_scales
+        self.prequantized_input = a_scales is not None
         self.experts = experts
         self.preparation_arena = workspace
         self.num_experts = experts.num_experts
@@ -224,11 +284,14 @@ class PreparedRoutedExperts:
             capacity=fused_moe.ExecutionCapacity(
                 max_tokens=source.shape[0], top_k=ids.shape[1],
                 route_num_experts=experts.num_experts if self.route_inputs else 0,
-                output_layout="routes" if output.ndim == 3 else "token"),
+                output_layout="routes" if output.ndim == 3 else "token",
+                input_format="mxfp8" if self.prequantized_input else "bf16",
+                reserve_sms=reserve_sms),
             scale_expansion=self.scale_plan, invocation=invocation, routing=routing,
             activation_mode=activation_mode,
         )
         route_input_templates = dict(self.route_inputs)
+        scale_input_kwargs = {"a_scales": a_scales} if self.prequantized_input else {}
 
         def prepare_call(state):
             scratch = planned_scratch(state.scratch.scratch_specs(), workspace)
@@ -240,7 +303,7 @@ class PreparedRoutedExperts:
                 if "num_valid_tokens" in route_inputs:
                     route_inputs["num_valid_tokens"] = torch.full_like(route_inputs["num_valid_tokens"], source.shape[0])
             binding = state.bind(a=source, topk_ids=torch.zeros_like(ids), topk_weights=torch.full_like(weights, 1 / ids.shape[1]),
-                output=output, scratch=scratch, input_scales_static=True, **precision, **route_inputs)
+                output=output, scratch=scratch, input_scales_static=True, **precision, **route_inputs, **scale_input_kwargs)
             return PreparedCall(run=lambda: state.run(binding), owners=prime_owners(workspace, scratch, binding))
 
         scale_requests = () if self.scale_plan is None else (self.scale_plan.request(
@@ -255,12 +318,13 @@ class PreparedRoutedExperts:
             benchmark_call=partial(moe_fixtures.benchmark_call, source=source, experts=experts,
                 top_k=ids.shape[1], session=session, name=name, workspace=workspace,
                 allocate_router=RouterScratch.allocate, router_plan=router_plan, precision=precision,
-                integrated_query=integrated_query, output_template=output)),))
+                integrated_query=integrated_query, output_template=output, a_scales=a_scales)),))
 
         def finalize():
             self.scratch = planned_scratch(self.plan.scratch_specs(), workspace)
             self.binding = fused_moe.bind(self.plan, a=source, topk_ids=ids, topk_weights=weights,
-                output=output, scratch=self.scratch, input_scales_static=True, **precision, **route_input_templates)
+                output=output, scratch=self.scratch, input_scales_static=True, **precision,
+                **route_input_templates, **scale_input_kwargs)
 
         register_finalizer(session, finalize, workspace=workspace)
 
@@ -271,7 +335,7 @@ class PreparedRoutedExperts:
                 raise ValueError("functional compressed experts require an arena preparation-release boundary")
             self.output_layout = (tuple(self.output.shape), self.output.stride(), self.output.dtype)
             self.integrated_routing = bool(self.route_inputs)
-            self.output = self.output_source = self.source = None
+            self.output = self.output_source = self.source = self.a_scales = None
             if self.router is not None:
                 self.router.functional(session=session)
             register_finalizer(session, self._finalize_functional, workspace=self.preparation_arena)
@@ -311,10 +375,11 @@ class PreparedRoutedExperts:
             self.router(logits)
 
     def __call__(self, source=None, ids=None, weights=None, *, router_logits=None, selected_logits=None,
-                 image_mask=None, num_valid_tokens=None, prequant_a_values=None, prequant_a_scales=None):
+                 image_mask=None, num_valid_tokens=None, prequant_a_values=None, prequant_a_scales=None,
+                 a_scales=None):
         if self.output is None:
             from b12x.moe.fused_moe._binding_ops import (
-                prepared_moe_out, prepared_moe_prequant_out, prepared_routed_moe_out,
+                prepared_moe_mxfp8_out, prepared_moe_out, prepared_moe_prequant_out, prepared_routed_moe_out,
             )
 
             if source is None or ids is None or weights is None:
@@ -332,6 +397,14 @@ class PreparedRoutedExperts:
                     scratch, self.scale_inputs, storage, self.plan.handle,
                     options.get("correction_bias"), options.get("image_correction_bias"),
                     options.get("image_mask"), options.get("num_valid_tokens"), False)
+            elif getattr(self, "prequantized_input", False):
+                if a_scales is None:
+                    raise ValueError("prequantized functional experts require a_scales")
+                prepared_moe_mxfp8_out(source, a_scales, weights, ids, output, scratch, self.scale_inputs, storage,
+                    self.plan.handle, True, None, None, None, None, None, False,
+                    self.precision.get("a4_prefill"))
+            elif a_scales is not None:
+                raise ValueError("a_scales requires prequantized MXFP8 expert preparation")
             elif prequant_a_values is not None and prequant_a_scales is not None:
                 prepared_moe_prequant_out(source, prequant_a_values, prequant_a_scales, weights, ids, output,
                     scratch, self.scale_inputs, storage, self.plan.handle, True, None, None, None, None, None,

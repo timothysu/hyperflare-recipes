@@ -24,21 +24,31 @@ def test_two_hosts_may_each_use_their_own_gpu_zero():
 
 
 def test_ring_and_chain_need_hosts_in_rank_order():
+    from dataclasses import replace
+
     with pytest.raises(ValueError, match="--roce-ring"):
-        bootstrap.PreparationConfig(devices=(0, 1), roce_ring=True)
+        bootstrap.PreparationConfig(devices=(0, 1), parameters=replace(recipe.RECIPE.parameters, roce_ring=True))
     with pytest.raises(ValueError, match="exclude each other"):
-        bootstrap.PreparationConfig(devices=(0,) * 2, hosts=("a", "b"), roce_ring=True, roce_chain=True)
-    assert bootstrap.PreparationConfig(devices=(0,) * 2, hosts=("a", "b"), roce_chain=True).roce_chain
+        bootstrap.PreparationConfig(
+            devices=(0,) * 2, hosts=("a", "b"),
+            parameters=replace(recipe.RECIPE.parameters, roce_ring=True, roce_chain=True),
+        )
+    assert bootstrap.PreparationConfig(
+        devices=(0,) * 2, hosts=("a", "b"),
+        parameters=replace(recipe.RECIPE.parameters, roce_chain=True),
+    ).roce_chain
 
 
 @pytest.mark.parametrize("world", [2, 4])
 @pytest.mark.parametrize("remote", [False, True])
 def test_recipe_dispatches_the_complete_plan_to_the_rank_group(monkeypatch, remote, world):
+    from dataclasses import replace
     from ignition.preparation import rank_group
 
     gpus = tuple(planning.Gpu(i, "GB10", f"GPU-{i}", 128 << 30, 120 << 30, (12, 1)) for i in range(world))
-    plan = planning.fit(recipe.RECIPE, recipe.RECIPE.checkpoints[0], gpus, concurrency=16,
-                        reserve_bytes=4 << 30, speculation=recipe.RECIPE.speculation)
+    plan = planning.fit(recipe.RECIPE, recipe.RECIPE.checkpoints[0], gpus,
+                        parameters=replace(recipe.RECIPE.parameters, max_concurrency=16),
+                        reserve_bytes=4 << 30)
     ranks = SimpleNamespace(hosts=("maxwell", "hertz", "faraday", "ampere")[:world]) if remote else None
     calls, result, storage = [], object(), object()
     monkeypatch.setattr(rank_group, "prepare_group", lambda *args, **kwargs: calls.append((args, kwargs)) or result)
@@ -57,13 +67,17 @@ def test_recipe_dispatches_the_complete_plan_to_the_rank_group(monkeypatch, remo
 @pytest.mark.parametrize("world", [2, 4])
 @pytest.mark.parametrize("dspark", [False, True])
 def test_remote_channels_cover_gathers_and_broadcasts_without_pcie(monkeypatch, dspark, world):
+    from dataclasses import replace
     from ignition.components.collectives import packed_broadcast_layout
     from hyperflare_recipes.components.draft_sampling import PreparedDraftBlockBroadcast, PreparedDraftDistribution
     from hyperflare_recipes.components.speculation import SpeculativeAcceptance
 
     hosts = ("a", "b", "c", "d")[:world]
-    config = bootstrap.PreparationConfig(devices=(0,) * world, hosts=hosts, max_active=16, dspark=dspark,
-                                         speculative_widths=(1, 2, 3, 4, 5, 6), speculative_token_capacity=128)
+    config = bootstrap.PreparationConfig(
+        devices=(0,) * world, hosts=hosts,
+        parameters=replace(recipe.RECIPE.parameters, max_concurrency=16,
+                           speculation=recipe.RECIPE.speculation if dspark else None),
+    )
     calls, runtime, storage = [], object(), object()
     monkeypatch.setattr(bootstrap, "create_roce_runtime",
                         lambda group, device, **kwargs: calls.append(kwargs) or runtime)
@@ -94,7 +108,11 @@ def test_remote_channels_cover_gathers_and_broadcasts_without_pcie(monkeypatch, 
 
 
 def test_local_channels_are_unchanged(monkeypatch):
-    config = bootstrap.PreparationConfig(devices=(0, 1), max_active=16, collective_tuning="runtime")
+    from dataclasses import replace
+
+    config = bootstrap.PreparationConfig(
+        devices=(0, 1), parameters=replace(recipe.RECIPE.parameters, max_concurrency=16),
+    )
     gathers, reductions = [], []
     monkeypatch.setattr(bootstrap, "create_all_gather_runtime",
                         lambda group, device, **kwargs: gathers.append(kwargs) or object())
@@ -107,7 +125,7 @@ def test_local_channels_are_unchanged(monkeypatch):
     collective, prefill, vocabulary, markov = bootstrap._collective_runtimes(config, None, None,
         coordinator=SimpleNamespace(spans_hosts=False), core_storage=SimpleNamespace(peer_storage=ipc))
     assert len({id(collective), id(prefill), id(vocabulary), id(markov)}) == 4
-    assert reductions[0]["collective_tuning"] == "runtime" and reductions[0]["ipc"] is ipc
+    assert reductions[0]["ipc"] is ipc
     assert gathers[0]["columns"] == 129280
     assert gathers[0]["max_rows"] == max(config.decode_samples, config.request_capacity * config.draft_tokens)
     assert gathers[1] == {"max_rows": config.request_capacity, "columns": 2 * 129280, "ipc": ipc}

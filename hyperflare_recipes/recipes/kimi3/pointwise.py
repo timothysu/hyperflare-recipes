@@ -76,6 +76,49 @@ def rms_norm_columns(source, weight, out, eps, begin=None):
 
 
 @triton.jit
+def _rms_norm_rows(Source, Output, source_stride, output_stride, eps, WIDTH: tl.constexpr, BLOCK: tl.constexpr):
+    row = tl.program_id(0).to(tl.int64)
+    columns = tl.arange(0, BLOCK)
+    valid = columns < WIDTH
+    value = tl.load(Source + row * source_stride + columns, valid, other=0.).to(tl.float32)
+    normalized = (value * tl.rsqrt(tl.sum(value * value) / WIDTH + eps)).to(Output.dtype.element_ty)
+    tl.store(Output + row * output_stride + columns, normalized, valid)
+
+
+def rms_norm_rows(source, out, eps):
+    """Weightless canonical RMSNorm rounded to ``out.dtype``, matching the first stage of ``rms_norm_columns``."""
+    rows, width = source.shape
+    if out.shape != (rows, width) or source.stride(-1) != 1 or out.stride(-1) != 1:
+        raise ValueError("RMSNorm rows require matching contiguous 2D tensors")
+    block = triton.next_power_of_2(width)
+    torch.library.wrap_triton(_rms_norm_rows)[(rows,)](
+        source, out, source.stride(0), out.stride(0), float(eps), width, block,
+        num_warps=4 if block <= 2048 else 8)
+    return out
+
+
+@triton.jit
+def _scale_columns(Source, Weight, Output, source_stride, output_stride, WIDTH: tl.constexpr, BLOCK: tl.constexpr):
+    row, block = tl.program_id(0).to(tl.int64), tl.program_id(1)
+    columns = block * BLOCK + tl.arange(0, BLOCK)
+    valid = columns < WIDTH
+    value = tl.load(Source + row * source_stride + columns, valid, other=0.).to(tl.float32)
+    weight = tl.load(Weight + columns, valid, other=0.).to(tl.float32)
+    tl.store(Output + row * output_stride + columns, (weight * value).to(Output.dtype.element_ty), valid)
+
+
+def scale_columns(source, weight, out):
+    """Multiply normalized columns by ``weight`` in FP32 and round to ``out.dtype``, matching ``rms_norm_columns``."""
+    rows, width = source.shape
+    if out.shape != (rows, width) or weight.shape != (width,) or source.stride(-1) != 1 or out.stride(-1) != 1:
+        raise ValueError("column scaling requires matching contiguous 2D tensors and weight vector")
+    block = min(1024, triton.next_power_of_2(width))
+    torch.library.wrap_triton(_scale_columns)[(rows, triton.cdiv(width, block))](
+        source, weight, out, source.stride(0), out.stride(0), width, block, num_warps=4)
+    return out
+
+
+@triton.jit
 def _sigmoid_gate(Value, Gate, value_stride, gate_stride, WIDTH: tl.constexpr, BLOCK: tl.constexpr):
     row, block = tl.program_id(0).to(tl.int64), tl.program_id(1)
     columns = block * BLOCK + tl.arange(0, BLOCK)

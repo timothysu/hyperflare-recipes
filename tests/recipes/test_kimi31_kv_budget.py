@@ -41,9 +41,10 @@ def test_rank_costs_include_latent_and_index_pages(config):
 
 @pytest.mark.parametrize("chunk,pages", [(128, 9), (2048, 9), (2176, 10), (4096, 10)])
 def test_preparation_pages_follow_global_context_geometry(chunk, pages):
+    from dataclasses import replace
     from hyperflare_recipes.recipes.kimi3.bootstrap import PreparationConfig
 
-    config = PreparationConfig(prefill_chunk_size=chunk)
+    config = PreparationConfig(parameters=replace(PreparationConfig().parameters, prefill_chunk=chunk))
     assert config.page_tokens == 2048 and config.preparation_pages == pages
     assert not config.drafting
     assert (pages - 8) * config.page_tokens >= chunk

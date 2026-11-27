@@ -9,12 +9,40 @@ from types import SimpleNamespace
 
 import pytest
 
+from ignition.parameters import PromptLogprobsParameters, SpeculationParameters
 from ignition.preparation.selection import BenchmarkSelection
 from hyperflare_recipes.recipes.kimi3.bootstrap import PreparationConfig, _benchmark_state
 
 
+def _cfg(**kwargs):
+    params = PreparationConfig().parameters
+    param_updates = {}
+    if "max_active" in kwargs:
+        param_updates["max_concurrency"] = kwargs.pop("max_active")
+    if "online_mxfp8" in kwargs:
+        param_updates["online_mxfp8"] = replace(params.online_mxfp8, enabled=kwargs.pop("online_mxfp8"))
+    if "prompt_logprobs" in kwargs:
+        param_updates["prompt_logprobs"] = PromptLogprobsParameters(enabled=kwargs.pop("prompt_logprobs"))
+    spec = params.speculation
+    spec_updates = {}
+    if "speculative_token_capacity" in kwargs:
+        spec_updates["token_capacity"] = kwargs.pop("speculative_token_capacity")
+    if "speculative_widths" in kwargs:
+        widths = kwargs.pop("speculative_widths")
+        drafts = max(widths) - 1
+        spec_updates["draft_tokens"] = drafts
+        if drafts == 0:
+            spec_updates["packed_verification"] = False
+            spec_updates["graph_budget"] = None
+    if spec_updates:
+        param_updates["speculation"] = replace(spec, **spec_updates)
+    if param_updates:
+        params = replace(params, **param_updates)
+    return PreparationConfig(parameters=params, **kwargs)
+
+
 def test_selected_kimi_round_preserves_serving_configuration():
-    ordinary = PreparationConfig(max_active=8, draft_checkpoint=Path("dspark"),
+    ordinary = _cfg(max_active=8, draft_checkpoint=Path("dspark"),
         speculative_token_capacity=64, online_mxfp8=True)
     selection = BenchmarkSelection(batches=(8,), contexts=(512, 2048, 8192), width=8)
     selected = replace(ordinary, benchmark_selection=selection)
@@ -35,15 +63,21 @@ def test_selected_kimi_round_preserves_serving_configuration():
 def test_packed_prefix_matrix_preserves_k7_owner_and_backing():
     selection = BenchmarkSelection(batches=(1,), contexts=(512, 8192),
                                    verification_prefixes=(1, 4, 6, 8))
-    config = PreparationConfig(max_active=4, draft_checkpoint=Path("dflash2"),
-                               speculative_token_capacity=32, benchmark_selection=selection)
+    config = _cfg(max_active=4, draft_checkpoint=Path("dflash2"),
+                  speculative_token_capacity=32, benchmark_selection=selection)
     assert config.draft_tokens == 7
     assert config.completion_token_capacity == 8
     assert config.speculative_round_shapes == (
         (1, 1, 1), (1, 8, 4), (1, 8, 6), (1, 8, 8))
     assert selection.physical_pages(2048) == 6
     with pytest.raises(ValueError, match="width capacities"):
-        replace(config, speculative_widths=(1,))
+        replace(
+            config,
+            parameters=replace(
+                config.parameters,
+                speculation=SpeculationParameters(draft_tokens=0, max_draft_tokens=7, token_capacity=32),
+            ),
+        )
 
 
 @pytest.mark.parametrize("changes,match", [
@@ -59,20 +93,31 @@ def test_kimi_selection_rejects_unavailable_geometry(changes, match):
         benchmark_selection=BenchmarkSelection(batches=(8,), contexts=(2048,)))
     options.update(changes)
     with pytest.raises(ValueError, match=match):
-        PreparationConfig(**options)
+        _cfg(**options)
 
 
 @pytest.mark.parametrize("alias,default", [("kimi-k3", "all"), ("kimi-k3.1-pro", "kda-input")])
 @pytest.mark.parametrize("scope", [None, "all", "kda-input"])
 def test_kimi_adapter_passes_benchmark_selection_and_precision(monkeypatch, tmp_path, alias, default, scope):
+    from ignition import planning
     from hyperflare_recipes.recipes import resolve
-    from .test_declarations import fitted
 
     model = resolve(alias)
     selection = BenchmarkSelection(batches=(8,), contexts=(2048,), width=8) if model.recipe.name == "kimi31" else None
-    plan = replace(fitted(model, 16, concurrency=8), benchmark_selection=selection,
-        speculation=replace(model.recipe.speculation, token_capacity=64), online_mxfp8=True, online_mxfp8_scope=scope,
-        language_model_only=False, autotune_effort="default")
+    devices = tuple(planning.Gpu(index, "NVIDIA RTX PRO 6000 Blackwell", f"GPU-{index}", 96 << 30, 95 << 30, (12, 0))
+                    for index in range(16))
+    params = replace(
+        model.recipe.parameters,
+        max_concurrency=8,
+        speculation=replace(model.recipe.speculation, token_capacity=64),
+        online_mxfp8=replace(model.recipe.parameters.online_mxfp8, enabled=True, scope=scope),
+        vision=replace(model.recipe.parameters.vision, language_model_only=False),
+        autotune_effort="default",
+    )
+    plan = replace(
+        planning.fit(model.recipe, model.checkpoint, devices, parameters=params, reserve_bytes=0),
+        benchmark_selection=selection,
+    )
     (tmp_path / "dspark").mkdir()
     monkeypatch.setattr("ignition.preparation.rank_group.prepare_group",
                         lambda snapshot, config, prepare, **kwargs: config)

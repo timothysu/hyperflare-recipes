@@ -22,12 +22,15 @@ from .projections import prepare_projection
 
 
 class PreparedKDA:
-    def __init__(self, weights, source, state, metadata, *, mode, eps, session, name, workspace, buffers, records=None):
+    def __init__(self, weights, source, state, metadata, *, mode, eps, session, name, workspace, buffers, records=None,
+                 chunk_rows=None):
         mode = "decode" if mode == "verify" else mode
         self.recording, self.state, self.metadata = records is not None, state, metadata
         self.weights, self.eps = weights, eps
         tokens, hidden = source.shape
-        self.tokens, self.fused = tokens, None
+        if chunk_rows is not None and (mode != "prefill" or not 0 < chunk_rows < tokens or tokens % chunk_rows):
+            raise ValueError("KDA chunked projections require prefill with chunk_rows dividing tokens")
+        self.tokens, self.chunk_rows, self.fused = tokens, chunk_rows, None
         heads, width = state.recurrent.shape[1], state.recurrent.shape[1] * 128
         device = source.device
 
@@ -54,10 +57,12 @@ class PreparedKDA:
             and self.forget_source.data_ptr() % 16 == 0
         )
         forget_decl = self.forget_source if self.direct_forget else self.forget
+        proj_rows = tokens if chunk_rows is None else chunk_rows
+        output_decl = buffer("output", hidden)
         self.projections = {key: prepare_projection(x, weights[key], y, session=session,
             name=name + "." + key, workspace=workspace) for key, x, y in (
-                ("input", source, self.input), ("forget", forget_decl, raw_g),
-                ("output", gated, buffer("output", hidden)))}
+                ("input", source[:proj_rows], self.input[:proj_rows]), ("forget", forget_decl, raw_g),
+                ("output", gated[:proj_rows], output_decl[:proj_rows]))}
         sequences = metadata.query_start_loc.numel() - 1
         conv_args = dict(x=qkv, conv_weight=weights["convolution"], query_start_loc=metadata.query_start_loc,
             state_slot_ids=metadata.convolution_slots, state_is_fresh=metadata.fresh,
@@ -131,42 +136,60 @@ class PreparedKDA:
     def _release_bindings(self):
         self.convolution = self.recurrence = None
 
-    def __call__(self, source, metadata=None, *, records=None):
+    def input_plans(self):
+        proj = self.projections["input"]
+        return tuple(p for p in (proj.plan, getattr(proj, "quantizer_plan", None)) if p is not None)
+
+    def output_plans(self):
+        proj = self.projections["output"]
+        return tuple(p for p in (proj.plan, getattr(proj, "quantizer_plan", None)) if p is not None)
+
+    def all_plans(self):
+        forget = self.projections["forget"]
+        forget_plans = tuple(p for p in (forget.plan, getattr(forget, "quantizer_plan", None)) if p is not None)
+        return (*self.input_plans(), *self.output_plans(), *forget_plans, self.conv_plan, self.plan)
+
+    def project_input_chunk(self, source_chunk):
+        return self.projections["input"](source_chunk)
+
+    def project_output_chunk(self, gated_chunk):
+        return self.projections["output"](gated_chunk)
+
+    def run_core(self, projected, metadata, *, records=None):
+        """Run forget projection, short convolution, recurrence, and gated RMSNorm over full projected rows."""
         if metadata is None:
             raise ValueError("KDA execution requires invocation metadata")
         if self.recording and records is None:
             raise ValueError("KDA verification requires invocation records")
-        tokens, heads, width = source.shape[0], self.heads, self.width
-        projected = self.projections["input"](source)
+        tokens, heads, width = projected.shape[0], self.heads, self.width
         qkv, forget, gate, beta, _ = projected.split(
             (3 * width, 128, width, heads, projected.shape[1] - 4 * width - 128 - heads), dim=-1)
         if tokens == 1 or self.direct_forget:
             forget_input = forget
         else:
-            forget_input = torch.empty((tokens, 128), dtype=source.dtype, device=source.device)
+            forget_input = torch.empty((tokens, 128), dtype=projected.dtype, device=projected.device)
             forget_input.copy_(forget)
         raw_g = self.projections["forget"](forget_input).view(tokens, heads, 128)
         gate = gate.view(tokens, heads, 128)
         if self.recording and self.fused is not None:
-            output = torch.empty((tokens, heads, 128), dtype=source.dtype, device=source.device)
+            output = torch.empty((tokens, heads, 128), dtype=projected.dtype, device=projected.device)
             _record_fused([qkv, raw_g, beta, gate, self.weights["A_log"], self.weights["dt_bias"].view(heads, 128),
                 self.weights["norm"], self.weights["convolution"], metadata.query_start_loc,
                 metadata.convolution_slots, metadata.fresh, metadata.accepted_tokens, metadata.state_indices,
                 metadata.num_seqs, metadata.num_tokens], self.recurrent_state, output, *records,
                 self.state.convolution, self.handle)
-            return self.projections["output"](output.reshape(tokens, -1))
-        mixed = torch.empty((tokens, 3 * width), dtype=source.dtype, device=source.device)
-        conv_scratch = torch.empty(self.conv_bytes, dtype=torch.uint8, device=source.device)
+            return output.reshape(tokens, -1)
+        mixed = torch.empty((tokens, 3 * width), dtype=projected.dtype, device=projected.device)
+        conv_scratch = torch.empty(self.conv_bytes, dtype=torch.uint8, device=projected.device)
         run_short_conv(self.conv_plan, x=qkv, conv_weight=self.weights["convolution"],
             query_start_loc=metadata.query_start_loc, state_slot_ids=metadata.convolution_slots,
             state_is_fresh=metadata.fresh, num_accepted_tokens=metadata.accepted_tokens,
             num_seqs=metadata.num_seqs, num_tokens=metadata.num_tokens,
             conv_state=self.state.convolution, out=mixed, scratch=conv_scratch)
-        gate = gate.view(tokens, heads, 128)
-        output = torch.empty((tokens, heads, 128), dtype=source.dtype, device=source.device)
+        output = torch.empty((tokens, heads, 128), dtype=projected.dtype, device=projected.device)
         dt_bias = self.weights["dt_bias"].view(heads, 128)
         if self.recording:
-            scratch = torch.empty(self.recurrence_bytes, dtype=torch.uint8, device=source.device)
+            scratch = torch.empty(self.recurrence_bytes, dtype=torch.uint8, device=projected.device)
             _record([mixed, raw_g, beta, gate, self.weights["A_log"], dt_bias, self.weights["norm"],
                 metadata.query_start_loc, metadata.accepted_tokens, metadata.state_indices,
                 metadata.num_seqs, metadata.num_tokens], self.recurrent_state, output,
@@ -177,7 +200,7 @@ class PreparedKDA:
                 metadata.accepted_tokens, metadata.state_indices, metadata.num_seqs,
                 metadata.num_tokens, output, self.eps, 128 ** -.5, -5.0, self.plan.handle)
         else:
-            scratch = torch.empty(self.recurrence_bytes, dtype=torch.uint8, device=source.device)
+            scratch = torch.empty(self.recurrence_bytes, dtype=torch.uint8, device=projected.device)
             q, k, v = (value.view(tokens, heads, 128) for value in mixed.split(width, dim=-1))
             kda_prefill_out([q, k, v, raw_g, beta, self.weights["A_log"], dt_bias,
                 metadata.query_start_loc, metadata.initial_state_indices, metadata.final_state_indices,
@@ -185,7 +208,21 @@ class PreparedKDA:
                 metadata.num_tokens], scratch, self.recurrent_state, output,
                 self.plan.handle, -5.0, None, 1e-6, None, None)
             output = self.norm(output, gate, live=metadata.num_tokens)
-        return self.projections["output"](output.reshape(tokens, -1))
+        return output.reshape(tokens, -1)
+
+    def __call__(self, source, metadata=None, *, records=None):
+        if metadata is None:
+            raise ValueError("KDA execution requires invocation metadata")
+        if self.recording and records is None:
+            raise ValueError("KDA verification requires invocation records")
+        if self.chunk_rows is None:
+            projected = self.projections["input"](source)
+            gated = self.run_core(projected, metadata, records=records)
+            return self.projections["output"](gated)
+        step = self.chunk_rows
+        projected = torch.cat([self.project_input_chunk(source[b:b + step]) for b in range(0, source.shape[0], step)], dim=0)
+        gated = self.run_core(projected, metadata, records=records)
+        return torch.cat([self.project_output_chunk(gated[b:b + step]) for b in range(0, gated.shape[0], step)], dim=0)
 
     def run_fused(self, reads, recurrent_state, output, corrections, keys_gates, convolution_state):
         (qkv, raw_g, raw_beta, z, A_log, dt_bias, norm_weight, conv_weight, query_start_loc,

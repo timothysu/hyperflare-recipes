@@ -91,7 +91,6 @@ class RecordingSession:
     def __init__(self, **kwargs):
         self.requests = {}
         self.finalizers = []
-        self.context_plans = {}
         self.arena = None
         self.closed = False
         self.resources = {}
@@ -105,11 +104,6 @@ class RecordingSession:
             assert request.name not in self.requests
             self.memory[request.name] = request.plan.memory_requirements()
             self.requests[request.name] = request
-
-    def register_context_plan(self, name, plan, bind):
-        assert self.requests[name].plan is plan
-        assert name not in self.context_plans and callable(bind)
-        self.context_plans[name] = (plan, bind)
 
     def register_finalizer(self, callback):
         self.finalizers.append(callback)
@@ -570,11 +564,21 @@ def _install_boundaries(monkeypatch, checkpoint):
 def test_prepare_model_constructs_real_catalog_on_meta(
     monkeypatch, checkpoint, proposal, fixed, concurrency
 ):
+    from dataclasses import replace
+    from ignition.parameters import SpeculationParameters
+    from hyperflare_recipes.recipes.qwen38.recipe import RECIPE
+
     session, signatures, constructors = _install_boundaries(monkeypatch, checkpoint)
+    spec = None if proposal == "ordinary" else SpeculationParameters(
+        draft_tokens=5 if fixed is None else fixed - 1,
+        max_draft_tokens=7,
+        adaptive=fixed is None,
+        token_capacity=None,
+        method="mtp",
+        supported_methods=("mtp", "dflash2"),
+    )
     config = bootstrap.PreparationConfig(
-        max_active=concurrency,
-        mtp=proposal != "ordinary",
-        speculative_fixed_width=fixed,
+        parameters=replace(RECIPE.parameters, max_concurrency=concurrency, speculation=spec),
     )
     with (
         FakeTensorMode(allow_non_fake_inputs=True),
@@ -583,7 +587,6 @@ def test_prepare_model_constructs_real_catalog_on_meta(
     ):
         bootstrap.prepare_model(checkpoint[0].snapshot, config)
     assert session.closed
-    assert session.context_plans
     modes = 1 if proposal == "ordinary" else 2
     expected = {
         "vision": 4,
@@ -691,8 +694,17 @@ def test_prepare_model_constructs_real_catalog_on_meta(
 
 
 def test_mixed_catalog_constructs_on_meta(monkeypatch, checkpoint):
+    from dataclasses import replace
+    from ignition.parameters import MixedPrefillParameters
+    from hyperflare_recipes.recipes.qwen38.recipe import RECIPE
+
     session, signatures, _ = _install_boundaries(monkeypatch, checkpoint)
-    config = bootstrap.PreparationConfig(max_active=4, mtp=True, mixed_prefill=True)
+    config = bootstrap.PreparationConfig(
+        parameters=replace(
+            RECIPE.parameters, max_concurrency=4,
+            mixed_prefill=MixedPrefillParameters(enabled=True),
+        ),
+    )
     with FakeTensorMode(allow_non_fake_inputs=True), MetadataValues(), pytest.raises(ConstructionComplete):
         bootstrap.prepare_model(checkpoint[0].snapshot, config)
     assert session.closed

@@ -50,6 +50,11 @@ def _hash(tensor):
     return hashlib.sha256(memoryview(value.numpy())).hexdigest()
 
 
+def prefill_graph_name(graphs, capacity, *, is_final):
+    terminal = f'terminal_prefill{capacity}'
+    return terminal if is_final and terminal in graphs else f'prefill{capacity}'
+
+
 class ReplayCase:
     def __init__(self, model):
         import torch
@@ -180,7 +185,7 @@ class ReplayCase:
                 h['token_ids'][:end - begin] = torch.tensor(prompt[begin:end])
                 h['prefill_positions'].zero_()
                 h['prefill_positions'][:end - begin] = torch.arange(begin, end)[:, None]
-                self.execute(f'prefill{capacity}')
+                self.execute(prefill_graph_name(self.model.graphs, capacity, is_final=end == len(prompt)))
                 record = self.model.buffers['completion_records'][0, slot].cpu().tolist()
                 expected_generated = int(end == len(prompt))
                 if (record[:4] != [1, 1, end, expected_generated]

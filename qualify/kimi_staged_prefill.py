@@ -184,7 +184,7 @@ def _benchmark_rank(rank, rendezvous, destination, pairs, seeds):
             output = torch.empty((maximum, WIDTH), dtype=cache.dtype, device=device)
             signals = tuple(torch.zeros((1, 8), dtype=torch.bfloat16, device=device) for _ in range(4))
             runtime = create_all_reduce_runtime(dist.group.WORLD, device,
-                collective_tuning='static', max_tokens=1, hidden_size=8, ipc=storage.peer_storage)
+                max_tokens=1, hidden_size=8, ipc=storage.peer_storage)
             with RecordedPreparationSession(device=device, checkpoint='kimi31-staged-prefill-synthetic',
                     workload_schema='paired-transfer-gather-bf16-attention', numerical_policy='exact-bf16',
                     autotune_effort='default', compile_workers=16, coordinator=coordinator) as session:

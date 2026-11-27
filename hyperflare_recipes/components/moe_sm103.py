@@ -783,8 +783,12 @@ class Sm103RoutedExperts:
 
     def __init__(self, source, experts: Sm103Experts, ids, weights, output, *, session, name: str,
                  workspace: ScratchArena | torch.Tensor | None = None,
-                 router_plan=None, a4_prefill=False, router=None, route_output=None):
+                 router_plan=None, a4_prefill=False, router=None, route_output=None,
+                 reserve_sms: int = 0):
         from hyperflare_recipes.components.moe import RouterScratch
+
+        if isinstance(reserve_sms, bool) or not isinstance(reserve_sms, int) or reserve_sms < 0:
+            raise ValueError("reserve_sms must be a non-negative integer")
 
         if a4_prefill:
             raise ValueError("SM103 routed experts do not provide A4 prefill for A16 experts")

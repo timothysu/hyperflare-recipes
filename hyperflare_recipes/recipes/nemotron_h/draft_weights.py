@@ -10,6 +10,7 @@ import json
 
 import torch
 
+from hyperflare_recipes.components.parallel import TensorParallelShard
 from hyperflare_recipes.components.weights import DirectWeightLoader
 from ignition.preparation.checkpoint import inspect_indexed_checkpoint
 from ignition.preparation.persistent import persistent_cat, persistent_copy
@@ -31,13 +32,17 @@ class DraftWeightLoader(DirectWeightLoader):
                 for name in self.manifest.tensors if name.endswith(".weight")
                 and not any(fnmatchcase(name.removesuffix(".weight"), pattern) for pattern in excluded)}
 
-    def projection(self, prefix, *, temporary=False):
+    def projection(self, prefix, *, rows=None, columns=None, temporary=False):
         if prefix in self.quantization:
-            return self.load_linear(prefix, temporary=temporary)
-        return self.tensor(prefix + ".weight", temporary=temporary)
+            return self.load_linear(prefix, rows=rows, columns=columns, temporary=temporary)
+        extent = None
+        if rows is not None or columns is not None:
+            extent = (slice(*rows) if rows is not None else slice(None),
+                      slice(*columns) if columns is not None else slice(None))
+        return self.tensor(prefix + ".weight", extent=extent, temporary=temporary)
 
-    def tensor(self, name, *, temporary=False):
-        value = self.load_tensor(name, temporary=temporary)
+    def tensor(self, name, *, extent=None, temporary=False):
+        value = self.load_tensor(name, extent=extent, temporary=temporary)
         if value.dtype != torch.bfloat16:
             raise ValueError(f"LiLiCorr requires BF16 unquantized parameters: {name}")
         return value
@@ -76,7 +81,7 @@ class DraftWeightLoader(DirectWeightLoader):
         return weights
 
 
-@weight_container(('projection', 'hidden_norm', 'norm', 'context_kv', 'layers', 'lattice'))
+@weight_container(('projection', 'hidden_norm', 'norm', 'context_kv', 'layers', 'lattice', 'head'))
 @dataclass(frozen=True)
 class DraftWeights:
     projection: object
@@ -85,29 +90,49 @@ class DraftWeights:
     context_kv: torch.Tensor
     layers: tuple[dict, ...]
     lattice: dict
+    head: object = None
 
     @classmethod
-    def load(cls, snapshot, config, device, *, progress=None):
+    def load(cls, snapshot, config, device, *, shard=None, progress=None):
+        shard = TensorParallelShard(0, 1) if shard is None else shard
+        config.validate_shard(shard)
         manifest = inspect_indexed_checkpoint(snapshot)
+        c = config.text
+        dim = c["head_dim"]
+        q_range = shard.partition(c["num_attention_heads"] * dim, alignment=dim)
+        kv_heads = shard.replicated_partition(c["num_key_value_heads"])
+        kv_range = (kv_heads[0] * dim, kv_heads[1] * dim)
+        local_q_width = config.local_attention_heads(shard) * dim
+        mlp_range = shard.partition(c["intermediate_size"], alignment=16)
         with DraftWeightLoader(manifest, device, progress=progress, progress_label="Load draft weights") as loader:
             projection = loader.projection("fc")
             hidden_norm, norm = loader.tensor("hidden_norm.weight"), loader.tensor("norm.weight")
+            head = (loader.projection("lm_head", rows=shard.partition(c["vocab_size"]))
+                    if config.has_own_lm_head else None)
             layers = []
             for index in range(config.layers):
                 p = f"layers.{index}."
-                qkv = loader.load_linear_group(tuple(p + "self_attn." + name
-                    for name in ("q_proj", "k_proj", "v_proj")))
-                layers.append(dict(qkv=qkv, context=qkv[config.text["num_attention_heads"] * config.text["head_dim"]:],
-                    output=loader.projection(p + "self_attn.o_proj"),
+                qkv = loader.load_linear_group(
+                    tuple(p + "self_attn." + name for name in ("q_proj", "k_proj", "v_proj")),
+                    row_ranges=(q_range, kv_range, kv_range),
+                )
+                sink = (persistent_copy(loader.tensor(
+                    p + "self_attn.attention_sink_bias",
+                    extent=slice(*shard.partition(c["num_attention_heads"])),
+                    temporary=True,
+                ).float()) if config.has_sink_bias else None)
+                layers.append(dict(qkv=qkv, context=qkv[local_q_width:],
+                    output=loader.projection(p + "self_attn.o_proj", columns=q_range),
                     q_norm=loader.tensor(p + "self_attn.q_norm.weight"), k_norm=loader.tensor(p + "self_attn.k_norm.weight"),
-                    sink=persistent_copy(loader.tensor(
-                        p + "self_attn.attention_sink_bias", temporary=True).float()),
+                    sink=sink,
                     input_norm=loader.tensor(p + "input_layernorm.weight"),
                     post_norm=loader.tensor(p + "post_attention_layernorm.weight"),
-                    mlp=tuple(loader.projection(p + "mlp." + name) for name in ("gate_proj", "up_proj", "down_proj")),
+                    mlp=(loader.projection(p + "mlp.gate_proj", rows=mlp_range),
+                         loader.projection(p + "mlp.up_proj", rows=mlp_range),
+                         loader.projection(p + "mlp.down_proj", columns=mlp_range)),
                     **{kind: dict(base=loader.tensor(p + kind + ".base_kernel"),
                         projection=loader.projection(p + kind + ".kernel_projection"))
                        for kind in ("attention_conv", "mlp_conv")}))
             lattice = loader.lattice(config)
         context_kv = persistent_cat([layer["context"] for layer in layers])
-        return cls(projection, hidden_norm, norm, context_kv, tuple(layers), lattice)
+        return cls(projection, hidden_norm, norm, context_kv, tuple(layers), lattice, head=head)

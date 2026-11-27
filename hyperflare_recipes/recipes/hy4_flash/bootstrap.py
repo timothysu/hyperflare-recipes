@@ -8,7 +8,7 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import json
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -16,7 +16,6 @@ import torch
 
 from ignition.components.capacity import (
     batch_capacities,
-    image_capacity,
     prefill_capacities,
     request_capacity,
     serving_modes,
@@ -58,6 +57,7 @@ from .decoder import PreparedDecoder, Scratch
 from .dfly import PreparedDFlySpeculativeRound
 from .engram import Tables
 from .pool import ContinuationPool, PAGE_TOKENS, continuation_layout, page_bytes
+from .recipe import Hy4FlashParameters, RECIPE
 from .vision import PreparedVision, VisionInputs, VisionScratch
 from .vision_state import PreparedVisionGeneration, VisionState
 from .weights import ModelWeights
@@ -111,28 +111,50 @@ def _collect_disposable_storage(
     return disposable
 
 
+def _default_parameters() -> Hy4FlashParameters:
+    return RECIPE.parameters
+
+
 @dataclass(frozen=True)
 class PreparationConfig(BasePreparationConfig):
-    prompt_logprobs: bool = False
+    parameters: Hy4FlashParameters = field(default_factory=_default_parameters)
     devices: tuple[int, ...] = (0,)
     context: int = 1048576
-    prefill_chunk_size: int = 4096
-    max_active: int = 8
     minimum_pages: int = 8
     kv_pages: int | None = None
-    image_concurrency: int | None = None
-    language_model_only: bool = False
-    dfly: bool = True
-    speculative_widths: tuple[int, ...] = tuple(range(1, 7))
-    speculative_token_capacity: int | None = 48
-    draft_head_quantization: str | None = None
-    online_mxfp8: bool = False
-    online_mxfp8_scope: str = "all"
-    stream_overlap: bool = True
-    expert_scale_compression: str | None = "csf"
     chat_template: dict | None = None
 
+    @property
+    def dfly(self) -> bool:
+        return self.parameters.speculation is not None
+
+    @property
+    def native_dense_activations(self) -> bool:
+        return self.parameters.native_dense_activations.enabled
+
+    @property
+    def stream_overlap(self) -> bool:
+        return self.parameters.stream_overlap.enabled
+
+    @property
+    def expert_scale_compression(self) -> str | None:
+        return self.parameters.expert_scale_compression.encoding
+
+    @property
+    def online_mxfp8(self) -> bool:
+        return self.parameters.online_mxfp8.enabled
+
+    @property
+    def online_mxfp8_scope(self) -> str:
+        return self.parameters.online_mxfp8.effective_scope
+
+    @property
+    def draft_head_quantization(self) -> str | None:
+        return self.parameters.draft_quantization.draft_head_quantization
+
     def __post_init__(self):
+        if not isinstance(self.parameters, Hy4FlashParameters):
+            raise TypeError("Hy4-flash PreparationConfig requires Hy4FlashParameters")
         if self.mtp_only and (
             not self.dfly
             or max(self.speculative_widths, default=1) <= 1
@@ -147,7 +169,9 @@ class PreparationConfig(BasePreparationConfig):
             raise ValueError("--draft-head-quantization requires enabled learned speculation with positive draft depth")
         if self.online_mxfp8_scope not in ("all", "draft"):
             raise ValueError("Hy4-flash online MXFP8 scope must be 'all' or 'draft'")
-        if self.online_mxfp8_scope != "all" and not self.online_mxfp8:
+        if self.parameters.online_mxfp8.scope not in (None, "all", "draft"):
+            raise ValueError("Hy4-flash online MXFP8 scope must be 'all' or 'draft'")
+        if self.parameters.online_mxfp8.scope not in (None, "all") and not self.online_mxfp8:
             raise ValueError("--online-mxfp8-scope requires --online-mxfp8")
         if len(self.devices) != 1 or any(type(d) is not int or d < 0 for d in self.devices):
             raise ValueError("Hy4-flash preparation requires a single CUDA device (TP=1)")
@@ -163,8 +187,6 @@ class PreparationConfig(BasePreparationConfig):
         self.speculative_shapes
         if self.speculative_fixed_width is not None and self.speculative_fixed_width not in self.speculative_widths:
             raise ValueError("fixed speculative width must belong to the prepared widths")
-        if not self.language_model_only:
-            object.__setattr__(self, "image_concurrency", image_capacity(self.max_active, self.image_concurrency))
         if self.minimum_pages <= 0 or self.snapshot_budget_bytes <= 0 or self.headroom_bytes < 0:
             raise ValueError("page and snapshot budgets must be positive and headroom nonnegative")
         if self.kv_pages is not None and (type(self.kv_pages) is not int or self.kv_pages < self.minimum_pages):
@@ -337,8 +359,6 @@ def prepare_rank(
 
         session = RecordedPreparationSession(
             compile_workers=config.compile_workers,
-            collective_tuning=config.collective_tuning,
-            collective_ladder=config.collective_ladder,
             autotune_effort=config.autotune_effort,
             tuning_replica=config.tuning_replica,
             native_dense_activations=config.native_dense_activations,

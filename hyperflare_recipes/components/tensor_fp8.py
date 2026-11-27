@@ -9,14 +9,40 @@ import torch
 from b12x.gemm import blockscaled
 from b12x.preparation import PreparedCall
 
+from ignition.preparation.persistent import persistent_copy
+from ignition.preparation.rebuild_manifest import weight_container
 from ignition.preparation.tensor_metadata import record_numeric_tensor
 from ignition.preparation.tuning import benchmark_resource, declare
 
 
+_SCALED_MM_MIN_ROWS = 128
+
+
+@torch.library.custom_op("flare::tensor_fp8_scaled_mm_out", mutates_args=("out",))
+def _scaled_mm_out(source: torch.Tensor, weight: torch.Tensor, unit_scale: torch.Tensor,
+                   output_scale: torch.Tensor, out: torch.Tensor) -> None:
+    torch._scaled_mm(source, weight.t(), scale_a=unit_scale, scale_b=output_scale,
+                     out_dtype=out.dtype, out=out)
+
+
+@_scaled_mm_out.register_fake
+def _fake_scaled_mm_out(source, weight, unit_scale, output_scale, out):
+    pass
+
+
+@weight_container(('packed', 'input_scale'))
 @dataclass(frozen=True)
 class TensorFP8Weight:
     packed: object
     input_scale: torch.Tensor
+
+    @property
+    def in_features(self) -> int:
+        return self.packed.in_features
+
+    @property
+    def out_features(self) -> int:
+        return self.packed.out_features
 
 
 class TensorFP8Projection:
@@ -31,12 +57,28 @@ class TensorFP8Projection:
                        weight.packed.output_scale, weight.input_scale):
             record_numeric_tensor(tensor)
         if staging is None:
-            self.quantized = torch.empty_like(source, dtype=torch.float8_e4m3fn)
+            self.quantized = torch.empty(source.shape, dtype=torch.float8_e4m3fn, device=source.device)
         else:
             if (staging.dtype != torch.uint8 or staging.device != source.device
                     or not staging.is_contiguous() or staging.numel() < source.numel()):
                 raise ValueError("tensor-FP8 staging requires sufficient contiguous device bytes")
             self.quantized = staging.flatten()[:source.numel()].view(torch.float8_e4m3fn).view(source.shape)
+        rows = source.shape[0]
+        self.use_scaled_mm = (
+            rows >= _SCALED_MM_MIN_ROWS
+            and rows % 16 == 0
+            and weight.packed.in_features == weight.packed.padded_in_features
+            and weight.packed.in_features % 16 == 0
+            and weight.packed.out_features % 16 == 0
+            and self.quantized.is_contiguous()
+            and output.is_contiguous()
+        )
+        if self.use_scaled_mm:
+            self.unit_scale = persistent_copy(torch.ones((1,), dtype=torch.float32, device=source.device))
+            record_numeric_tensor(self.unit_scale)
+            self.plan = None
+            return
+        self.unit_scale = None
         self.plan = blockscaled.plan(blockscaled.query_from_call(self.quantized, weight.packed))
         quantized = self.quantized
 
@@ -69,10 +111,18 @@ class TensorFP8Projection:
     def __call__(self, source):
         output, quantized = self.output, self.quantized
         if output is None:
-            shape, stride, dtype = self.output_layout
-            output = torch.empty_strided(shape, stride, dtype=dtype, device=source.device)
-            shape, stride, dtype = self.quantized_layout
-            quantized = torch.empty_strided(shape, stride, dtype=dtype, device=source.device)
+            quantized = (source.float() / self.weight.input_scale).clamp(-448, 448).to(torch.float8_e4m3fn)
+            if self.use_scaled_mm:
+                shape, stride, dtype = self.output_layout
+                output = torch.empty_strided(shape, stride, dtype=dtype, device=source.device)
+                _scaled_mm_out(quantized, self.weight.packed.values, self.unit_scale,
+                               self.weight.packed.output_scale, output)
+                return output
+            return blockscaled.mm(quantized, self.weight.packed, plan=self.plan)
         quantized.copy_((source.float() / self.weight.input_scale).clamp(-448, 448))
-        output.copy_(blockscaled.mm(quantized, self.weight.packed, plan=self.plan))
+        if self.use_scaled_mm:
+            _scaled_mm_out(quantized, self.weight.packed.values, self.unit_scale,
+                           self.weight.packed.output_scale, output)
+        else:
+            output.copy_(blockscaled.mm(quantized, self.weight.packed, plan=self.plan))
         return output

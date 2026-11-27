@@ -75,6 +75,15 @@ class PreparedCandidateSelector:
         unary, ids = logits.topk(self.top_k, dim=-1, sorted=False)
         return self._functional_correct(logits, predecessor, position, selector_features[:, position], unary, ids)
 
+    def score_shortlist(self, predecessor, position, selector_features, unary, ids):
+        coded = self.weights["predecessor"][predecessor] * selector_features[:, position]
+        row_ids = ids[:, position]
+        vocab = self.weights["successor"].shape[0]
+        valid = (row_ids >= 0) & (row_ids < vocab)
+        successors = self.weights["successor"][row_ids.clamp(0, vocab - 1)]
+        correction = torch.bmm(successors, coded.unsqueeze(-1)).squeeze(-1)
+        return torch.where(valid, unary[:, position] + correction.float(), -torch.inf)
+
     def _functional_correct(self, logits, predecessor, position, selector_features, unary, ids):
         coded = self.weights["predecessor"][predecessor] * selector_features
         successors = self.weights["successor"][ids]

@@ -5,6 +5,7 @@
 """Unit tests for the Gemma 4 recipe, configuration, pool layout, and numerical kernels."""
 
 import json
+from dataclasses import replace
 from pathlib import Path
 import struct
 
@@ -469,7 +470,8 @@ def test_gemma4_recipe_adapter_configures_bootstrap(monkeypatch, tmp_path):
     monkeypatch.setattr("hyperflare_recipes.recipes.gemma4.bootstrap.prepare", fake_prepare)
     model = resolve("gemma-4-26b-a4b-nvfp4")
     gpu = planning.Gpu(0, "NVIDIA RTX PRO 6000 Blackwell", "GPU-0", 96 << 30, 95 << 30, (12, 0))
-    plan = planning.fit(model.recipe, model.checkpoint, (gpu,), concurrency=4, reserve_bytes=0, speculation=None)
+    params = replace(model.recipe.parameters, max_concurrency=4, speculation=None)
+    plan = planning.fit(model.recipe, model.checkpoint, (gpu,), parameters=params, reserve_bytes=0)
     assert model.recipe.prepare(
         tmp_path,
         plan,
@@ -735,7 +737,8 @@ def test_gemma4_multi_rank_and_speculative_adapter(monkeypatch, tmp_path):
     gpus = tuple(
         planning.Gpu(i, "NVIDIA GB10", f"GPU-{i}", 128 << 30, 120 << 30, (12, 1)) for i in range(4)
     )
-    plan = planning.fit(model.recipe, model.checkpoint, gpus, concurrency=4, reserve_bytes=0, speculation=model.recipe.speculation)
+    params = replace(model.recipe.parameters, max_concurrency=4)
+    plan = planning.fit(model.recipe, model.checkpoint, gpus, parameters=params, reserve_bytes=0)
     rendezvous = SimpleNamespace(hosts=("host0", "host1", "host2", "host3"))
     assert (
         model.recipe.prepare(

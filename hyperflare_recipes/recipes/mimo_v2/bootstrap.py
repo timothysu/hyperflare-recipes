@@ -7,7 +7,7 @@
 import contextlib
 import hashlib
 import json
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 import torch
@@ -55,7 +55,7 @@ from ignition.preparation.tuning import RecordedPreparationSession, with_autotun
 from ignition.preparation.tuning_replicas import TuningReplica
 from ignition.progress import phase
 
-from .recipe import RECIPE
+from .recipe import MiMoV2Parameters, RECIPE
 from .decoder import PreparedDecoder, Scratch
 from .dflash import SpeculativePreparation
 from .model import DecoderEnvironment
@@ -68,21 +68,29 @@ from .weights import ModelWeights
 from ignition.preparation.bootstrap import BasePreparationConfig
 
 
+def _default_parameters() -> MiMoV2Parameters:
+    return RECIPE.parameters
+
+
 @dataclass(frozen=True)
 class PreparationConfig(BasePreparationConfig):
-    prompt_logprobs: bool = False
-    image_concurrency: int | None = None
+    parameters: MiMoV2Parameters = field(default_factory=_default_parameters)
     devices: tuple[int, ...] = tuple(range(8))
     # Each rank's host when ranks run on separate hosts; devices are then host-local ordinals.
     hosts: tuple[str, ...] | None = None
-    roce_ring: bool = False
-    roce_chain: bool = False
     context: int = 1048576
-    dflash: bool = True
-    speculative_widths: tuple[int, ...] = tuple(range(1, 9))
-    speculative_graph_budget: int = 64
+
+    @property
+    def native_dense_activations(self) -> bool:
+        return self.parameters.native_dense_activations.enabled
+
+    @property
+    def dflash(self) -> bool:
+        return self.parameters.speculation is not None
 
     def __post_init__(self):
+        if not isinstance(self.parameters, MiMoV2Parameters):
+            raise TypeError("MiMo V2 PreparationConfig requires MiMoV2Parameters")
         if self.mtp_only and (not self.dflash
                 or max(self.speculative_widths, default=1) <= 1 or self.speculative_fixed_width == 1):
             raise ValueError("--mtp-only requires enabled learned speculation with positive draft depth")
@@ -90,7 +98,7 @@ class PreparationConfig(BasePreparationConfig):
             raise ValueError("MiMo V2 draft model supports at most seven draft tokens")
         from ignition.components.capacity import image_capacity
 
-        object.__setattr__(self, "image_concurrency", image_capacity(self.max_active, self.image_concurrency))
+        image_capacity(self.max_active, self.image_concurrency)
         from ignition.planning import host_shape_error
 
         error = host_shape_error(self.roce_ring, self.roce_chain, None if self.hosts is None else len(self.hosts))
@@ -138,7 +146,7 @@ class PreparationConfig(BasePreparationConfig):
         from ignition.components.capacity import parallel_speculative_shapes
 
         return parallel_speculative_shapes(self.max_active, self.speculative_widths,
-            self.speculative_token_capacity, self.speculative_graph_budget,
+            self.speculative_token_capacity, self.speculative_graph_budget or 64,
             fixed_width=self.speculative_fixed_width) if self.dflash else ()
 
     @property
@@ -230,7 +238,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
             prefill_collective = vocabulary_collective = vision_collective = collective
             context_collective = collective if config.dflash else None
         else:
-            collective = create_all_reduce_runtime(group, device, collective_tuning=config.collective_tuning, max_tokens=tokens, hidden_size=hidden, ipc=ipc)
+            collective = create_all_reduce_runtime(group, device, max_tokens=tokens, hidden_size=hidden, ipc=ipc)
             prefill_collective = create_dma_all_reduce_runtime(
                 group, device, max_tokens=config.prefill_chunk_size, hidden_size=hidden, ipc=ipc
             )
@@ -254,7 +262,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
             ).encode()
         ).hexdigest()
         session = RecordedPreparationSession(
-            compile_workers=config.compile_workers, collective_tuning=config.collective_tuning, collective_ladder=config.collective_ladder, autotune_effort=config.autotune_effort, tuning_replica=config.tuning_replica,
+            compile_workers=config.compile_workers, autotune_effort=config.autotune_effort, tuning_replica=config.tuning_replica,
             native_dense_activations=config.native_dense_activations, lock_gpu_clocks=config.lock_gpu_clocks,
             device=device,
             checkpoint=identity,

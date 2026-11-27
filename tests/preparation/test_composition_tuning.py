@@ -130,8 +130,7 @@ def test_trial_session_inherits_the_model_sessions_identity_and_limits(monkeypat
     session = SimpleNamespace(namespace=SimpleNamespace(to_dict=lambda: dict(namespace)),
         requested_compile_workers=3, autotune_effort="audit", headroom_bytes=7, lock_gpu_clocks=True)
     coordinator = object()
-    assert composition_tuning.trial_session(session, device="cuda:1", coordinator=coordinator,
-                                            collective_tuning="static") == "trial"
+    assert composition_tuning.trial_session(session, device="cuda:1", coordinator=coordinator) == "trial"
     assert created == [dict(device="cuda:1", checkpoint="model", workload_schema="schema",
         numerical_policy="exact", namespace={"mode": "decode"}, coordinator=coordinator, compile_workers=3,
-        autotune_effort="audit", headroom_bytes=7, lock_gpu_clocks=True, collective_tuning="static")]
+        autotune_effort="audit", headroom_bytes=7, lock_gpu_clocks=True)]

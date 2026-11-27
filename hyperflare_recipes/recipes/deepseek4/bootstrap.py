@@ -7,7 +7,7 @@
 import contextlib
 import hashlib
 import json
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from functools import partial
 
@@ -53,7 +53,7 @@ from ignition.preparation.tuning import RecordedPreparationSession, with_autotun
 from ignition.preparation.tuning_replicas import TuningReplica
 from ignition.progress import phase
 
-from .recipe import RECIPE
+from .recipe import DeepSeek4Parameters, RECIPE
 from .decoder import PreparedDecoder, Scratch
 from .dspark import FORWARDS
 from .pool import PAGE_TOKENS, ContinuationPool, continuation_layout, page_bytes
@@ -65,38 +65,59 @@ from ignition.preparation.bootstrap import BasePreparationConfig
 PATCH_CAPACITIES = (576, 1152, 2304, 3456)
 
 
+def _default_parameters() -> DeepSeek4Parameters:
+    return RECIPE.parameters
+
+
 @dataclass(frozen=True)
 class PreparationConfig(BasePreparationConfig):
-    prompt_logprobs: bool = False
-    image_concurrency: int | None = None
+    parameters: DeepSeek4Parameters = field(default_factory=_default_parameters)
     devices: tuple[int, ...] = (0, 1, 2, 3)
     # Device ordinals are host-local when each rank runs on its own Spark.
     hosts: tuple[str, ...] | None = None
-    roce_ring: bool = False
-    roce_chain: bool = False
     context: int = 1048576
-    dspark: bool = True
-    draft_head_quantization: str | None = None
-    markov_head_quantization: str | None = None
-    speculative_graph_budget: int = 64
-    # Run single-row decode's shared expert on an auxiliary stream; without overlap it runs serially.
-    stream_overlap: bool = True
+
+    @property
+    def native_dense_activations(self) -> bool:
+        return self.parameters.native_dense_activations.enabled
+
+    @property
+    def dspark(self) -> bool:
+        return self.parameters.speculation is not None
+
+    @property
+    def draft_head_quantization(self) -> str | None:
+        return self.parameters.draft_quantization.draft_head_quantization
+
+    @property
+    def markov_head_quantization(self) -> str | None:
+        return self.parameters.draft_quantization.markov_head_quantization
+
+    @property
+    def stream_overlap(self) -> bool:
+        return self.parameters.stream_overlap.enabled
 
     def __post_init__(self):
+        if not isinstance(self.parameters, DeepSeek4Parameters):
+            raise TypeError("DeepSeek V4 PreparationConfig requires DeepSeek4Parameters")
         if self.mtp_only and (not self.dspark
                 or max(self.speculative_widths, default=1) <= 1 or self.speculative_fixed_width == 1):
             raise ValueError("--mtp-only requires enabled learned speculation with positive draft depth")
+        if (self.draft_head_quantization is not None or self.markov_head_quantization is not None) and (
+                not self.dspark or self.draft_tokens < 1):
+            raise ValueError("draft precision overrides require positive learned draft depth")
         if self.speculative_widths and max(self.speculative_widths) > 8:
             raise ValueError("DeepSeek V4 draft model supports at most seven draft tokens")
         from ignition.components.capacity import image_capacity
-        from ignition.declaration import Speculation
 
-        Speculation(self.draft_tokens, draft_head_quantization=self.draft_head_quantization,
-                    markov_head_quantization=self.markov_head_quantization)
         if self.draft_head_quantization not in (None, "nvfp4"):
             raise ValueError("DeepSeek V4 draft head quantization must be omitted or nvfp4")
+        if self.markov_head_quantization not in (None, "nvfp4", "fp8"):
+            raise ValueError("DeepSeek V4 Markov head quantization must be omitted, nvfp4, or fp8")
+        if (self.draft_head_quantization is not None or self.markov_head_quantization is not None) and self.draft_tokens < 1:
+            raise ValueError("draft head quantization requires positive learned draft depth")
 
-        object.__setattr__(self, "image_concurrency", image_capacity(self.max_active, self.image_concurrency))
+        image_capacity(self.max_active, self.image_concurrency)
         if type(self.stream_overlap) is not bool:
             raise TypeError("stream_overlap must be a boolean")
         placements = tuple(zip(self.hosts or ("",) * len(self.devices), self.devices))
@@ -142,7 +163,7 @@ class PreparationConfig(BasePreparationConfig):
         from ignition.components.capacity import parallel_speculative_shapes
 
         return parallel_speculative_shapes(self.max_active, self.speculative_widths,
-            self.speculative_token_capacity, self.speculative_graph_budget,
+            self.speculative_token_capacity, self.speculative_graph_budget or 64,
             fixed_width=self.speculative_fixed_width) if self.dspark else ()
 
     @property
@@ -196,7 +217,7 @@ def _collective_runtimes(config, group, device, *, coordinator, core_storage):
             ring_open=config.roce_chain, core_storage=core_storage)
         return runtime, runtime, runtime, runtime if config.dspark else None
     ipc = core_storage.peer_storage
-    collective = create_all_reduce_runtime(group, device, collective_tuning=config.collective_tuning,
+    collective = create_all_reduce_runtime(group, device,
                                            max_tokens=tokens, hidden_size=4096, ipc=ipc)
     prefill = create_dma_all_reduce_runtime(group, device, max_tokens=config.prefill_chunk_size,
                                             hidden_size=4096, ipc=ipc)
@@ -273,7 +294,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
             ).encode()
         ).hexdigest()
         session = RecordedPreparationSession(
-            compile_workers=config.compile_workers, collective_tuning=config.collective_tuning, collective_ladder=config.collective_ladder, autotune_effort=config.autotune_effort, tuning_replica=config.tuning_replica,
+            compile_workers=config.compile_workers, autotune_effort=config.autotune_effort, tuning_replica=config.tuning_replica,
             native_dense_activations=config.native_dense_activations, lock_gpu_clocks=config.lock_gpu_clocks,
             device=device,
             checkpoint=identity,

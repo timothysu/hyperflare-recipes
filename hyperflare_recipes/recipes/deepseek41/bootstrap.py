@@ -7,7 +7,7 @@
 import contextlib
 import hashlib
 import json
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from functools import partial
 from pathlib import Path
 
@@ -25,11 +25,18 @@ from ignition.components.capacity import (
 from hyperflare_recipes.components.parallel import TensorParallelShard
 from ignition.components.sampling import AdmissionBuffers, DeviceRequestState
 from ignition.components.state_transfer import StateCommands
+from ignition.parameters import (
+    ParameterContext,
+    PromptLogprobsParameters,
+    SpeculationParameters,
+    VisionParameters,
+)
 from ignition.preparation.capture import capture_forwards
 from ignition.preparation.rebuild_manifest import declare_weights
 from .contract import prepare as prepare_contract, PATCH_CAPACITIES, INPUT_VOCABULARY
 from hyperflare_recipes.components.deepseek_vision import (PreparedVision, VisionInputs, VisionScratch,
     PrefillVisionInputs, PreparedVisionGeneration, VisionState)
+from hyperflare_recipes.parameters import ExpertScaleCompressionParameters
 from ignition.preparation.checkpoint import inspect_indexed_checkpoint
 from ignition.preparation.collectives import (CollectivePreparation, create_all_gather_runtime,
     create_all_reduce_runtime, create_dma_all_reduce_runtime, create_result_broadcast_runtime, create_roce_runtime)
@@ -44,7 +51,7 @@ from ignition.preparation.tuning_replicas import TuningReplica
 from ignition.progress import phase
 
 from hyperflare_recipes.components.paged_batch import BatchInputs, Metadata, PreparedBatch
-from .recipe import RECIPE
+from .recipe import DeepSeek41Parameters, RECIPE
 from .attention import INDEXER_QUERY_ROWS
 from .decoder import PreparedDecoder, Scratch, DraftScratch
 from hyperflare_recipes.components.dspark import PreparedContext, PreparedMarkov
@@ -61,6 +68,26 @@ from ignition.preparation.bootstrap import BasePreparationConfig
 _CONTEXT = partial(PreparedContext, compact_prefill=True)
 
 
+def _default_parameters() -> DeepSeek41Parameters:
+    return DeepSeek41Parameters(
+        max_concurrency=32,
+        max_concurrency_limit=64,
+        prefill_chunk=4096,
+        mla_compute_mode="auto",
+        expert_scale_compression=ExpertScaleCompressionParameters(encoding=None),
+        speculation=SpeculationParameters(
+            draft_tokens=5,
+            max_draft_tokens=7,
+            token_capacity=128,
+            packed_verification=True,
+            draft_prefix_selection="gpu",
+            graph_budget=64,
+        ),
+        vision=VisionParameters(),
+        prompt_logprobs=PromptLogprobsParameters(),
+    )
+
+
 def _prepare_draft(*args, draft_vocabulary_runtime, vocabulary_runtime=None, **kwargs):
     # Fixed-width PCIe channels distinguish FP32 target words from BF16 proposals.
     runtime = vocabulary_runtime if draft_vocabulary_runtime is None else draft_vocabulary_runtime
@@ -68,84 +95,95 @@ def _prepare_draft(*args, draft_vocabulary_runtime, vocabulary_runtime=None, **k
 
 
 def _forward_factories(mla_compute_mode, *, vision,
-                       draft_vocabulary_runtime=None, examples=None):
+                       draft_vocabulary_runtime=None, kv_runtime=None, examples=None,
+                       row_shard_prefill=False, row_shard_attention=False):
     """Bind attention arithmetic and the proposal head's BF16 gather channel."""
-    return (partial(PreparedDecoder, vision=vision, mla_compute_mode=mla_compute_mode, examples=examples),
+    return (partial(PreparedDecoder, vision=vision, mla_compute_mode=mla_compute_mode,
+                    kv_runtime=kv_runtime, examples=examples, row_shard_prefill=row_shard_prefill,
+                    row_shard_attention=row_shard_attention),
             partial(_prepare_draft, draft_vocabulary_runtime=draft_vocabulary_runtime,
                     mla_compute_mode=mla_compute_mode, examples=examples))
 
 
-def _can_race_contextual_plans(config, signatures, device):
-    if not config.joint_tuning:
-        return False
-    if config.autotune_effort == "off":
-        raise ValueError("--joint-tuning requires --autotune-effort default or audit")
-    from b12x.quantization import mla_norm_mxfp8
-
-    if not mla_norm_mxfp8.is_supported(device):
-        raise ValueError("--joint-tuning requires fused MXFP8 query normalization on the selected device")
-    if not any(signature.kind in ("prefill", "terminal_prefill", "scored_prefill", "decode", "speculative")
-               for signature in signatures.values()):
-        raise ValueError("--joint-tuning requires prepared text graphs")
-    return True
-
-
 @dataclass(frozen=True)
 class PreparationConfig(BasePreparationConfig):
-    prompt_logprobs: bool = False
-    image_concurrency: int | None = None
-    joint_tuning: bool = False
+    parameters: DeepSeek41Parameters = field(default_factory=_default_parameters)
     devices: tuple[int, ...] = (0, 1, 2, 3)
     # Device ordinals are host-local when each rank runs on its own Spark.
     hosts: tuple[str, ...] | None = None
-    roce_ring: bool = False
-    roce_chain: bool = False
     context: int = 1048576
-    max_active: int = 32
     minimum_pages: int = 8
     # An explicit cache capacity makes memory comparisons independent of automatic sizing.
     kv_pages: int | None = None
-    dspark: bool = True
-    draft_head_quantization: str | None = None
-    markov_head_quantization: str | None = None
-    vocabulary_parallel_sampling: bool = False
-    speculative_token_capacity: int | None = 128
-    speculative_graph_budget: int = 64
-    # Overlap shared and routed experts within each eligible text graph.
-    stream_overlap: bool = True
-    expert_scale_compression: str | None = None
-    mla_compute_mode: str = "auto"
-    packed_verification: bool | None = None
-    draft_prefix_selection: str | None = None
     speculation_reference_graphs: bool = False
 
+    @property
+    def native_dense_activations(self) -> bool:
+        return self.parameters.native_dense_activations.enabled
+
+    @property
+    def dspark(self) -> bool:
+        return self.parameters.speculation is not None
+
+    @property
+    def draft_head_quantization(self) -> str | None:
+        return self.parameters.draft_quantization.draft_head_quantization
+
+    @property
+    def markov_head_quantization(self) -> str | None:
+        return self.parameters.draft_quantization.markov_head_quantization
+
+    @property
+    def vocabulary_parallel_sampling(self) -> bool:
+        return self.parameters.vocabulary_parallel_sampling
+
+    @property
+    def stream_overlap(self) -> bool:
+        return self.parameters.stream_overlap.enabled
+
+    @property
+    def expert_scale_compression(self) -> str | None:
+        return self.parameters.expert_scale_compression.encoding
+
+    @property
+    def mla_compute_mode(self) -> str:
+        return self.parameters.mla_compute_mode
+
+    @property
+    def row_shard_prefill(self) -> bool:
+        return self.parameters.row_shard_prefill
+
+    @property
+    def row_shard_attention(self) -> bool:
+        return self.parameters.row_shard_attention
+
+    @property
+    def packed_verification(self) -> bool:
+        return bool(self.parameters.speculation and self.parameters.speculation.packed_verification)
+
+    @property
+    def draft_prefix_selection(self) -> str:
+        if self.parameters.speculation is None:
+            return "cpu"
+        return self.parameters.speculation.draft_prefix_selection
+
     def __post_init__(self):
+        if not isinstance(self.parameters, DeepSeek41Parameters):
+            raise TypeError("DeepSeek V4.1 PreparationConfig requires DeepSeek41Parameters")
         if self.mtp_only and (not self.dspark
                 or max(self.speculative_widths, default=1) <= 1 or self.speculative_fixed_width == 1):
             raise ValueError("--mtp-only requires enabled learned speculation with positive draft depth")
+        if (self.draft_head_quantization is not None or self.markov_head_quantization is not None) and (
+                not self.dspark or self.draft_tokens < 1):
+            raise ValueError("draft precision overrides require positive learned draft depth")
         if self.speculative_widths and max(self.speculative_widths) > 8:
             raise ValueError("DeepSeek V4.1 draft model supports at most seven draft tokens")
-        from ignition.components.capacity import image_capacity
         from hyperflare_recipes.components.compressed_mla import validate_mla_compute_mode
 
         validate_mla_compute_mode(self.mla_compute_mode)
-        from ignition.declaration import Speculation
-        Speculation(self.draft_tokens, draft_head_quantization=self.draft_head_quantization,
-                    markov_head_quantization=self.markov_head_quantization,
-                    vocabulary_parallel_sampling=self.vocabulary_parallel_sampling)
         self.speculative_shapes
         self.packed_speculative_shapes
         drafting = self.dspark and self.draft_tokens > 0
-        for name in ("packed_verification",):
-            value = getattr(self, name)
-            if value is None:
-                object.__setattr__(self, name, drafting)
-            elif type(value) is not bool:
-                raise TypeError(f"{name} must be a boolean")
-        if self.draft_prefix_selection is None:
-            object.__setattr__(self, "draft_prefix_selection", "gpu" if drafting else "cpu")
-        if self.draft_prefix_selection not in ("cpu", "gpu"):
-            raise ValueError("draft prefix selection must be cpu or gpu")
         if drafting:
             if not self.packed_verification or self.draft_prefix_selection != "gpu":
                 raise ValueError("DeepSeek V4.1 DSpark requires packed GPU draft prefix selection")
@@ -153,11 +191,12 @@ class PreparationConfig(BasePreparationConfig):
                 raise ValueError("DeepSeek V4.1 DSpark requires adaptive packed GPU rounds")
         elif self.packed_verification or self.draft_prefix_selection != "cpu" or self.speculation_reference_graphs:
             raise ValueError("packed GPU speculation requires positive DSpark draft depth")
-        object.__setattr__(self, "image_concurrency", image_capacity(self.max_active, self.image_concurrency))
         if self.expert_scale_compression not in (None, "csf"):
             raise ValueError("DeepSeek V4.1 expert scale compression must be None or 'csf'")
         if type(self.stream_overlap) is not bool:
             raise TypeError("stream_overlap must be a boolean")
+        if self.row_shard_attention and not self.row_shard_prefill:
+            raise ValueError("row_shard_attention requires row_shard_prefill")
         placements = tuple(zip(self.hosts or ("",) * len(self.devices), self.devices))
         if (not isinstance(self.devices, tuple) or len(self.devices) not in (3, 4, 6)
                 or len(set(placements)) != len(self.devices)
@@ -174,7 +213,6 @@ class PreparationConfig(BasePreparationConfig):
         if not 64 <= self.prefill_chunk_size <= self.context or self.prefill_chunk_size % 64:
             raise ValueError("prefill chunk size must be 64-aligned in [64,context]")
         request_capacity(self.max_active)
-        self.speculative_shapes
         if self.speculative_fixed_width is not None and self.speculative_fixed_width not in self.speculative_widths:
             raise ValueError("fixed verification width must belong to the prepared widths")
         if self.minimum_pages <= 0 or self.snapshot_budget_bytes <= 0 or self.headroom_bytes < 0:
@@ -301,7 +339,7 @@ def _collective_runtimes(config, group, device, *, coordinator, core_storage, ve
             hidden_size=5120, gather_bytes=gather_bytes, ring=config.roce_ring, ring_open=config.roce_chain, core_storage=core_storage)
         return runtime, runtime, runtime, runtime if layouts else None, runtime if config.dspark else None
     ipc = core_storage.peer_storage
-    collective = create_all_reduce_runtime(group, device, collective_tuning=config.collective_tuning, max_tokens=config.all_reduce_tokens, hidden_size=5120, ipc=ipc)
+    collective = create_all_reduce_runtime(group, device, max_tokens=config.all_reduce_tokens, hidden_size=5120, ipc=ipc)
     dma_tokens = ((config.prefill_chunk_size * 6 + 4) // 5 + 63) // 64 * 64
     prefill = create_dma_all_reduce_runtime(group, device,
         max_tokens=dma_tokens, hidden_size=5120, ipc=ipc)
@@ -312,6 +350,28 @@ def _collective_runtimes(config, group, device, *, coordinator, core_storage, ve
         columns=local_vocab * len(config.devices), ipc=ipc) if config.dspark else None)
     result = create_result_broadcast_runtime(group, device, layouts=layouts, ipc=ipc) if layouts else None
     return collective, prefill, vocabulary, result, draft_vocabulary
+
+
+def _kv_gather_runtime(config, group, device, *, coordinator, core_storage):
+    """Allocate a peer-to-peer KV gather channel for single-host row-sharded attention."""
+    if (coordinator.spans_hosts
+            or not config.row_shard_attention
+            or len(config.devices) < 2
+            or config.prefill_chunk_size < 1024):
+        return None
+    from b12x.comm.pcie.pcie_dcp_a2a import (
+        DCP_A2A_REQUIRED_SMS, SUPPORTED_WORLD_SIZES as _DCP_WORLD_SIZES,
+    )
+
+    world = len(config.devices)
+    max_kv_shard_rows = config.prefill_chunk_size // (2 * world)
+    if (world not in _DCP_WORLD_SIZES
+            or max_kv_shard_rows <= 0
+            or torch.cuda.get_device_properties(device).multi_processor_count < DCP_A2A_REQUIRED_SMS):
+        return None
+    return create_all_gather_runtime(
+        group, device, max_rows=max_kv_shard_rows,
+        columns=512 * world, ipc=core_storage.peer_storage)
 
 
 @torch.no_grad()
@@ -339,7 +399,8 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
                                     draft_head_quantization=config.draft_head_quantization,
                                     markov_head_quantization=config.markov_head_quantization,
                                     vocabulary_parallel_sampling=config.vocabulary_parallel_sampling,
-                                    engram_full_projection=load_engram_full)
+                                    engram_full_projection=load_engram_full,
+                                    row_shard_attention=config.row_shard_attention)
         release_unused()
     if progress is not None:
         progress("Target head: BF16 checkpoint weights with FP32 accumulation and logits")
@@ -378,6 +439,8 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
         collective, prefill_collective, vocabulary_collective, result_collective, draft_vocabulary_collective = _collective_runtimes(
             config, group, device, coordinator=coordinator, core_storage=core_storage,
             verification_samples=verification_samples)
+        kv_collective = _kv_gather_runtime(
+            config, group, device, coordinator=coordinator, core_storage=core_storage)
         sampling_collective = logprob_collective = None
         if config.vocabulary_parallel_sampling and shard.world_size > 1:
             sampling_collective = (collective if coordinator.spans_hosts else create_all_gather_runtime(
@@ -391,7 +454,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
             "headers": [s.header_sha256 for s in manifest.shards], "world_size": shard.world_size,
             "contract": "deepseek41.graph-inputs.v1"}, sort_keys=True).encode()).hexdigest()
         session = RecordedPreparationSession(
-            compile_workers=config.compile_workers, collective_tuning=config.collective_tuning, collective_ladder=config.collective_ladder, autotune_effort=config.autotune_effort, tuning_replica=config.tuning_replica,
+            compile_workers=config.compile_workers, autotune_effort=config.autotune_effort, tuning_replica=config.tuning_replica,
             native_dense_activations=config.native_dense_activations, lock_gpu_clocks=config.lock_gpu_clocks,
             device=device, checkpoint=identity,
             workload_schema="deepseek41-text", numerical_policy="default", coordinator=coordinator,
@@ -411,7 +474,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
             candidate_tokens=config.prefill_chunk_size)
             if config.prompt_logprobs else None)
         decoder_storage = Scratch.allocate(config.decode_tokens, verification_samples, shard.world_size, device)
-        vision_state = vision_inputs = vision_prefill = vision_storage = feature_pool = None
+        vision_state = vision_inputs = vision_prefill = vision_max = vision_storage = feature_pool = None
         if weights.vision is not None:
             vision_inputs = VisionInputs.allocate(device, patches=max(PATCH_CAPACITIES))
             vision_prefill = PrefillVisionInputs.allocate(config.prefill_chunk_size, device)
@@ -425,7 +488,10 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
             vision_storage = {}
         decoder_factory, draft_factory = _forward_factories(config.mla_compute_mode,
             vision=vision_state,
-            draft_vocabulary_runtime=draft_vocabulary_collective, examples=examples)
+            draft_vocabulary_runtime=draft_vocabulary_collective,
+            kv_runtime=kv_collective, examples=examples,
+            row_shard_prefill=config.row_shard_prefill,
+            row_shard_attention=config.row_shard_attention)
         buffers = dict(inputs.buffers(), **tables.buffers(), **commands.buffers(), **{
             name: getattr(admission, name) for name in admission.__dataclass_fields__},
             state_pool=pool.backing, memory_capacity=pool.memory_capacity,
@@ -522,9 +588,10 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
             forward_inputs=forward_inputs,
             host_allocate=core_storage.host_allocate, device=device)
         if vision_state is not None:
+            vision_max = VisionScratch.allocate(max(PATCH_CAPACITIES), device, hidden=5120)
             for capacity in reversed(PATCH_CAPACITIES):
                 name = f"vision{capacity}"
-                vision_storage[capacity] = VisionScratch.allocate(capacity, device, hidden=5120)
+                vision_storage[capacity] = vision_max.rows(capacity)
                 encoder = PreparedVision(weights.vision, vision_storage[capacity], vision_inputs,
                     session=session, workspace=arena, name=name)
                 add(name, PreparedVisionGeneration(encoder, vision_state, completion, frame, sequence),
@@ -549,6 +616,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
                     add(name, forward, mode, capacity, 1, (*fields, "page_tables", *commands.buffers()), enabled=enabled)
     transient.close()
     release_unused()
+    torch.cuda.empty_cache()
     if progress is not None:
         progress(f"before tuning: {torch.cuda.memory_allocated(device) >> 20} MiB allocated, "
                  f"{torch.cuda.memory_reserved(device) >> 20} MiB reserved, "
@@ -562,33 +630,16 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
     if feature_pool is not None:
         feature_pool.release_backing()
     try:
-        contextual = None
-        if _can_race_contextual_plans(config, signatures, device):
-            from .contextual_selection import CatalogContextualSelection
-
-            contextual = CatalogContextualSelection(forwards, signatures,
-                coordinator=coordinator, collective=collective, device=device,
-                graph_pool=core_storage.graph_pool.id, cache_root=config.kernel_cache,
-                compile_decoder=config.compile_decoder, warmup_storage=core_storage,
-                progress=progress)
         with phase(progress, "Prepare and tune kernels") as stage, core_storage.transient():
             tuning = session.tune(show_progress=progress is not None and rank == 0,
-                                  console=stage.console, contextual=contextual)
-        if contextual is not None and progress is not None:
-            from .contextual_selection import contextual_summary
-
-            summary = contextual_summary(tuning["contextual_tuning"])
-            if hasattr(progress, "console"):
-                progress.console.print(summary, markup=False)
-            else:
-                progress(summary)
+                                  console=stage.console)
         stream, graph_pool = torch.cuda.Stream(device=device), core_storage.graph_pool.id
         if speculation is not None:
             speculation.release_examples()
         metadata.clear()
         scratch.clear()
         examples.clear()
-        vision_storage = None
+        vision_max = vision_storage = None
         prefill_storage = decoder_storage = scored_storage = storage = decoder = batch = None
         arena.release_preparation()
         release_unused()
@@ -625,6 +676,8 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
         "weights_bytes": weights.allocated_bytes, "mapped_host_bytes": 0,
         "expert_scale_compression": config.expert_scale_compression,
         "mla_compute_mode": config.mla_compute_mode,
+        "row_shard_prefill": config.row_shard_prefill,
+        "row_shard_attention": config.row_shard_attention,
         "draft_head_quantization": config.draft_head_quantization,
         "markov_head_quantization": config.markov_head_quantization,
         "vocabulary_parallel_sampling": config.vocabulary_parallel_sampling,
@@ -661,7 +714,10 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
             forward = forward.forward
         if hasattr(forward, "completion") and hasattr(forward.completion, "scratch_tensors"):
             disposable.append(forward.completion.scratch_tensors)
-    model = PreparedModel(rebuild_weights=declare_weights(weights, components=('embedding', 'norm', 'head', 'vision', 'draft')), device=config.devices[rank], graphs=graphs, buffers=buffers, signatures=signatures,
+    weight_components = ("embedding", "norm", "head", "vision", "draft")
+    if weights.replicated_attention is not None:
+        weight_components += ("replicated_attention",)
+    model = PreparedModel(rebuild_weights=declare_weights(weights, components=weight_components), device=config.devices[rank], graphs=graphs, buffers=buffers, signatures=signatures,
         max_active=config.max_active, session=session, server_config=server_config, memory_report=memory,
         export_zero_ranges=(*(() if scoring is None else scoring.zero_ranges()),
                            *storage_ranges(disposable), *completion.zero_ranges()),
@@ -670,10 +726,10 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
         core_data=tables if rank == 0 else None,
         resources=(scoring, weights, tables, pool, requests, inputs, admission, commands, forwards,
             compiled, stream, graph_pool, session,
-            collective, prefill_collective, vocabulary_collective, draft_vocabulary_collective, result_collective, sampling_collective, logprob_collective, coordinator, speculation, confidence,
+            collective, prefill_collective, vocabulary_collective, draft_vocabulary_collective, result_collective, sampling_collective, logprob_collective, kv_collective, coordinator, speculation, confidence,
             vision_state, vision_inputs, vision_prefill, feature_pool),
         close_resources=tuple(dict.fromkeys(c for c in
-            (scoring, sampling_collective, logprob_collective, result_collective, prefill_collective, vocabulary_collective, draft_vocabulary_collective, collective) if c is not None)))
+            (scoring, sampling_collective, logprob_collective, result_collective, prefill_collective, kv_collective, vocabulary_collective, draft_vocabulary_collective, collective) if c is not None)))
     if confidence is not None:
         model.proposal_confidence = confidence.host_view
     return model

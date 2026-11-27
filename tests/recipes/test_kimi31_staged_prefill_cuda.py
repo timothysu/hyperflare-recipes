@@ -43,7 +43,7 @@ def _rank(rank, rendezvous, rows, maximum, compiled):
             output = torch.empty((maximum, WIDTH), dtype=cache.dtype, device=device)
             signals = tuple(torch.zeros((1, 8), dtype=torch.bfloat16, device=device) for _ in range(4))
             runtime = create_all_reduce_runtime(dist.group.WORLD, device,
-                collective_tuning="static", max_tokens=1, hidden_size=8, ipc=storage.peer_storage)
+                max_tokens=1, hidden_size=8, ipc=storage.peer_storage)
             with RecordedPreparationSession(device=device, checkpoint="kimi31-staged-prefill-transport",
                     workload_schema="direct-and-staged-selected-records", numerical_policy="exact-bytes-bf16-query",
                     autotune_effort="off", coordinator=coordinator) as session:

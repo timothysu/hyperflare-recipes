@@ -48,6 +48,81 @@ class DSparkConfig:
         return result
 
 
+TEXT_GEOMETRY = {
+    "hidden_size": 5120, "num_hidden_layers": 40, "num_attention_heads": 64,
+    "num_key_value_heads": 1, "head_dim": 512, "qk_rope_head_dim": 64,
+    "q_lora_rank": 1280, "o_lora_rank": 1024, "o_groups": 8,
+    "vocab_size": 129280, "moe_intermediate_size": 2304, "n_routed_experts": 384,
+    "n_shared_experts": 1, "num_experts_per_tok": 6, "scoring_func": "sqrtsoftplus",
+    "index_n_heads": 32, "index_head_dim": 128, "index_topk": 512,
+    "candidate_topk_blocks": 2048, "candidate_block_size": 8, "hc_mult": 4,
+    "sliding_window": 128, "engram_max_ngram_size": 4, "engram_n_heads": 8,
+    "engram_head_dim": 256,
+}
+
+QUALIFIED_ENCODER_SCHEDULE = {
+    "compress_ratios": [0, 0] + [2] * 18 + [1] * 20,
+    "kv_source_layer_ids": [2, 8, 14, 20],
+    "index_source_layer_ids": [2, 8, 14, 20, 24, 28, 32, 36],
+    "candidate_source_layer_id": 20,
+}
+
+
+def full_attention_encoder_layers(config):
+    """Encoder layers without global KV compression or sparse indexing (`pipelined_attn == 'full'`)."""
+    stop = config.decoder_start
+    if stop is None:
+        return ()
+    kv_sources = set(config.text["kv_source_layer_ids"])
+    index_sources = set(config.text["index_source_layer_ids"])
+    return tuple(i for i in range(stop) if i not in kv_sources and i not in index_sources)
+
+
+def row_shard_attention_encoder_layers(config):
+    """Encoder layers prior to `decoder_start` when candidate selection begins at or after the boundary."""
+    stop = config.decoder_start
+    if stop is None or config.text["candidate_source_layer_id"] < stop:
+        return ()
+    return tuple(range(stop))
+
+
+def _mxfp8_packed_bytes(rows: int, cols: int) -> int:
+    if rows <= 0 or cols <= 0 or rows % 128 != 0 or cols % 128 != 0:
+        raise ValueError("replicated MXFP8 attention projections require positive 128-aligned dimensions")
+    values = rows * cols
+    return values + 2 * (values // 32)
+
+
+def replicated_attention_layer_bytes(text=TEXT_GEOMETRY) -> int:
+    """Per-rank device bytes for one layer's replicated MXFP8 projections and FP32 sinks.
+
+    Accounts for FP8 weight values plus both retained MXFP8 scale layouts (`scale_rows` and
+    `scale_mma`, 1 byte per 32 elements each) across `wq_b`, `wo_a`, and `wo_b`, plus the
+    FP32 `attn_sink` vector (44,564,480 + 80,216,064 + 256 = 124,780,800 bytes).
+    """
+    heads_dim = text["num_attention_heads"] * text["head_dim"]
+    groups_rank = text["o_groups"] * text["o_lora_rank"]
+    group_width = heads_dim // text["o_groups"]
+    q_b_bytes = _mxfp8_packed_bytes(heads_dim, text["q_lora_rank"])
+    wo_a_bytes = _mxfp8_packed_bytes(groups_rank, group_width)
+    wo_b_bytes = _mxfp8_packed_bytes(text["hidden_size"], groups_rank)
+    sink_bytes = text["num_attention_heads"] * 4
+    return q_b_bytes + wo_a_bytes + wo_b_bytes + sink_bytes
+
+
+def replicated_attention_bytes(world_size, *, prompt_logprobs=False, mtp_only=False, config=None) -> int:
+    """Per-rank device weight bytes replicated beside decode partitions for row-sharded attention."""
+    del prompt_logprobs, mtp_only
+    if world_size < 2:
+        return 0
+    if config is None:
+        config = ModelConfig({**TEXT_GEOMETRY, **QUALIFIED_ENCODER_SCHEDULE}, {})
+    layers = row_shard_attention_encoder_layers(config)
+    if not layers:
+        return 0
+    return len(layers) * replicated_attention_layer_bytes(config.text)
+
+
 @dataclass(frozen=True)
 class ModelConfig:
     text: dict
@@ -64,17 +139,7 @@ class ModelConfig:
                 or config.get("architectures") != ["DeepseekV41ForCausalLM"]):
             raise ValueError("DeepSeek V4.1 requires DeepseekV41ForCausalLM")
         text, quant = config["text_config"], config["quantization_config"]
-        for name, value in {
-            "hidden_size": 5120, "num_hidden_layers": 40, "num_attention_heads": 64,
-            "num_key_value_heads": 1, "head_dim": 512, "qk_rope_head_dim": 64,
-            "q_lora_rank": 1280, "o_lora_rank": 1024, "o_groups": 8,
-            "vocab_size": 129280, "moe_intermediate_size": 2304, "n_routed_experts": 384,
-            "n_shared_experts": 1, "num_experts_per_tok": 6, "scoring_func": "sqrtsoftplus",
-            "index_n_heads": 32, "index_head_dim": 128, "index_topk": 512,
-            "candidate_topk_blocks": 2048, "candidate_block_size": 8, "hc_mult": 4,
-            "sliding_window": 128, "engram_max_ngram_size": 4, "engram_n_heads": 8,
-            "engram_head_dim": 256,
-        }.items():
+        for name, value in TEXT_GEOMETRY.items():
             if text.get(name) != value:
                 raise ValueError(f"DeepSeek V4.1 Flash {name} requires {value}, got {text.get(name)}")
         if (quant.get("quant_method") != "fp8" or quant.get("weight_block_size") != [32, 32]
@@ -143,3 +208,10 @@ class ModelConfig:
         if self.source(layer) is None:
             return None
         return next((i for i in reversed(self.text["index_source_layer_ids"]) if i <= layer), None)
+
+    def require_planned_attention_schedule(self):
+        """Reject checkpoints whose encoder attention schedule differs from the planned charge."""
+        qualified = ModelConfig({**TEXT_GEOMETRY, **QUALIFIED_ENCODER_SCHEDULE}, {})
+        if (row_shard_attention_encoder_layers(self) != row_shard_attention_encoder_layers(qualified)
+                or full_attention_encoder_layers(self) != full_attention_encoder_layers(qualified)):
+            raise ValueError("row-sharded attention requires the qualified encoder layer schedule")

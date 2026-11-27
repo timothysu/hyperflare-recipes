@@ -10,19 +10,19 @@ from types import SimpleNamespace
 import pytest
 from google.protobuf.json_format import ParseDict
 
-from ignition.cli import _parser, display, preparation
+from ignition.cli import display, parse_args, preparation
 from ignition.components.capacity import batch_capacities, prefill_capacities, serving_modes
 from ignition.errors import UsageError
+from ignition.parameters import MixedPrefillParameters, SpeculationParameters
 from ignition.preparation import rebuild_manifest, runtime_core_pb2 as proto
 from hyperflare_recipes.recipes import ResolvedModel, recipes, resolve
-from ignition.declaration import Speculation
 from tests.cli.test_planning import derive, gpu
 
 
 def selected(*flags, command="export"):
     model = resolve("kimi-k3.1-pro")
-    args = _parser().parse_args([command, model.checkpoint.alias, *flags])
-    return preparation.speculation(args, model)
+    args = parse_args([command, model.checkpoint.alias, *flags], recipes=recipes())
+    return preparation.resolve_parameters(model, args).speculation
 
 
 @pytest.mark.parametrize("command", ["export", "debug-serve", "bench"])
@@ -41,29 +41,28 @@ def test_mtp_only_rejects_disabled_speculation(flags, message):
     with pytest.raises(UsageError, match=message):
         selected("--mtp-only", *flags)
     with pytest.raises(ValueError, match="positive learned draft depth"):
-        Speculation(0, mtp_only=True)
+        SpeculationParameters(0, mtp_only=True)
 
 
 def test_mtp_only_rejects_a_recipe_without_speculation():
     model = resolve("kimi-k3.1-pro")
-    recipe = replace(model.recipe, speculation=None, max_draft_tokens=0, plain_ranks={})
-    args = _parser().parse_args(["export", model.checkpoint.alias, "--mtp-only"])
-    with pytest.raises(UsageError, match="has no multi-token speculation; --mtp-only"):
-        preparation.speculation(args, ResolvedModel(recipe, model.checkpoint))
+    recipe = replace(model.recipe, parameters=replace(model.recipe.parameters, speculation=None), plain_ranks={})
+    with pytest.raises(UsageError, match="is not supported"):
+        parse_args(["export", model.checkpoint.alias, "--mtp-only"], recipes=(recipe,))
 
 
 def test_mtp_only_plan_display_and_rebuild_round_trip(monkeypatch):
     monkeypatch.setattr("ignition.preparation.source_identity.source_identity", lambda: "test-source")
     for mtp_only in (False, True):
-        plan = derive(speculation=Speculation(3, mtp_only=mtp_only))
+        plan = derive(speculation=SpeculationParameters(3, mtp_only=mtp_only))
         assert plan.to_dict()["speculation"]["mtp_only"] is mtp_only
         for brief in (False, True):
             assert ("MTP-only graphs" in display.speculation(plan.speculation, brief=brief)) is mtp_only
         metadata = rebuild_manifest.from_plan(SimpleNamespace(directory=None), plan, compiled_forwards=True)
-        encoded = ParseDict(metadata, proto.RebuildManifest())
-        decoded = proto.RebuildManifest.FromString(encoded.SerializeToString())
-        assert decoded.speculation.mtp_only is mtp_only
-    assert not proto.RebuildSpeculation.FromString(b"\x08\x07").mtp_only
+        encoded = ParseDict(metadata, proto.PreparationManifest())
+        decoded = proto.PreparationManifest.FromString(encoded.SerializeToString())
+        values = {p.key: p.value for p in decoded.parameters}
+        assert values["speculation.mtp_only"].bool_value is mtp_only
 
 
 @pytest.mark.parametrize("enabled,mtp_only,expected", [
@@ -103,31 +102,32 @@ def test_recipe_adapters_preserve_mtp_only_and_validate_direct_configs(monkeypat
     config, = captured
     assert config.mtp_only is mtp_only
     assert config.speculative_widths == plan.speculation.widths
-    assert original.__dataclass_fields__["mtp_only"].default is False
     if not mtp_only:
         return
-    source = (dict(draft_checkpoint=None) if name in ("kimi3", "gemma4", "nemotron_h")
-              else dict(dspark=False) if name in ("deepseek4", "deepseek41", "minimax_m3")
-              else dict(dflash=False) if name in ("mimo_v2", "muse_spark")
-              else dict(dfly=False) if name == "hy4_flash"
-              else dict(drafting=False) if name == "inkling2" else dict(mtp=False))
-    for invalid in (source, dict(speculative_widths=(1,), speculative_fixed_width=None),
-                    dict(speculative_fixed_width=1)):
+    if name in ("kimi3", "gemma4", "nemotron_h"):
         with pytest.raises(ValueError, match="--mtp-only requires enabled learned speculation with positive draft depth"):
-            replace(config, **invalid)
+            replace(config, draft_checkpoint=None)
+    else:
+        with pytest.raises(ValueError, match="positive learned draft depth"):
+            replace(config.parameters.speculation, draft_tokens=0)
 
 
 @pytest.mark.parametrize("concurrency,normal,only", [(1, 42, 27), (4, 104, 79)])
 def test_kimi_catalog_geometry_keeps_width_one_and_vision(concurrency, normal, only):
     from hyperflare_recipes.components.prompt_logprobs import prefill_modes
     from hyperflare_recipes.recipes.kimi3.bootstrap import PreparationConfig
+    from hyperflare_recipes.recipes.kimi3.recipe import RECIPE
     from hyperflare_recipes.recipes.kimi3.vision import PATCH_CAPACITIES
 
     catalogs = []
     for mtp_only, expected in ((False, normal), (True, only)):
-        config = PreparationConfig(draft_checkpoint="fixture", max_active=concurrency,
-            prefill_chunk_size=4096, speculative_widths=tuple(range(1, 9)), speculative_token_capacity=32,
-            speculative_graph_budget=64, mtp_only=mtp_only)
+        params = replace(
+            RECIPE.parameters,
+            max_concurrency=concurrency,
+            prefill_chunk=4096,
+            speculation=replace(RECIPE.speculation, draft_tokens=7, token_capacity=32, graph_budget=64, mtp_only=mtp_only),
+        )
+        config = PreparationConfig(parameters=params, draft_checkpoint="fixture")
         batches = batch_capacities(config.max_active)
         catalog = []
         for enabled in serving_modes(config.drafting, config.mtp_only):
@@ -151,9 +151,14 @@ def test_qwen_mixed_shapes_agree_with_the_plan_for_mtp_only():
     recipe = resolve("qwen3.8-flash").recipe
     for mtp_only in (False, True):
         settings = replace(recipe.speculation, mtp_only=mtp_only)
-        config = PreparationConfig(mtp=True, mtp_only=mtp_only, mixed_prefill=True,
-            speculative_widths=settings.widths, speculative_token_capacity=settings.token_capacity)
-        assert config.mixed_shapes == recipe.mixed_shapes(config.max_active, config.prefill_chunk_size, settings)
+        params = replace(
+            recipe.parameters,
+            max_concurrency=4,
+            speculation=settings,
+            mixed_prefill=MixedPrefillParameters(enabled=True),
+        )
+        config = PreparationConfig(parameters=params)
+        assert config.mixed_shapes == params.mixed_prefill.shapes(config.max_active, config.prefill_chunk_size, settings)
         assert {shape[0] for shape in config.mixed_shapes} == ({True} if mtp_only else {True, False})
 
 
@@ -162,7 +167,14 @@ def test_mtp_only_preserves_selected_benchmark_geometry(name):
     from ignition.preparation.selection import BenchmarkSelection
 
     selection = BenchmarkSelection(batches=(1, 4))
-    config_type = import_module(f"hyperflare_recipes.recipes.{name}.bootstrap").PreparationConfig
-    options = dict(draft_checkpoint="fixture") if name == "kimi3" else dict(mtp=True, draft_snapshot="fixture")
-    config = config_type(benchmark_selection=selection, mtp_only=True, speculative_token_capacity=128, **options)
+    bootstrap = import_module(f"hyperflare_recipes.recipes.{name}.bootstrap")
+    recipe = import_module(f"hyperflare_recipes.recipes.{name}.recipe").RECIPE
+    params = replace(
+        recipe.parameters,
+        speculation=replace(recipe.speculation, mtp_only=True, token_capacity=128),
+    )
+    if name == "qwen38_dense":
+        params = replace(params, vision=replace(params.vision, language_model_only=True))
+    options = dict(draft_checkpoint="fixture") if name == "kimi3" else dict(draft_snapshot="fixture")
+    config = bootstrap.PreparationConfig(parameters=params, benchmark_selection=selection, **options)
     assert config.speculative_round_shapes == selection.speculative_round_shapes

@@ -83,10 +83,12 @@ def _rank(rank, rendezvous):
                 first.functional(session=session)
                 final.functional(session=session)
 
-                def run(first=first, final=final, state=state):
+                def run(first=first, final=final, state=state, out=hidden[:rows]):
                     block, injection = first.mix_runtime(state)
                     residual, normalized = first.combine_norm_runtime(state, block, injection)
-                    final.mix_runtime(residual, normalized)
+                    state.copy_(residual)
+                    final_block, _ = final.mix_runtime(residual, normalized)
+                    out.copy_(final_block)
 
                 calls.append((rows, run))
             session.tune(show_progress=False)

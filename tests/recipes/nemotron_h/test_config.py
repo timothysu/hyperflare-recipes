@@ -103,13 +103,21 @@ def test_host_ragged_rounds_separate_target_rows_from_sample_rows():
     from hyperflare_recipes.recipes.nemotron_h.bootstrap import PreparationConfig
     from hyperflare_recipes.recipes.nemotron_h.recipe import RECIPE
 
-    config = PreparationConfig(max_active=4, draft_checkpoint=Path("lilicorr"),
-        speculative_widths=tuple(range(1, 9)), speculative_token_capacity=8)
+    params = replace(
+        RECIPE.parameters,
+        max_concurrency=4,
+        speculation=replace(RECIPE.speculation, draft_tokens=7, token_capacity=8),
+    )
+    config = PreparationConfig(parameters=params, draft_checkpoint=Path("lilicorr"))
     assert (4, 8, 5) in config.speculative_round_shapes
     assert config.decode_tokens == 8
     assert config.decode_samples == 32
     assert RECIPE.speculation.packed_verification
-    fixed = replace(config, speculative_fixed_width=4)
+    fixed_params = replace(
+        params,
+        speculation=replace(params.speculation, draft_tokens=3, adaptive=False),
+    )
+    fixed = replace(config, parameters=fixed_params)
     assert {width for _, width, _ in fixed.speculative_round_shapes} == {1, 4}
     assert fixed.decode_tokens == 8 and fixed.decode_samples == 16
     plain = replace(config, draft_checkpoint=None)

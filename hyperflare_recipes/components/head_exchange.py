@@ -161,9 +161,8 @@ class PreparedLseReduceScatter:
                  threads=None, block_limit=None):
         import torch.distributed as dist
         from b12x.comm import pcie
-        from b12x.preparation import PreparedCall
+        from b12x.preparation import CollectiveRequirement, PreparedCall
         from ignition.components.collectives import PreparedAllGather, _roce
-        from ignition.preparation.collectives import CollectiveRequirement
         from ignition.preparation.tuning import declare
 
         rows = partial.shape[0]

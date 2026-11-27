@@ -125,7 +125,7 @@ class CandidateSelectionTuning:
             coordinator = self.context.coordinator
             device = self.context.shards.index.device
             graphs, compiled = {}, {}
-            with trial_session(session, device=device, coordinator=coordinator, collective_tuning="static") as trials:
+            with trial_session(session, device=device, coordinator=coordinator) as trials:
                 fixtures = {rows: _Fixture(rows, self.context, self.reduction, trials, self.selections[rows][0].alternatives)
                             for rows in sorted(self.selections)}
                 trials.tune(show_progress=False)

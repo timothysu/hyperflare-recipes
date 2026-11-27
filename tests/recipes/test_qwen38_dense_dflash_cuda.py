@@ -407,3 +407,95 @@ def test_checkpoint_five_layer_operator_arithmetic_and_raw_head(weights):
         for name, tensor in rings.items():
             assert torch.equal(tensor.view(torch.uint8), saved[name]), name
         graph.reset()
+
+
+@CUDA
+@torch.no_grad()
+def test_checkpoint_shortlist_only_draft_matches_full_vocabulary_topk(weights):
+    """Single-GPU shortlist-only DFlash2 draft skips full-vocab FP32 cast and matches dense top-16."""
+    from b12x.preparation import PreparationSession
+    from hyperflare_recipes.components.dflash2 import DraftScratch, PreparedDraft
+    from hyperflare_recipes.components.paged_batch import Metadata
+    from hyperflare_recipes.components.weights import DirectWeightLoader
+    from hyperflare_recipes.recipes.qwen38_dense.config import TEXT_PREFIX
+    from ignition.preparation.checkpoint import inspect_indexed_checkpoint
+    from ignition.preparation.compilation import compile_forward
+    from ignition.preparation.scratch import ScratchArena
+
+    with DirectWeightLoader(inspect_indexed_checkpoint(TARGET), "cuda:0",
+            prefixes=(TEXT_PREFIX + ".embed_tokens", "lm_head")) as loader:
+        embedding = loader.load_tensor(TEXT_PREFIX + ".embed_tokens.weight")
+        head = loader.load_linear("lm_head")
+    torch.manual_seed(2719)
+    metadata = Metadata.allocate(8, 1, 1, "cuda", samples=8)
+    ids = torch.full((1, 8), weights.config.draft.noise_token, device="cuda", dtype=torch.int64)
+    ids[0, 0] = 17
+    metadata.set(torch.tensor([17], device="cuda"), torch.tensor([8], device="cuda", dtype=torch.int32),
+        torch.tensor([1], device="cuda"), torch.zeros((1, 1), device="cuda", dtype=torch.int32), ids,
+        torch.tensor([1], device="cuda", dtype=torch.int32))
+    rings = {f"draft{i}.{kind}": (torch.randn((2, 2048, 8, 128), device="cuda") * .1).to(torch.float8_e4m3fn)
+             for i in range(5) for kind in ("key", "value")}
+    pool = SimpleNamespace(reserved_region=rings.__getitem__)
+    with PreparationSession(device="cuda:0", autotune=False) as session:
+        arena = ScratchArena("cuda")
+        scratch = DraftScratch.allocate(weights.config.draft, weights.shard, 8, "cuda")
+        dense = PreparedDraft(weights, scratch, metadata, pool, runtime=None, vocabulary_runtime=None,
+            embedding_runtime=None, coordinator=None, session=session, name="qwen.draft.dense", workspace=arena,
+            embedding=embedding, head=head, output_multiplier=1., final_logit_softcapping=None)
+        shortlist = PreparedDraft(weights, scratch, metadata, pool, runtime=None, vocabulary_runtime=None,
+            embedding_runtime=None, coordinator=None, session=session, name="qwen.draft.shortlist", workspace=arena,
+            embedding=embedding, head=head, output_multiplier=1., final_logit_softcapping=None,
+            shortlist_only=True)
+        assert shortlist.shortlist_output is True
+        assert shortlist.shortlist_gather is None
+        assert shortlist.head.local_only is True
+        dense.release_outputs()
+        shortlist.release_outputs()
+        out_hidden = torch.empty((8, 5120), device="cuda", dtype=torch.bfloat16)
+        out_unary = torch.empty((1, 8, 16), device="cuda", dtype=torch.float32)
+        out_ids = torch.empty((1, 8, 16), device="cuda", dtype=torch.int64)
+        out_features = torch.empty((1, 8, 256), device="cuda", dtype=torch.bfloat16)
+
+        def capture_shortlist():
+            hidden, (unary, token_ids), features = shortlist.forward(metadata)
+            out_hidden.copy_(hidden)
+            out_unary.copy_(unary)
+            out_ids.copy_(token_ids)
+            out_features.copy_(features)
+
+        arena.finalize()
+        forward = compile_forward(capture_shortlist)
+        forward()
+        graph = torch.cuda.CUDAGraph()
+        with session.capture(), torch.cuda.graph(graph):
+            forward()
+        allocated = torch.cuda.memory_allocated()
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.cuda.memory_allocated() == allocated
+
+        ref_hidden, ref_logits, ref_features = dense.forward(metadata)
+        torch.cuda.synchronize()
+        assert torch.equal(out_hidden, ref_hidden)
+        assert torch.equal(out_features, ref_features)
+
+        ref_top_u, _ = ref_logits.topk(16, dim=-1, sorted=True)
+        got_u, order = out_unary.view(8, 16).sort(dim=-1, descending=True)
+        got_i = out_ids.view(8, 16).gather(-1, order)
+        assert torch.equal(got_u, ref_top_u)
+        assert torch.equal(ref_logits.gather(-1, got_i), got_u)
+        for row in range(8):
+            assert len(set(got_i[row].tolist())) == 16
+            assert 0 <= int(got_i[row].min()) and int(got_i[row].max()) < 248320
+
+        predecessor = ids[:, 0]
+        for position in range(1, 8):
+            expected = dense.selector.apply_shortlist(
+                ref_logits[position:position + 1].clone(), predecessor, position,
+                ref_features, out_unary, out_ids)
+            direct = shortlist.selector.score_shortlist(
+                predecessor, position, out_features, out_unary, out_ids)
+            rebuilt = torch.full_like(expected, -torch.inf).scatter_(1, out_ids[:, position], direct)
+            assert torch.equal(rebuilt, expected)
+            predecessor = expected.argmax(-1)
+        graph.reset()

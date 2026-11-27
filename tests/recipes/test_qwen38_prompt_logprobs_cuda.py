@@ -31,9 +31,21 @@ def test_real_qwen_prompt_head_and_reduction():
     tokens = Tokenizer.from_file(str(snapshot / "tokenizer.json")).encode(
         "The capital of France is Paris. The city is known for its art, architecture, museums and history.",
         add_special_tokens=False).ids
-    config = PreparationConfig(prompt_logprobs=True, max_active=1, context=128, prefill_chunk_size=128,
-        pages=4, snapshot_budget_bytes=256 << 20, compile_workers=12,
-        kernel_cache=Path.home() / ".cache/flare/kernels-qwen")
+    from dataclasses import replace
+    from ignition.parameters import PromptLogprobsParameters
+    config = PreparationConfig(
+        parameters=replace(
+            PreparationConfig().parameters,
+            prompt_logprobs=PromptLogprobsParameters(enabled=True),
+            max_concurrency=1,
+            prefill_chunk=128,
+            compile_workers=12,
+        ),
+        context=128,
+        pages=4,
+        snapshot_budget_bytes=256 << 20,
+        kernel_cache=Path.home() / ".cache/flare/kernels-qwen",
+    )
     with CoreStorage(world=1) as storage:
         with prepare_model(snapshot, config, compile_decoder=False, core_storage=storage,
                            progress=lambda message: print(message, flush=True)) as model:

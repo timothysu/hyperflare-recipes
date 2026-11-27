@@ -193,7 +193,7 @@ def tune_local_slots(registry, session):
     with RecordedPreparationSession(device=registry.context.shards.index.device, checkpoint=checkpoint,
             workload_schema=schema, numerical_policy=numerics, namespace=namespace,
             coordinator=registry.context.coordinator, compile_workers=session.requested_compile_workers,
-            autotune_effort=session.autotune_effort, collective_tuning="static",
+            autotune_effort=session.autotune_effort,
             headroom_bytes=session.headroom_bytes, lock_gpu_clocks=session.lock_gpu_clocks) as trials:
         grouped = {}
         for geometry, bindings in registry.slot_groups.items():

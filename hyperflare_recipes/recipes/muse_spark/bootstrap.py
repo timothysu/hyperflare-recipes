@@ -6,7 +6,7 @@
 import contextlib
 import hashlib
 import json
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 import torch
@@ -42,20 +42,32 @@ from .decoder import PreparedDecoder, PreparedResume, Scratch
 from .frontend import prepare_frontend, runtime_assets
 from .pool import PAGE_TOKENS, ContinuationPool, continuation_layout, page_bytes
 from .weights import ModelWeights
+from .recipe import MuseSparkParameters, RECIPE
 from ignition.preparation.bootstrap import BasePreparationConfig
+
+
+def _default_parameters() -> MuseSparkParameters:
+    return replace(RECIPE.parameters, speculation=None)
 
 
 @dataclass(frozen=True)
 class PreparationConfig(BasePreparationConfig):
-    prompt_logprobs: bool = False
+    parameters: MuseSparkParameters = field(default_factory=_default_parameters)
     devices: tuple[int, ...] = tuple(range(8))
     stream_overlap: bool = True
-    dflash: bool = False
     draft_snapshot: Path | None = None
-    speculative_widths: tuple[int, ...] = tuple(range(1, 9))
-    speculative_graph_budget: int = 64
+
+    @property
+    def native_dense_activations(self) -> bool:
+        return self.parameters.native_dense_activations.enabled
+
+    @property
+    def dflash(self) -> bool:
+        return self.parameters.speculation is not None
 
     def __post_init__(self):
+        if not isinstance(self.parameters, MuseSparkParameters):
+            raise TypeError("Muse Spark PreparationConfig requires MuseSparkParameters")
         if self.mtp_only and (not self.dflash
                 or max(self.speculative_widths, default=1) <= 1 or self.speculative_fixed_width == 1):
             raise ValueError("--mtp-only requires enabled learned speculation with positive draft depth")
@@ -79,7 +91,7 @@ class PreparationConfig(BasePreparationConfig):
         from ignition.components.capacity import parallel_speculative_shapes
 
         return parallel_speculative_shapes(self.max_active, self.speculative_widths,
-            self.speculative_token_capacity, self.speculative_graph_budget,
+            self.speculative_token_capacity, self.speculative_graph_budget or 64,
             fixed_width=self.speculative_fixed_width) if self.dflash else ()
 
     @property
@@ -143,7 +155,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage):
         # Reduce each routed expert output before the replicated mixture finalizer.
         expert_width = weights.config.text["moe_hidden_size"]
         routed_width = weights.config.text["num_experts_per_tok"] * expert_width
-        collective = create_all_reduce_runtime(group, device, collective_tuning=config.collective_tuning,
+        collective = create_all_reduce_runtime(group, device,
             max_tokens=max(config.decode_tokens, draft_rows), hidden_size=routed_width,
             ipc=core_storage.peer_storage)
         prefill_collective = create_dma_all_reduce_runtime(group, device, max_tokens=tokens,
@@ -161,7 +173,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage):
             draft_headers=draft_headers, kv_dtype="float8_e4m3fn",
             world_size=shard.world_size, contract="muse-spark.text.v1"), sort_keys=True).encode()).hexdigest()
         session = RecordedPreparationSession(compile_workers=config.compile_workers,
-            collective_tuning=config.collective_tuning, collective_ladder=config.collective_ladder, autotune_effort=config.autotune_effort,
+            autotune_effort=config.autotune_effort,
             tuning_replica=config.tuning_replica, native_dense_activations=config.native_dense_activations,
             lock_gpu_clocks=config.lock_gpu_clocks, device=device, checkpoint=identity,
             workload_schema="muse_spark", numerical_policy="default", coordinator=coordinator,

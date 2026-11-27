@@ -230,13 +230,16 @@ def test_combine_uses_public_prepared_plan_and_residual_output(monkeypatch):
 
     def combine(state, block_output, logits, *, plan, out):
         calls.append((state, block_output, logits, plan, plan.selection))
-        assert out is state
+        assert out is not state
+        assert out.shape == state.shape and out.dtype == state.dtype and out.device == state.device
         return out
 
     monkeypatch.setattr(hyperconnection.hc, "run_combine", combine)
     for selection in ("default", "tuned"):
         plan.selection = selection
-        assert operator.combine_runtime(residual, block, injection) is residual
+        combined = operator.combine_runtime(residual, block, injection)
+        assert combined is not residual
+        assert combined.shape == residual.shape and combined.dtype == residual.dtype
         state, actual_block, logits, selected_plan, selected_config = calls[-1]
         assert state is residual and actual_block is block
         assert logits is injection

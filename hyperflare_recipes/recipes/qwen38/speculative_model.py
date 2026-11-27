@@ -28,9 +28,11 @@ class SpeculativePreparation:
     def __init__(self, *, weights, mtp_weights, pool, requests, inputs, scratch,
                  workspaces, rotary, cache, table, session, completion, frame, sequence,
                  context, prefill_capacity, max_cache_pages,
-                 runtime=None, vocabulary_runtime=None, coordinator=None, verification_width=8,
-                 sampling_workspace=None):
+                 runtime=None, vocabulary_runtime=None, result_runtime=None, qsa_gather_runtime=None,
+                 coordinator=None, verification_width=8, sampling_workspace=None):
         self.collectives = dict(runtime=runtime, vocabulary_runtime=vocabulary_runtime, coordinator=coordinator)
+        self.result_runtime = result_runtime
+        self.qsa_gather_runtime = qsa_gather_runtime
         self.weights, self.mtp_weights, self.pool, self.requests = weights, mtp_weights, pool, requests
         self.inputs, self.scratch, self.workspaces, self.rotary = inputs, scratch, workspaces, rotary
         self.cache, self.table, self.session = cache, table, session
@@ -183,12 +185,20 @@ class PreparedSpeculativeRound:
         scratch = owner.scratch.rows(batch * width, batch * width)
         self.target_residual = (owner.verification_residual[:batch * width]
                                 if residual_output is None else residual_output)
+        qsa_shard = (
+            dict(qsa_gather_runtime=owner.qsa_gather_runtime, qsa_shard_mode="group")
+            if (residual_output is None
+                and getattr(owner, "qsa_gather_runtime", None) is not None
+                and batch * width <= 128
+                and owner.context % (64 * owner.weights.shard.world_size) == 0)
+            else {}
+        )
         self.decoder = decoder_factory(owner.weights, scratch, self.state, owner.cache, owner.rotary,
             owner.table, owner.workspaces, owner.completion, owner.frame, owner.sequence,
             session=owner.session, name=f"{name}.target", max_cache_pages=owner.max_cache_pages,
             residual_output=self.target_residual, verification=True,
             gdn_records=owner.gdn_records if width > 1 else None,
-            gdn_in_place=width == 1 and owner.gdn_records is not None, **owner.collectives)
+            gdn_in_place=width == 1 and owner.gdn_records is not None, **qsa_shard, **owner.collectives)
         owner.decoders.append(getattr(self.decoder, "forward", self.decoder))
         self.draft_metadata = owner.draft_metadata(batch, batch)
         self.draft = owner.mtp(self.draft_metadata, f"{name}.draft") if width > 1 else None
@@ -222,7 +232,7 @@ class PreparedSpeculativeRound:
         o, b, w = self.owner, self.batch, self.width
         slots, epochs = o.inputs.row_slot_ids[:b], o.inputs.row_generations[:b]
         target = PreparedSpeculativeDistributions(self.decoder.scratch.logits.view(b, w, -1),
-            o.requests, slots, epochs, o.inputs.live_rows, self.drafts)
+            o.requests, slots, epochs, o.inputs.live_rows, self.drafts, token_limits=self.token_limits)
         proposals = tuple(PreparedDraftDistribution(self.draft.scratch.logits.view(b, 1, -1),
             o.requests, slots, epochs, o.inputs.live_rows, self.drafts, prefix_offset=index,
             seed=self.seed, offset=self.offset, sampled=self.sampled) for index in range(w - 1))
@@ -235,7 +245,7 @@ class PreparedSpeculativeRound:
         verify.prepare()
         from hyperflare_recipes.components.parallel_draft import prepare_sampling_broadcasts
         prepare_sampling_broadcasts(proposals, verify, collectives=o.collectives, session=o.session,
-                                    name=self.name)
+                                    name=self.name, result_runtime=getattr(o, "result_runtime", None))
         commit = PreparedSpeculativeCommit(o.requests, verify.output,
             self.state.token_ids.view(b, w), slots, epochs, o.inputs.live_rows,
             o.completion, o.frame, o.sequence, logits=self.decoder.scratch.logits.view(b, w, -1), rng=o.rng, copy_offered_mask=self.copy_mask,
@@ -351,7 +361,8 @@ class PreparedSpeculativeRound:
         hidden, logits, auxiliary, records = (self.decoder(runtime) if packing is None
                                                else self.decoder(runtime, packing))
         target_scratch = bind_scratch(target.layout, device=slots.device)
-        target_probs = target.run(target_scratch, logits.view(b, w, -1), candidates=drafts, slots=slots, generations=inputs.row_generations[:b], live_rows=inputs.live_rows)
+        target_probs = target.run(target_scratch, logits.view(b, w, -1), candidates=drafts, slots=slots,
+            generations=inputs.row_generations[:b], live_rows=inputs.live_rows, token_limits=token_limits)
         verify_scratch = bind_scratch(verify.layout, device=slots.device)
         acceptance = verify.run(verify_scratch, draft_probabilities, target_probs, target_scratch["valid"],
                                 drafts=drafts, draft_valid=draft_valid, slots=slots,

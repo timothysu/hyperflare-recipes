@@ -51,12 +51,14 @@ def test_explicit_bf16_is_operator_metadata_and_has_no_complete_override(monkeyp
 
 
 def test_preparation_config_rejects_missing_api_before_weight_loading(monkeypatch):
+    from dataclasses import replace
     from hyperflare_recipes.recipes.deepseek41.bootstrap import PreparationConfig
 
     monkeypatch.setattr(compressed_mla.mla, "Caps", lambda: None)
-    assert PreparationConfig().mla_compute_mode == "auto"
+    base = PreparationConfig()
+    assert base.mla_compute_mode == "auto"
     with pytest.raises(ValueError, match="preparation API"):
-        PreparationConfig(mla_compute_mode="bf16")
+        PreparationConfig(parameters=replace(base.parameters, mla_compute_mode="bf16"))
 
 
 def test_target_prefill_and_draft_factories_keep_the_selected_arithmetic(monkeypatch):

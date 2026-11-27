@@ -7,7 +7,7 @@
 import contextlib
 import hashlib
 import json
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from functools import partial
 from pathlib import Path
 from types import SimpleNamespace
@@ -72,27 +72,45 @@ from .vision import (
 )
 from .vision_state import PreparedVisionGeneration
 from .weights import ModelWeights
+from .recipe import RECIPE, Step5Parameters
 from ignition.preparation.bootstrap import BasePreparationConfig
+
+
+def _default_parameters() -> Step5Parameters:
+    return RECIPE.parameters
 
 
 @dataclass(frozen=True)
 class PreparationConfig(BasePreparationConfig):
-    prompt_logprobs: bool = False
-    image_concurrency: int | None = None
+    parameters: Step5Parameters = field(default_factory=_default_parameters)
     devices: tuple[int, ...] = tuple(range(8))
     context: int = 1048576
-    mtp: bool = True
-    speculative_widths: tuple[int, ...] = (1, 2, 3, 4)
-    stream_overlap: bool = True
-    expert_scale_compression: str | None = None
+
+    @property
+    def native_dense_activations(self) -> bool:
+        return self.parameters.native_dense_activations.enabled
+
+    @property
+    def mtp(self) -> bool:
+        return self.parameters.speculation is not None
+
+    @property
+    def stream_overlap(self) -> bool:
+        return self.parameters.stream_overlap.enabled
+
+    @property
+    def expert_scale_compression(self) -> str | None:
+        return self.parameters.expert_scale_compression.encoding
 
     def __post_init__(self):
+        if not isinstance(self.parameters, Step5Parameters):
+            raise TypeError("Step-5 PreparationConfig requires Step5Parameters")
         if self.mtp_only and (not self.mtp
                 or max(self.speculative_widths, default=1) <= 1 or self.speculative_fixed_width == 1):
             raise ValueError("--mtp-only requires enabled learned speculation with positive draft depth")
         from ignition.components.capacity import image_capacity
 
-        object.__setattr__(self, "image_concurrency", image_capacity(self.max_active, self.image_concurrency))
+        image_capacity(self.max_active, self.image_concurrency)
         if self.expert_scale_compression not in (None, "csf"):
             raise ValueError("Step-5 expert scale compression must be None or 'csf'")
         if len(self.devices) not in (4, 8, 16) or len(set(self.devices)) != len(self.devices) or any(d < 0 for d in self.devices):
@@ -163,7 +181,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage):
         sequence = torch.zeros(1, dtype=torch.int64, device=device)
         completion = CompletionOutputs.allocate((2, slots, VECTOR_TOKENS_FIELD + config.completion_token_capacity), device=device)
         coordinator = CollectivePreparation(group)
-        collective = create_all_reduce_runtime(group, device, collective_tuning=config.collective_tuning, max_tokens=max(decode_tokens, draft_tokens),
+        collective = create_all_reduce_runtime(group, device, max_tokens=max(decode_tokens, draft_tokens),
             hidden_size=weights.config.hidden, element_bytes=4, ipc=core_storage.peer_storage)
         prefill_collective = create_dma_all_reduce_runtime(group, device, max_tokens=tokens,
             hidden_size=weights.config.hidden, element_bytes=4, ipc=core_storage.peer_storage)
@@ -177,7 +195,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage):
             "quantization": weights.config.quantization, "headers": headers, "world_size": shard.world_size,
             "contract": "step5.graph-inputs.v1"}, sort_keys=True).encode()).hexdigest()
         session = RecordedPreparationSession(
-            compile_workers=config.compile_workers, collective_tuning=config.collective_tuning, collective_ladder=config.collective_ladder, autotune_effort=config.autotune_effort, tuning_replica=config.tuning_replica,
+            compile_workers=config.compile_workers, autotune_effort=config.autotune_effort, tuning_replica=config.tuning_replica,
             native_dense_activations=config.native_dense_activations, lock_gpu_clocks=config.lock_gpu_clocks,
             device=device, checkpoint=identity, workload_schema="step5",
             numerical_policy="default", coordinator=coordinator, headroom_bytes=config.headroom_bytes,

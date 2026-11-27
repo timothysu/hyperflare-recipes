@@ -98,50 +98,40 @@ def test_absent_catalog_is_not_inferred_from_allocation_names():
     assert bundle.allocations[0].nbytes == 64
 
 
-@pytest.mark.parametrize("mode", ["static", "runtime"])
-def test_rebuild_manifest_records_collective_selection(mode):
+def test_rebuild_manifest_embeds_parseable_reproduction_arguments(tmp_path, monkeypatch):
     from dataclasses import replace
     from google.protobuf.json_format import ParseDict
+    from ignition.cli import parse_args
+    from ignition.parameters import PromptLogprobsParameters
     from ignition.preparation.rebuild_manifest import from_plan
-    from hyperflare_recipes.recipes import ResolvedModel
-    from tests.cli.test_planning import derive
+    from hyperflare_recipes.parameters import NativeDenseActivationsParameters
+    from hyperflare_recipes.recipes import ResolvedModel, recipes, resolve
+    from tests.cli.test_planning import derive, gpu
 
-    plan = replace(derive(), collective_tuning=mode)
-    model = ResolvedModel(plan.recipe, plan.checkpoint)
-    manifest = ParseDict(from_plan(model, plan, compiled_forwards=True), proto.RebuildManifest())
-    restored = proto.RebuildManifest.FromString(manifest.SerializeToString())
-    assert restored.collective_tuning == mode
-
-
-def test_rebuild_manifest_embeds_parseable_reproduction_arguments(tmp_path):
-    from dataclasses import replace
-    from google.protobuf.json_format import ParseDict
-    from ignition.cli import _parser
-    from ignition.preparation.rebuild_manifest import from_plan
-    from hyperflare_recipes.recipes import ResolvedModel
-    from tests.cli.test_planning import derive
-
-    base = derive()
-    plan = replace(
-        base,
-        prompt_logprobs=True,
+    monkeypatch.setattr("ignition.preparation.source_identity.source_identity", lambda: "test-source")
+    qwen = resolve("qwen3.8-flash")
+    params = replace(
+        qwen.recipe.parameters,
+        max_concurrency=4,
+        prompt_logprobs=PromptLogprobsParameters(enabled=True),
         autotune_effort="audit",
-        native_dense_activations=True,
+        native_dense_activations=NativeDenseActivationsParameters(enabled=True),
         lock_gpu_clocks=True,
-        collective_tuning="static",
     )
+    plan = derive(model=qwen.recipe, gpus=(gpu(0, 95),), selected=(0,), parameters=params)
     model = ResolvedModel(plan.recipe, plan.checkpoint)
     encoded = from_plan(model, plan, compiled_forwards=False)
-    manifest = ParseDict(encoded, proto.RebuildManifest())
-    restored = proto.RebuildManifest.FromString(manifest.SerializeToString())
-    assert restored.prompt_logprobs is True
-    assert restored.autotune_effort == "audit"
-    assert restored.native_dense_activations is True
-    assert restored.lock_gpu_clocks is True
+    manifest = ParseDict(encoded, proto.PreparationManifest())
+    restored = proto.PreparationManifest.FromString(manifest.SerializeToString())
+    values = {entry.key: entry.value for entry in restored.parameters}
+    assert values["prompt_logprobs"].bool_value is True
+    assert values["autotune_effort"].string_value == "audit"
+    assert values["native_dense_activations"].bool_value is True
+    assert values["lock_gpu_clocks"].bool_value is True
 
     args = list(restored.reproduction_args)
     assert args[:3] == ["ignition", "export", f"{plan.checkpoint.repository}@{plan.checkpoint.revision}"]
-    parsed = _parser().parse_args(args[1:])
+    parsed = parse_args(args[1:], recipes=recipes())
     assert parsed.command == "export"
     assert parsed.model == f"{plan.checkpoint.repository}@{plan.checkpoint.revision}"
     assert parsed.max_concurrency == plan.concurrency
@@ -163,9 +153,9 @@ def test_rebuild_manifest_embeds_parseable_reproduction_arguments(tmp_path):
     assert all("secret-host-path" not in item for item in local_args)
 
     # Multi-host export records --ranks and RoCE shape rather than --gpus.
-    ring_plan = replace(plan, roce_ring=True)
+    ring_plan = replace(plan, parameters=replace(plan.parameters, roce_ring=True))
     multi_args = list(from_plan(model, ring_plan, compiled_forwards=True, multi_host=True)["reproduction_args"])
     assert "--ranks" in multi_args and "--roce-ring" in multi_args and "--gpus" not in multi_args
-    multi_parsed = _parser().parse_args(multi_args[1:])
+    multi_parsed = parse_args(multi_args[1:], recipes=recipes())
     assert multi_parsed.ranks == plan.world_size
     assert multi_parsed.roce_ring is True

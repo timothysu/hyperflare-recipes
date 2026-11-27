@@ -17,6 +17,7 @@ class DFlash2Preparation:
                  page_tokens, completion, frame, sequence, session, workspace,
                  verification_width=8, study_width=None, runtime=None,
                  vocabulary_runtime=None, coordinator=None, block_size=None, gather_runtime=None, examples=None,
+                 result_runtime=None, shortlist_runtime=None, block_proposal_broadcast=False, shortlist_only=False,
                  ):
         width = verification_width if study_width is None else study_width
         if type(width) is not int or not 1 <= width <= 16:
@@ -29,13 +30,16 @@ class DFlash2Preparation:
         self.session, self.workspace = session, workspace
         self.collectives = dict(runtime=runtime, vocabulary_runtime=vocabulary_runtime, coordinator=coordinator)
         self.gather_runtime = gather_runtime
+        self.result_runtime = result_runtime
+        self.block_proposal_broadcast = block_proposal_broadcast
         self.markov_runtime = None
         self.owners = []
         self.forwards = SimpleNamespace(decoder=decoder,
             context=partial(PreparedContext, runtime=gather_runtime, coordinator=coordinator, examples=self.examples),
             draft=partial(PreparedDraft, embedding=embedding, head=head,
                 output_multiplier=1., final_logit_softcapping=None,
-                embedding_runtime=gather_runtime, examples=self.examples), markov=None)
+                embedding_runtime=gather_runtime, examples=self.examples,
+                shortlist_only=shortlist_only, shortlist_runtime=shortlist_runtime), markov=None)
         self.rng = SpeculativeRngState.allocate(pool.backing.device, capacity=requests.capacity)
         self.generation, self.offset = torch.zeros_like(requests.generation), torch.zeros_like(requests.generation)
         block_size = width if block_size is None else block_size

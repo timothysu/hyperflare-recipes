@@ -37,9 +37,14 @@ class PreparedVocabularyProjection:
                 or row_indices.device != source.device or row_indices.shape != (output.shape[0],)
                 or output.shape[0] < rows):
             raise ValueError("vocabulary row indices require one device int64 index per expanded output row")
+        from .tensor_fp8 import TensorFP8Projection, TensorFP8Weight
+
         self.row_indices = row_indices
         if isinstance(weight, torch.Tensor):
             self.projection = UnquantizedProjection(source, weight, local_output,
+                session=session, name=f"{name}.projection")
+        elif isinstance(weight, TensorFP8Weight):
+            self.projection = TensorFP8Projection(source, weight, local_output,
                 session=session, name=f"{name}.projection")
         else:
             self.projection = QuantizedProjection(source, weight, local_output,

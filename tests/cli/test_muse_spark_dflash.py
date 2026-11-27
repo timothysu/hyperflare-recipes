@@ -3,12 +3,14 @@
 
 """Muse Spark DFlash2 plan selection and ordinary-decoding preparation."""
 
+from dataclasses import replace
+
 import pytest
 
 from ignition import planning
-from ignition.cli import _parser, preparation
+from ignition.cli import parse_args, preparation
 from ignition.errors import UsageError
-from hyperflare_recipes.recipes import resolve
+from hyperflare_recipes.recipes import recipes, resolve
 
 
 ALIAS = "muse-spark-open-nvfp4"
@@ -16,8 +18,8 @@ GIB = 1 << 30
 
 
 def speculation(*flags):
-    args = _parser().parse_args(["export", ALIAS, *flags])
-    return preparation.speculation(args, resolve(ALIAS))
+    args = parse_args(["export", ALIAS, *flags], recipes=recipes())
+    return preparation.resolve_parameters(resolve(ALIAS), args).speculation
 
 
 def test_muse_defaults_to_seven_adaptive_dflash_drafts():
@@ -49,9 +51,11 @@ def test_muse_planning_omits_draft_weights_and_state_without_mtp():
     gpus = tuple(planning.Gpu(index, "NVIDIA SM120", f"GPU-{index}", 96 * GIB,
                              95 * GIB, (12, 0)) for index in range(8))
     plain = planning.plan(model.recipe, model.checkpoint, gpus, selected=tuple(range(8)),
-                          concurrency=4, speculation=None, reserve_bytes=0)
+                          parameters=replace(model.recipe.parameters, max_concurrency=4, speculation=None),
+                          reserve_bytes=0)
     draft = planning.plan(model.recipe, model.checkpoint, gpus, selected=tuple(range(8)),
-                          concurrency=4, speculation=speculation(), reserve_bytes=0)
+                          parameters=replace(model.recipe.parameters, max_concurrency=4, speculation=speculation()),
+                          reserve_bytes=0)
     assert plain.fits and draft.fits
     assert draft.world_size == plain.world_size == 8
     assert draft.speculative_token_capacity == 32

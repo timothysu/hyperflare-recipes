@@ -4,12 +4,41 @@ Recipes in `hyperflare_recipes/recipes/` own model composition, checkpoint mappi
 layouts, and graph preparation. Shared model execution mechanisms belong in
 `hyperflare_recipes/components/` (Helios-ABI runtime interface components live in `ignition/components/` in Flare). Each recipe package's `recipe.py` defines `RECIPE`, a
 `Recipe` from [the declaration module](https://github.com/NVIDIA/hyperflare-inference/blob/main/ignition/declaration.py) that
-names its checkpoints, serving range, memory costs, speculation, and sampling
-defaults; `recipes()` in `hyperflare_recipes/recipes/__init__.py` lists the declarations
+names its checkpoints, serving range, memory costs, sampling defaults, and
+`RecipeParameters` declaration; `recipes()` in `hyperflare_recipes/recipes/__init__.py` lists the declarations
 the Ignition CLI offers. Follow [repository guidance](../AGENTS.md),
 [preparation development](preparation-development.md), and the relevant
 [model preparation and serving instructions](model-preparation.md).
 Performance changes also require [GPU performance work](performance-work.md).
+
+## Recipe parameters
+
+Every recipe declares a frozen `RecipeParameters` instance (`ignition.parameters`)
+on `Recipe.parameters`. That instance is the single source of truth for the
+recipe's command-line flags, `MODEL --help` output, defaults, bounds and choices,
+cross-field validation, memory/topology planning adjustments, startup status
+summary, `Plan.to_dict()`, `reproduction_args`, and `PreparationManifest`
+entries:
+
+- Attach core Helios-ABI capabilities (`SpeculationParameters`,
+  `VisionParameters`, `PromptLogprobsParameters`, `MixedPrefillParameters`) from
+  `ignition.parameters` when the recipe supports them, or leave them `None`.
+- Compose reusable recipe-domain parameter groups from
+  [hyperflare_recipes/parameters.py](../hyperflare_recipes/parameters.py)
+  (`NativeDenseActivationsParameters`, `StreamOverlapParameters`,
+  `ContextParallelParameters`, `HybridContextParallelParameters`,
+  `ExpertScaleCompressionParameters`, `OnlineMXFP8Parameters`,
+  `DraftQuantizationParameters`).
+- Put options owned by a single recipe on a recipe-local `RecipeParameters`
+  subclass in that recipe's `recipe.py` using `param(...)`, and override hooks
+  (`validate`, `filter_world_sizes`, `adjust_weights_bytes`, `adjust_rank_costs`,
+  `manifest_parameters`, `reproduction_args`) only where the recipe needs
+  model-specific constraints or memory accounting.
+- Keep `recipe.py` free of PyTorch and GPU imports so `ignition export MODEL --help`
+  and offline CLI parsing run without loading CUDA dependencies.
+- Embed `parameters` directly on each recipe's `PreparationConfig` (subclassing
+  `BasePreparationConfig` in `ignition.preparation.bootstrap`) and construct it
+  from `plan` via `common_preparation_kwargs`.
 
 ## Canonical model structure and semantics
 

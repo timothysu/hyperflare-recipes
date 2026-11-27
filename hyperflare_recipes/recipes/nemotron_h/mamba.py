@@ -7,10 +7,11 @@ import torch
 from b12x.sequence import short_conv
 
 from hyperflare_recipes.components.gated_norm import PreparedGatedRMSNorm
-from hyperflare_recipes.components.linear import QuantizedProjection
+from hyperflare_recipes.components.linear import prepare_projection
 from hyperflare_recipes.components.mamba import PreparedMambaScan, PreparedMambaUpdate
 from hyperflare_recipes.components.mamba_speculation import PreparedMambaVerification
 from hyperflare_recipes.components.recurrent import prepare_sequence_binding, run_short_conv
+from ignition.components.collectives import PreparedAllReduce
 from ignition.preparation.examples import declaration_tensor
 
 
@@ -22,10 +23,12 @@ def _metadata(metadata):
 
 class PreparedMamba:
     def __init__(self, weights, source, state, metadata, config, *, mode, session, name, workspace,
+                 shard=None, runtime=None, coordinator=None,
                  replay=None, records=None, verification_width=1, examples=None):
         c, tokens = config.text, source.shape[0]
-        heads, dim, n, groups = c["mamba_num_heads"], c["mamba_head_dim"], c["ssm_state_size"], c["n_groups"]
-        width, channels = config.mamba_width, config.convolution_width
+        heads = config.local_mamba_heads(shard)
+        dim, n, groups = c["mamba_head_dim"], c["ssm_state_size"], config.local_n_groups(shard)
+        width, channels = config.local_mamba_width(shard), config.local_convolution_width(shard)
 
         def buffer(role, columns):
             return declaration_tensor(examples, "nemotron.target.mamba." + role,
@@ -34,13 +37,14 @@ class PreparedMamba:
         projected = buffer("projected", width + channels + heads)
         gate, xbc, dt = projected.split((width, channels, heads), dim=-1)
         mixed, output = buffer("mixed", channels), buffer("output", config.hidden)
+        partial = buffer("partial", config.hidden) if runtime is not None else output
         recurrence, gated = buffer("recurrence", width), buffer("gated", width)
-        self.input = QuantizedProjection(source, weights["input"], projected, session=session,
-            name=name + ".input", activation_mode="auto", workspace=workspace,
-            examples=examples, example_role="nemotron.target.mamba.input")
-        self.output = QuantizedProjection(gated, weights["output"], output, session=session,
-            name=name + ".output", activation_mode="auto", workspace=workspace,
-            examples=examples, example_role="nemotron.target.mamba.output")
+        self.input = prepare_projection(source, weights["input"], projected, session=session,
+            name=name + ".input", activation_mode="auto", workspace=workspace)
+        self.output = prepare_projection(gated, weights["output"], partial, session=session,
+            name=name + ".output", activation_mode="auto", workspace=workspace)
+        self.reduce = None if runtime is None else PreparedAllReduce(
+            partial, output, runtime=runtime, coordinator=coordinator, session=session, name=name + ".reduce")
         sequences = metadata.query_start_loc.numel() - 1
         args = dict(x=xbc, conv_weight=weights["convolution"], conv_bias=weights["convolution_bias"],
             query_start_loc=metadata.query_start_loc, state_slot_ids=metadata.convolution_slots,
@@ -86,6 +90,8 @@ class PreparedMamba:
     def functional(self, *, session):
         self.input.functional(session=session)
         self.output.functional(session=session)
+        if self.reduce is not None:
+            self.reduce.functional(session=session)
         self.norm.functional(session=session, dynamic_live=True)
         return self
 
@@ -124,4 +130,5 @@ class PreparedMamba:
             recurrent = self.recurrence(recurrence_args)
         norm_shape = (tokens, self.groups, width // self.groups)
         gated = self.norm(recurrent.view(norm_shape), gate.view(norm_shape), live=metadata.num_tokens)
-        return self.output(gated.flatten(1))
+        output = self.output(gated.flatten(1))
+        return output if self.reduce is None else self.reduce(output)

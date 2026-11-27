@@ -156,3 +156,78 @@ def test_projection_precision_gate_checks_worst_row_independently():
     candidate = torch.tensor([[1.08, 1.08], [100., 100.]], dtype=torch.bfloat16)
     with pytest.raises(AssertionError, match='worst_row_relative_l2'):
         check_projection_gate(control, candidate, reference)
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+@pytest.mark.parametrize("functional", [False, True])
+@pytest.mark.parametrize("rows", [16, 128, 2048])
+def test_paired_columns_dma_pack_and_unpack_bit_exact(monkeypatch, device, functional, rows):
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA is unavailable")
+    runtime = SimpleNamespace(world_size=16, shard_capacity=2048 * 336 * 2, offset=0, variation=0)
+    monkeypatch.setattr(column_pair_gather, "_is_dma_runtime", lambda rt: rt is runtime)
+
+    class DmaGather:
+        def __init__(self, source, output, **kwargs):
+            assert tuple(output.shape) == (16, source.shape[0], source.shape[1])
+            self.output = output
+            self.shape = tuple(output.shape)
+
+        def functional(self, *, session):
+            self.output = None
+
+        def __call__(self, source):
+            count = source.shape[0]
+            parts = []
+            for rank in range(16):
+                first, second = fields(rows, rank, runtime.variation)
+                part = torch.cat((first, second.view(torch.bfloat16)), dim=1)[runtime.offset:runtime.offset + count]
+                parts.append(part.to(source.device))
+            assert torch.equal(source.view(torch.int16), parts[0].view(torch.int16))
+            result = torch.stack(parts, dim=0).contiguous()
+            if self.output is not None:
+                self.output.copy_(result)
+                result = self.output
+            runtime.offset += count
+            return result
+
+    monkeypatch.setattr(column_pair_gather, "PreparedAllGather", DmaGather)
+    first, second = (t.to(device) for t in fields(rows, 0, 0))
+    output_first = torch.empty((rows, 3584), dtype=torch.bfloat16, device=device)
+    output_second = torch.empty((rows, 896), dtype=torch.float32, device=device)
+    buffers = {}
+    op = column_pair_gather.PreparedColumnPairGather(
+        first, second, output_first, output_second,
+        runtime=runtime, session=None, coordinator=None, name="dma_cols", buffers=buffers,
+    )
+    assert op.dma is True
+    assert op.received.shape == (16, rows, 336)
+    if functional:
+        op.functional(session=None)
+    for variation in range(2):
+        runtime.variation, runtime.offset = variation, 0
+        left, right = (t.to(device) for t in fields(rows, 0, variation))
+        first.copy_(left)
+        second.copy_(right)
+        out1, out2 = op(first, second) if functional else op()
+        expected_first = torch.cat([fields(rows, rank, variation)[0] for rank in range(16)], dim=1).to(device)
+        expected_second = torch.cat([fields(rows, rank, variation)[1] for rank in range(16)], dim=1).to(device)
+        assert torch.equal(out1.view(torch.int16), expected_first.view(torch.int16))
+        assert torch.equal(out2.view(torch.int32), expected_second.view(torch.int32))
+        assert runtime.offset == rows
+
+    if device == "cuda" and rows == 128 and functional:
+        # Verify Triton pack/unpack trace cleanly through torch.compile with dtype-reinterpreted views.
+        def compiled_roundtrip(f, s):
+            send = torch.empty((rows, 336), dtype=torch.bfloat16, device=device)
+            column_pair_gather._pack_columns(f, s, send, 224)
+            rec = send.unsqueeze(0).expand(16, rows, 336).contiguous()
+            o1 = torch.empty((rows, 3584), dtype=torch.bfloat16, device=device)
+            o2 = torch.empty((rows, 896), dtype=torch.float32, device=device)
+            column_pair_gather._unpack_dma_columns(rec, o1, o2, 16, 224, 56)
+            return o1, o2
+
+        fn = torch.compile(compiled_roundtrip, fullgraph=True)
+        o1, o2 = fn(first, second)
+        assert torch.equal(o1.view(torch.int16), first.repeat(1, 16).view(torch.int16))
+        assert torch.equal(o2.view(torch.int32), second.repeat(1, 16).view(torch.int32))

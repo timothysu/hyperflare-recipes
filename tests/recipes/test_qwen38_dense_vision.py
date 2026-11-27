@@ -58,7 +58,7 @@ def test_dense_recipe_declares_the_flash_image_limits():
     )
 
     assert (RECIPE.max_images, RECIPE.image_bytes) == (FLASH.max_images, FLASH.image_bytes) == (4, 32 << 20)
-    assert RECIPE.language_model_only
+    assert RECIPE.parameters.vision.separable_encoder
     assert VISION_SLOT_BYTES == 167_772_160
     assert VISION_INPUT_BYTES == 101_711_900
     assert VISION_TOWER_BYTES == 921_460_192
@@ -71,36 +71,74 @@ def test_dense_recipe_declares_the_flash_image_limits():
 
 def test_benchmark_selection_takes_no_image_slots():
     """A benchmark prepares text graphs only, so its configuration rejects image slots."""
+    from dataclasses import replace
+    from ignition.parameters import VisionParameters
     from ignition.preparation.selection import BenchmarkSelection
     from hyperflare_recipes.recipes.qwen38_dense.bootstrap import PreparationConfig
 
+    base = PreparationConfig(draft_snapshot=Path("draft")).parameters
     selection = BenchmarkSelection(batches=(1,), contexts=(0,), prefill_chunk=4096)
-    config = PreparationConfig(draft_snapshot=Path("draft"), max_active=1,
-        prefill_chunk_size=4096, benchmark_selection=selection)
+    config = PreparationConfig(
+        draft_snapshot=Path("draft"),
+        parameters=replace(base, max_concurrency=1, prefill_chunk=4096),
+        benchmark_selection=selection,
+    )
     assert config.image_concurrency == 0
     with pytest.raises(ValueError, match="takes no image slots"):
-        PreparationConfig(draft_snapshot=Path("draft"), max_active=1, image_concurrency=1,
-            prefill_chunk_size=4096, benchmark_selection=selection)
-    assert PreparationConfig(mtp=False).image_concurrency == 0
-    assert PreparationConfig(mtp=False, max_active=8, image_concurrency=2).image_concurrency == 2
+        PreparationConfig(
+            draft_snapshot=Path("draft"),
+            parameters=replace(
+                base, max_concurrency=1, prefill_chunk=4096,
+                vision=VisionParameters(separable_encoder=True, image_concurrency=1),
+            ),
+            benchmark_selection=selection,
+        )
+    plain_base = replace(base, speculation=None)
+    assert PreparationConfig(parameters=plain_base).image_concurrency == 0
+    assert PreparationConfig(
+        parameters=replace(
+            plain_base, max_concurrency=8,
+            vision=VisionParameters(separable_encoder=True, image_concurrency=2),
+        )
+    ).image_concurrency == 2
     with pytest.raises(ValueError, match="max_active"):
-        PreparationConfig(mtp=False, max_active=2, image_concurrency=4)
+        PreparationConfig(
+            parameters=replace(
+                plain_base, max_concurrency=2,
+                vision=VisionParameters(separable_encoder=True, image_concurrency=4),
+            )
+        )
     with pytest.raises(ValueError, match="non-negative"):
-        PreparationConfig(mtp=False, image_concurrency=-1)
+        PreparationConfig(
+            parameters=replace(
+                plain_base,
+                vision=VisionParameters(separable_encoder=True, image_concurrency=-1),
+            )
+        )
 
 
 def test_plan_reserves_vision_storage_only_for_image_slots():
+    from dataclasses import replace
     from ignition import planning
     from hyperflare_recipes.recipes import resolve
     from hyperflare_recipes.recipes.qwen38_dense.recipe import RECIPE, VISION_BYTES, VISION_SLOT_BYTES
 
     model = resolve("qwen3.8-27b")
     gpus = (planning.Gpu(0, "SM120", "GPU-0", 96 << 30, 95 << 30, (12, 0)),)
-    options = dict(concurrency=8, reserve_bytes=0, speculation=RECIPE.speculation)
-    default = planning.fit(RECIPE, model.checkpoint, gpus, **options)
-    language_only = planning.fit(RECIPE, model.checkpoint, gpus, **options, language_model_only=True)
-    one = planning.fit(RECIPE, model.checkpoint, gpus, **options, image_concurrency=1)
-    wide = planning.fit(RECIPE, model.checkpoint, gpus, **options, image_concurrency=8)
+    base = replace(RECIPE.parameters, max_concurrency=8)
+    default = planning.fit(RECIPE, model.checkpoint, gpus, parameters=base, reserve_bytes=0)
+    language_only = planning.fit(
+        RECIPE, model.checkpoint, gpus,
+        parameters=replace(base, vision=replace(base.vision, language_model_only=True)), reserve_bytes=0,
+    )
+    one = planning.fit(
+        RECIPE, model.checkpoint, gpus,
+        parameters=replace(base, vision=replace(base.vision, image_concurrency=1)), reserve_bytes=0,
+    )
+    wide = planning.fit(
+        RECIPE, model.checkpoint, gpus,
+        parameters=replace(base, vision=replace(base.vision, image_concurrency=8)), reserve_bytes=0,
+    )
     assert (language_only.image_concurrency, language_only.max_images) == (0, 0)
     assert language_only.graph_bytes == 4 << 30
     assert (default.image_concurrency, default.max_images) == (4, 4)
@@ -108,8 +146,11 @@ def test_plan_reserves_vision_storage_only_for_image_slots():
     assert one.graph_bytes - language_only.graph_bytes == VISION_BYTES + VISION_SLOT_BYTES
     assert wide.graph_bytes - default.graph_bytes == 4 * VISION_SLOT_BYTES
     # A plan that prepares no vision uses the text-only continuation row.
-    plain = planning.fit(RECIPE, model.checkpoint, gpus, concurrency=8, reserve_bytes=0,
-        speculation=None, language_model_only=True)
+    plain = planning.fit(
+        RECIPE, model.checkpoint, gpus,
+        parameters=replace(base, speculation=None, vision=replace(base.vision, language_model_only=True)),
+        reserve_bytes=0,
+    )
     assert language_only.costs == RECIPE.costs(1, RECIPE.speculation, model.checkpoint)
     assert language_only.costs.state_row_bytes == 193_865_984
     assert plain.costs.state_row_bytes == 158_148_864
@@ -119,6 +160,7 @@ def test_plan_reserves_vision_storage_only_for_image_slots():
 
 
 def test_plan_shortfall_on_32gib_sm120_suggests_language_model_only_when_applicable():
+    from dataclasses import replace
     from ignition import planning
     from ignition.errors import CapacityError, UsageError
     from hyperflare_recipes.recipes import resolve
@@ -126,29 +168,33 @@ def test_plan_shortfall_on_32gib_sm120_suggests_language_model_only_when_applica
 
     model = resolve("qwen3.8-27b")
     gpus = (planning.Gpu(0, "NVIDIA GeForce RTX 5090", "GPU-0", 32 << 30, 31 << 30, (12, 0)),)
+    base = replace(RECIPE.parameters, max_concurrency=4)
     # Four slots with default four image slots exceed 30 GiB usable (31 GiB free - 1 GiB headroom) and
     # suggest --language-model-only (28.6 GiB) alongside --max-concurrency and --no-mtp.
     with pytest.raises(CapacityError) as default_error:
-        planning.plan(RECIPE, model.checkpoint, gpus, selected=(0,), concurrency=4,
-            reserve_bytes=0, prefill_chunk=None, speculation=RECIPE.speculation)
+        planning.plan(RECIPE, model.checkpoint, gpus, selected=(0,), parameters=base, reserve_bytes=0)
     assert "--language-model-only" in str(default_error.value)
     # Explicit --image-concurrency cannot be combined with --language-model-only, so shortfall suggests
     # reducing --image-concurrency instead and omits --language-model-only.
     with pytest.raises(CapacityError) as explicit_error:
-        planning.plan(RECIPE, model.checkpoint, gpus, selected=(0,), concurrency=4,
-            reserve_bytes=0, prefill_chunk=None, speculation=RECIPE.speculation,
-            image_concurrency=4)
+        planning.plan(
+            RECIPE, model.checkpoint, gpus, selected=(0,),
+            parameters=replace(base, vision=replace(base.vision, image_concurrency=4)), reserve_bytes=0,
+        )
     assert "--language-model-only" not in str(explicit_error.value)
     assert "--image-concurrency" in str(explicit_error.value)
     # Combining language_model_only=True with an explicit image_concurrency is rejected.
     with pytest.raises(UsageError, match="--language-model-only"):
-        planning.plan(RECIPE, model.checkpoint, gpus, selected=(0,), concurrency=4, reserve_bytes=0,
-            prefill_chunk=None, speculation=RECIPE.speculation, language_model_only=True,
-            image_concurrency=4)
+        planning.plan(
+            RECIPE, model.checkpoint, gpus, selected=(0,),
+            parameters=replace(base, vision=replace(base.vision, language_model_only=True, image_concurrency=4)),
+            reserve_bytes=0,
+        )
     # Selecting --language-model-only fits four slots on the 32 GiB SM120 card even with a 1 GiB reserve.
-    text_only = planning.plan(RECIPE, model.checkpoint, gpus, selected=(0,), concurrency=4,
-        reserve_bytes=1 << 30, prefill_chunk=None, speculation=RECIPE.speculation,
-        language_model_only=True)
+    text_only = planning.plan(
+        RECIPE, model.checkpoint, gpus, selected=(0,),
+        parameters=replace(base, vision=replace(base.vision, language_model_only=True)), reserve_bytes=1 << 30,
+    )
     assert text_only.image_concurrency == 0 and text_only.max_images == 0
 
 
@@ -232,7 +278,16 @@ def _image_catalog():
     from hyperflare_recipes.recipes.qwen38_dense.bootstrap import PreparationConfig
     from hyperflare_recipes.recipes.qwen38_dense.vision_state import VisionInputs
 
-    config = PreparationConfig(draft_snapshot=Path("metadata-draft"), max_active=32, image_concurrency=4)
+    from dataclasses import replace
+    from hyperflare_recipes.recipes.qwen38_dense.recipe import RECIPE
+
+    config = PreparationConfig(
+        draft_snapshot=Path("metadata-draft"),
+        parameters=replace(
+            RECIPE.parameters, max_concurrency=32,
+            vision=replace(RECIPE.parameters.vision, image_concurrency=4),
+        ),
+    )
     capacity, vocabulary = config.max_active, 248320
     inputs = RotaryBatchInputs.allocate(config.prefill_chunk_size, config.context // 128, "cpu",
         capacity=capacity)

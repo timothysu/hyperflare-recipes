@@ -371,7 +371,6 @@ class TextReadback:
 def capture_readback(model, forward, rows, collective, *, compiled, stream=None):
     import torch
     from ignition.preparation.compilation import compile_forward
-    from ignition.preparation.startup_tuning import capture_consumers
 
     layers = forward.decoder.layers
     snapshots = (torch.empty((len(layers), rows, forward.decoder.weights.config.hidden),
@@ -398,7 +397,7 @@ def capture_readback(model, forward, rows, collective, *, compiled, stream=None)
             if not compiled:
                 execute()
         stream.synchronize()
-        with capture_consumers(model.session, graph), collective.capture(stream=stream), model.session.capture(), \
+        with collective.capture(stream=stream), model.session.capture(), \
                 torch.cuda.graph(graph, stream=stream):
             execute()
         stream.synchronize()
@@ -620,7 +619,7 @@ def main():
     from ignition.preparation.core_storage import CoreStorage
     from ignition.preparation.rank_group import prepare_group
     from hyperflare_recipes.recipes.muse_spark.bootstrap import PreparationConfig
-    config = PreparationConfig(collective_tuning=plan.collective_tuning, prompt_logprobs=plan.prompt_logprobs,
+    config = PreparationConfig(prompt_logprobs=plan.prompt_logprobs,
         compile_workers=plan.compile_workers, autotune_effort=plan.autotune_effort, tuning_replica=plan.tuning_replica,
         native_dense_activations=plan.native_dense_activations,
         lock_gpu_clocks=plan.lock_gpu_clocks and plan.autotune_effort != 'off',

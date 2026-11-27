@@ -7,8 +7,9 @@ import json
 
 import pytest
 
-from ignition.cli import _parser, main as _cli_main
+from ignition.cli import main as _cli_main, parse_args
 from ignition.cli.bench import Settings, table, write_result
+from ignition.cli.config import Configuration
 from ignition.errors import UsageError
 from hyperflare_recipes.recipes import recipes
 
@@ -17,8 +18,12 @@ def main(argv=None):
     return _cli_main(argv, recipes=recipes())
 
 
-def settings(*flags):
-    return Settings.from_args(_parser().parse_args(["bench", *flags]))
+def parse(argv):
+    return parse_args(argv, recipes=recipes())
+
+
+def settings(*flags, model="qwen3.8-27b"):
+    return Settings.from_args(parse(["bench", model, *flags]))
 
 
 def test_bench_plans_qwen_dense_text_only_and_rejects_image_concurrency(monkeypatch, tmp_path):
@@ -46,12 +51,14 @@ def test_bench_plans_qwen_dense_text_only_and_rejects_image_concurrency(monkeypa
 
     def run(text, *flags):
         config.write_text(text)
-        return bench.run(_parser().parse_args(["bench", "qwen3.8-27b", "--config", str(config), *flags]))
+        return bench.run(parse(["bench", "qwen3.8-27b", "--config", str(config), *flags]))
 
-    # Planning succeeds as text-only even when config.toml configures image_concurrency.
-    for text in ("", "[defaults]\nimage_concurrency = 4\n", '[models."qwen3.8-27b"]\nimage_concurrency = 2\n'):
-        with pytest.raises(Planned):
-            run(text)
+    with pytest.raises(Planned):
+        run("")
+    for text in ("[defaults]\nimage_concurrency = 4\n", '[models."qwen3.8-27b"]\nimage_concurrency = 2\n'):
+        config.write_text(text)
+        with pytest.raises(UsageError, match="unknown key"):
+            Configuration.load(config)
     with pytest.raises(UsageError, match="--image-concurrency does not apply"):
         run("", "--image-concurrency", "2")
 
@@ -83,10 +90,10 @@ def test_bench_leaves_non_qwen_dense_image_options_untouched(monkeypatch, tmp_pa
     config = tmp_path / "config.toml"
     config.write_text("")
     with pytest.raises(StopAfterDerive):
-        bench.run(_parser().parse_args(["bench", "kimi-k3.1-pro", "--config", str(config),
-            "--gpus", "0-15", "--image-concurrency", "2"]))
-    assert seen["language_model_only"] is False
-    assert seen["image_concurrency"] == 2
+        bench.run(parse(["bench", "kimi-k3.1-pro", "--config", str(config),
+                         "--gpus", "0-15", "--image-concurrency", "2"]))
+    assert seen["parameters"].vision.language_model_only is False
+    assert seen["parameters"].vision.image_concurrency == 2
 
 
 def test_default_matrix_and_measurement_counts():
@@ -102,7 +109,7 @@ def test_default_matrix_and_measurement_counts():
 
 
 def test_explicit_workload_and_preparation_options(tmp_path):
-    args = _parser().parse_args(["bench", "qwen3.8-27b", "--batches", "2,4", "--contexts", "2048,8192",
+    args = parse(["bench", "qwen3.8-27b", "--batches", "2,4", "--contexts", "2048,8192",
         "--verify-width", "8", "--mtp-draft-tokens", "7", "--seeds", "14,29", "--warmup", "2",
         "--repetitions", "7", "--output", str(tmp_path / "rounds.json"), "--gpus", "3",
         "--compile-workers", "12", "--autotune-effort", "off", "--speculative-token-capacity", "128"])
@@ -122,7 +129,7 @@ def test_explicit_draft_count_and_unordered_selections():
 
 
 def test_kimi_eight_request_round_with_autotuning():
-    args = _parser().parse_args(["bench", "kimi-k3.1-pro", "--gpus", "0-15",
+    args = parse(["bench", "kimi-k3.1-pro", "--gpus", "0-15",
         "--batches", "8", "--max-concurrency", "8", "--verify-width", "8",
         "--speculative-token-capacity", "64", "--online-mxfp8", "--autotune-effort", "default"])
     value = Settings.from_args(args)
@@ -161,8 +168,8 @@ def test_kimi_rejects_private_dflash_studies_before_preparation(tmp_path, capsys
 def test_prefill_defaults_and_target_only_selection():
     value = settings("--prefill")
     assert value.prefill and value.batches == (1,) and value.contexts == (0,)
-    args = _parser().parse_args(["bench", "--prefill", "--prefill-chunk-size", "2048",
-                                "--contexts", "4096,0", "--no-mtp"])
+    args = parse(["bench", "qwen3.8-27b", "--prefill", "--prefill-chunk-size", "2048",
+                  "--contexts", "4096,0", "--no-mtp"])
     assert Settings.from_args(args).contexts == (0, 4096)
     assert args.prefill_chunk_size == 2048 and args.no_mtp
 
@@ -190,33 +197,33 @@ def test_prefill_report_names_chunk_and_prefix():
     assert result["metric"] == "cuda_graph_prefill_latency_ms"
 
 
-@pytest.mark.parametrize("flags,message", [
-    (("--verify-width", "4", "--mtp-draft-tokens", "7"), "must equal"),
-    (("--verify-width", "9"), "requires --verify-width 8"),
-    (("--verify-width", "4"), "requires --verify-width 8"),
-    (("--mtp-draft-tokens", "3"), "requires --verify-width 8"),
-    (("--batches", "0"), "from 1,2,4"),
-    (("--batches", "16"), "from 1,2,4,8"),
-    (("--contexts", "0"), "positive multiples"),
-    (("--contexts", "513"), "positive multiples"),
-    (("--warmup", "-1"), "positive"),
-    (("--warmup", "0"), "positive"),
-    (("--repetitions", "0"), "positive"),
-    (("--seeds", "-1"), "0 through"),
-    (("--no-mtp",), "requires draft state"),
-    (("--mixed-prefill",), "speculative rounds"),
-    (("--prompt-logprobs",), "speculative rounds"),
-    (("--official-source", "https://example.com/model"), "core publishing"),
+@pytest.mark.parametrize("flags,message,model", [
+    (("--verify-width", "4", "--mtp-draft-tokens", "7"), "must equal", "qwen3.8-27b"),
+    (("--verify-width", "9"), "requires --verify-width 8", "qwen3.8-27b"),
+    (("--verify-width", "4"), "requires --verify-width 8", "qwen3.8-27b"),
+    (("--mtp-draft-tokens", "3"), "requires --verify-width 8", "qwen3.8-27b"),
+    (("--batches", "0"), "from 1,2,4", "qwen3.8-27b"),
+    (("--batches", "16"), "from 1,2,4,8", "qwen3.8-27b"),
+    (("--contexts", "0"), "positive multiples", "qwen3.8-27b"),
+    (("--contexts", "513"), "positive multiples", "qwen3.8-27b"),
+    (("--warmup", "-1"), "positive", "qwen3.8-27b"),
+    (("--warmup", "0"), "positive", "qwen3.8-27b"),
+    (("--repetitions", "0"), "positive", "qwen3.8-27b"),
+    (("--seeds", "-1"), "0 through", "qwen3.8-27b"),
+    (("--no-mtp",), "requires draft state", "qwen3.8-27b"),
+    (("--mixed-prefill",), "speculative rounds", "qwen3.8-flash"),
+    (("--prompt-logprobs",), "speculative rounds", "qwen3.8-27b"),
+    (("--official-source", "https://example.com/model"), "core publishing", "qwen3.8-27b"),
 ])
-def test_invalid_measurement_settings(flags, message):
+def test_invalid_measurement_settings(flags, message, model):
     with pytest.raises(UsageError, match=message):
-        settings(*flags)
+        settings(*flags, model=model)
 
 
 @pytest.mark.parametrize("flag,value", [("--batches", "1,1"), ("--contexts", "512,"), ("--seeds", "x")])
 def test_malformed_lists_are_usage_errors(flag, value):
     with pytest.raises(SystemExit) as error:
-        _parser().parse_args(["bench", flag, value])
+        parse(["bench", "qwen3.8-27b", flag, value])
     assert error.value.code == 2
 
 
@@ -225,10 +232,10 @@ def test_bench_help_describes_measured_boundary(capsys):
         main(["bench", "--help"])
     assert error.value.code == 0
     output = capsys.readouterr().out
-    assert "Kimi K3.1 Pro DSpark" in output
     assert "excludes preparation" in output
     assert "not serving throughput" in output
     assert "--repetitions" in output
+    assert "Available model recipes:" in output
 
 
 def test_unsupported_recipe_fails_before_preparation(tmp_path, capsys):

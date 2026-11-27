@@ -201,7 +201,8 @@ class EngramScratch:
 
 class PreparedEngram:
     def __init__(self, layer, weights, tables, source, output, metadata, pool, *, scratch, session, name, workspace,
-                 runtime=None, coordinator=None, examples=None, defer_reduce_functional=False):
+                 runtime=None, coordinator=None, examples=None, defer_reduce_functional=False, row_shard=None,
+                 min_gather_chunks: int = 1):
         self.pool = pool
         tokens, device = metadata.token_ids.numel(), source.device
         self.mask, self.gathered, self.projected = scratch.mask, scratch.gathered, scratch.projected
@@ -233,16 +234,32 @@ class PreparedEngram:
             and "projection_full" in weights
             and tokens >= 512
         )
+        self.row_shard = True if (row_shard is not None and self.use_all_gather) else None
+        if self.row_shard is not None:
+            rank, half_tokens, shard_rows = row_shard
+            if 2 * half_tokens != tokens or shard_rows <= 0 or rank < 0 or (rank + 1) * shard_rows > half_tokens:
+                raise ValueError("Engram row shard must partition both microbatch halves within the chunk")
+            s0 = rank * shard_rows
+            self.row_shard_indices = persistent_copy(torch.cat((
+                torch.arange(s0, s0 + shard_rows, dtype=torch.int64, device=device),
+                torch.arange(half_tokens + s0, half_tokens + s0 + shard_rows, dtype=torch.int64, device=device),
+            )))
+            mix_tokens = 2 * shard_rows
+        else:
+            self.row_shard_indices = None
+            mix_tokens = tokens
         self.gather_parts = ()
         self.gather_bounds = ()
         if self.use_all_gather:
+            if type(min_gather_chunks) is not int or min_gather_chunks < 1:
+                raise ValueError("Engram min_gather_chunks must be a positive integer")
             world = tables.shard.world_size
             local_cols = 6144 // world
             max_rows = runtime.shard_capacity // (local_cols * 2)
             if max_rows < 1:
                 raise ValueError("DMA runtime shard capacity is too small for Engram all-gather")
-            chunks = max(1, (tokens + max_rows - 1) // max_rows)
-            step = (tokens + chunks - 1) // chunks
+            chunks = max(min_gather_chunks, (tokens + max_rows - 1) // max_rows)
+            step = min(max_rows, (tokens + chunks - 1) // chunks)
             self.gather_bounds = tuple((start, min(start + step, tokens)) for start in range(0, tokens, step))
             self.gather_parts = tuple(
                 PreparedAllGather(
@@ -256,7 +273,8 @@ class PreparedEngram:
             if not defer_reduce_functional:
                 for part in self.gather_parts:
                     part.functional(session=session)
-            self.projection = QuantizedProjection(self.gathered, weights["projection_full"], self.projected,
+            self.projection = QuantizedProjection(
+                self.gathered[:mix_tokens], weights["projection_full"], self.projected[:mix_tokens],
                 session=session, name=name + ".projection", workspace=workspace, activation_mode="auto",
                 examples=examples, example_role="engram.projection").functional(session=session)
             self.reduce = None
@@ -270,12 +288,12 @@ class PreparedEngram:
                 self.reduce.functional(session=session)
         self.norm_weight = weights["weight"].view(-1)
         self.eps = pool.config.text["rms_norm_eps"]
-        self.mix_plan = hyperconnection.plan(hyperconnection.Caps(device=device, max_tokens=tokens, hidden_size=5120),
+        self.mix_plan = hyperconnection.plan(hyperconnection.Caps(device=device, max_tokens=mix_tokens, hidden_size=5120),
             invocation={"operation": "engram_mix", "eps": self.eps, "token_mask": True})
-        projected, mask = self.projected, self.mask
+        projected, mask = self.projected[:mix_tokens], self.mask[:mix_tokens]
         declare(session, (self.mix_plan.request(name=name + ".mix", prepare_call=lambda state: PreparedCall(
-            run=lambda: state.launch(source.view(tokens, -1), projected, self.norm_weight,
-                                      mask, output.view(tokens, -1), eps=self.eps))),))
+            run=lambda: state.launch(source[:mix_tokens].view(mix_tokens, -1), projected, self.norm_weight,
+                                      mask, output[:mix_tokens].view(mix_tokens, -1), eps=self.eps))),))
         self.mask = self.gathered = self.projected = self.local = self.partial = None
 
     def lookup_local(self, source, metadata):
@@ -285,6 +303,8 @@ class PreparedEngram:
     def project_gathered(self, gathered_chunks):
         reordered = [chunk.permute(1, 0, 2).reshape(chunk.shape[1], 6144) for chunk in gathered_chunks]
         full = reordered[0].contiguous() if len(reordered) == 1 else torch.cat(reordered, dim=0)
+        if self.row_shard_indices is not None:
+            full = torch.index_select(full, 0, self.row_shard_indices)
         return self.projection(full)
 
     def project(self, source, metadata):
@@ -293,6 +313,8 @@ class PreparedEngram:
 
     def mix(self, source, projected, metadata):
         mask = (metadata.positions >= 0) & (metadata.token_ids < 129280)
+        if self.row_shard_indices is not None:
+            mask = torch.index_select(mask, 0, self.row_shard_indices)
         output = torch.empty_like(source)
         hyperconnection.run_engram_mix(source.view(source.shape[0], -1), projected, self.norm_weight,
             eps=self.eps, plan=self.mix_plan, out=output.view(source.shape[0], -1), token_mask=mask)

@@ -5,7 +5,7 @@
 """Prepare a single- or multi-rank Gemma 4 text and Assistant MTP graph catalog."""
 
 import contextlib
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 import hashlib
 import json
 from pathlib import Path
@@ -64,20 +64,27 @@ from .decoder import PreparedDecoder, Scratch, SoftcappedResume
 from .pool import ContinuationPool, continuation_layout, page_bytes
 from .speculative import PreparedContext, PreparedRound
 from .weights import ModelWeights
+from .recipe import Gemma4Parameters, RECIPE
 from ignition.preparation.bootstrap import BasePreparationConfig
+
+
+def _default_parameters() -> Gemma4Parameters:
+    return RECIPE.parameters
 
 
 @dataclass(frozen=True)
 class PreparationConfig(BasePreparationConfig):
-    prompt_logprobs: bool = False
+    parameters: Gemma4Parameters = field(default_factory=_default_parameters)
     device: int = 0
     devices: tuple[int, ...] | None = None
     hosts: tuple[str, ...] | None = None
-    roce_ring: bool = False
-    roce_chain: bool = False
     minimum_pages: int = 8
     hub_cache: Path | None = None
     draft_checkpoint: Path | None = None
+
+    @property
+    def native_dense_activations(self) -> bool:
+        return self.parameters.native_dense_activations.enabled
 
     @property
     def speculative_shapes(self):
@@ -92,6 +99,8 @@ class PreparationConfig(BasePreparationConfig):
         return max((b * w for b, w in self.speculative_shapes), default=request_capacity(self.max_active))
 
     def __post_init__(self):
+        if not isinstance(self.parameters, Gemma4Parameters):
+            raise TypeError("Gemma 4 PreparationConfig requires Gemma4Parameters")
         if self.mtp_only and (self.draft_checkpoint is None
                 or max(self.speculative_widths, default=1) <= 1 or self.speculative_fixed_width == 1):
             raise ValueError("--mtp-only requires enabled learned speculation with positive draft depth")
@@ -238,7 +247,7 @@ def prepare_rank(snapshot, config, *, rank=0, group=None, progress=None, core_st
             )
         elif group is not None:
             collective = create_all_reduce_runtime(
-                group, device, collective_tuning=config.collective_tuning, max_tokens=tokens, hidden_size=weights.config.hidden, ipc=ipc
+                group, device, max_tokens=tokens, hidden_size=weights.config.hidden, ipc=ipc
             )
             prefill_collective = create_dma_all_reduce_runtime(
                 group,
@@ -273,7 +282,6 @@ def prepare_rank(snapshot, config, *, rank=0, group=None, progress=None, core_st
             ).encode()
         ).hexdigest()
         session = RecordedPreparationSession(
-            collective_tuning=config.collective_tuning, collective_ladder=config.collective_ladder,
             compile_workers=config.compile_workers, autotune_effort=config.autotune_effort,
             native_dense_activations=config.native_dense_activations, lock_gpu_clocks=config.lock_gpu_clocks,
             tuning_replica=config.tuning_replica,

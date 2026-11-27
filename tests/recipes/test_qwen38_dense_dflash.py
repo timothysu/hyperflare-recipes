@@ -135,25 +135,37 @@ def test_complete_ring_and_target_page_geometry(config):
 
 
 def test_parallel_speculative_catalog_and_explicit_ordinary_mode():
+    from ignition.parameters import SpeculationParameters
     from hyperflare_recipes.recipes.qwen38_dense.bootstrap import PreparationConfig
+
     recipe = resolve("qwen3.8-27b").recipe
     assert recipe.speculation.draft_tokens == 7
     assert recipe.max_draft_tokens == 15
     assert recipe.speculation.adaptive and recipe.speculation.packed_verification
     assert recipe.speculation.token_capacity == 128
     assert (recipe.concurrency, recipe.max_concurrency) == (32, 64)
-    config = PreparationConfig(draft_snapshot=Path("draft"), max_active=32)
+    base = PreparationConfig(draft_snapshot=Path("draft")).parameters
+    config = PreparationConfig(draft_snapshot=Path("draft"), parameters=replace(base, max_concurrency=32))
     shapes = config.speculative_round_shapes
     assert {(batch, 1, batch) for batch in (1, 2, 4, 8, 16, 32)} <= set(shapes)
     assert any(batch == 32 and width == 8 and packed == 128 for batch, width, packed in shapes)
     assert all(packed <= 128 for _, _, packed in shapes)
     assert sum(width > 1 for _, width, _ in shapes) <= 64
     assert config.speculative_graph_budget == 64
-    assert PreparationConfig(mtp=False).speculative_round_shapes == ()
-    fixed = PreparationConfig(draft_snapshot=Path("draft"), speculative_fixed_width=4)
+    assert PreparationConfig(parameters=replace(base, speculation=None)).speculative_round_shapes == ()
+    fixed = PreparationConfig(
+        draft_snapshot=Path("draft"),
+        parameters=replace(base, speculation=replace(base.speculation, draft_tokens=3, adaptive=False)),
+    )
     assert {width for _, width, _ in fixed.speculative_round_shapes} == {1, 4}
     with pytest.raises(ValueError):
-        PreparationConfig(draft_snapshot=Path("draft"), speculative_widths=(1, 17))
+        PreparationConfig(
+            draft_snapshot=Path("draft"),
+            parameters=replace(
+                base,
+                speculation=SpeculationParameters(draft_tokens=16, max_draft_tokens=16, token_capacity=128),
+            ),
+        )
 
 
 @pytest.mark.parametrize("location", ["decoder", "projector"])
@@ -192,28 +204,35 @@ def test_pinned_checkpoint_metadata_rejects_precision_and_non_square_shape_error
 @pytest.mark.parametrize("head", [None, "mxfp8", "nvfp4"])
 def test_qad_precision_options_reach_preparation_plan(online, head):
     from ignition import planning
-    from ignition.cli import _parser
-    from ignition.cli.preparation import speculation
+    from ignition.cli import parse_args
+    from ignition.cli.preparation import resolve_parameters
+    from hyperflare_recipes.recipes import recipes
     from hyperflare_recipes.recipes.qwen38_dense.bootstrap import PreparationConfig
 
     flags = (["--online-mxfp8"] if online else []) + (["--draft-head-quantization", head] if head else [])
-    args = _parser().parse_args(["bench", "qwen3.8-27b-qad", *flags])
+    args = parse_args(["bench", "qwen3.8-27b-qad", *flags], recipes=recipes())
     model = resolve(args.model)
     assert model.checkpoint.repository == "local-inference-lab/Qwen3.8-27B-NVFP4-QAD"
     assert model.checkpoint.revision == "b9389787cbb5a09fbcf3517bdf673b5a56b16b02"
     assert resolve("qwen3.8-27b").checkpoint.repository == "nvidia/Qwen3.8-27B-NVFP4"
     gpus = (planning.Gpu(0, "SM120", "GPU-0", 96 << 30, 95 << 30, (12, 0)),)
-    plan = planning.fit(model.recipe, model.checkpoint, gpus, concurrency=1, reserve_bytes=0,
-                        online_mxfp8=args.online_mxfp8, speculation=speculation(args, model))
-    assert plan.online_mxfp8 == online
-    assert plan.speculation.draft_head_quantization == head
+    params = replace(resolve_parameters(model, args), max_concurrency=1)
+    plan = planning.fit(model.recipe, model.checkpoint, gpus, parameters=params, reserve_bytes=0)
+    assert plan.parameters.online_mxfp8.enabled == online
+    assert plan.parameters.draft_quantization.draft_head_quantization == head
     assert plan.to_dict()["online_mxfp8"] == online
     assert plan.to_dict()["speculation"]["draft_head_quantization"] == head
-    config = PreparationConfig(draft_snapshot=Path("draft"), online_mxfp8=online, draft_head_quantization=head)
+    base = PreparationConfig(draft_snapshot=Path("draft")).parameters
+    cfg_params = replace(
+        base,
+        online_mxfp8=replace(base.online_mxfp8, enabled=online),
+        draft_quantization=replace(base.draft_quantization, draft_head_quantization=head),
+    )
+    config = PreparationConfig(draft_snapshot=Path("draft"), parameters=cfg_params)
     assert config.online_mxfp8 == online and config.draft_head_quantization == head
     if head:
         with pytest.raises(ValueError, match="requires DFlash2"):
-            PreparationConfig(mtp=False, draft_head_quantization=head)
+            PreparationConfig(parameters=replace(cfg_params, speculation=None))
 
 
 @pytest.mark.parametrize("width", [1, 8, 16])
@@ -233,6 +252,8 @@ def test_native_depth_sizes_proposal_and_recovery_storage(config, width):
         completion=None, frame=None, sequence=None, session=None, workspace=None,
         verification_width=width)
     assert owner.study_width is None
+    assert owner.block_proposal_broadcast is True
+    assert owner.forwards.draft.keywords["shortlist_only"] is True
     assert owner.block_size == owner.draft_scratch.block_size == width
     assert (owner.draft_scratch.tokens, owner.draft_scratch.hidden_size) == (2 * width, config.hidden)
     assert owner.records.delta.shape == (48, 2, 48, width, 128)
@@ -250,9 +271,18 @@ def test_native_depth_sizes_proposal_and_recovery_storage(config, width):
 def test_native_depth_catalog_preserves_logical_and_packed_capacities(width, capacity):
     from hyperflare_recipes.recipes.qwen38_dense.bootstrap import PreparationConfig
 
-    config = PreparationConfig(draft_snapshot=Path("draft"), max_active=8,
-        speculative_widths=tuple(range(1, width + 1)), speculative_token_capacity=capacity,
-        speculative_graph_budget=64)
+    base = PreparationConfig(draft_snapshot=Path("draft")).parameters
+    spec = replace(
+        base.speculation,
+        draft_tokens=width - 1,
+        token_capacity=capacity,
+        packed_verification=width > 1,
+        graph_budget=64 if width > 1 else None,
+    )
+    config = PreparationConfig(
+        draft_snapshot=Path("draft"),
+        parameters=replace(base, max_concurrency=8, speculation=spec),
+    )
     shapes = config.speculative_round_shapes
     assert config.verification_width == width
     assert {(b, 1, b) for b in (1, 2, 4, 8)} <= set(shapes)

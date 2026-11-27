@@ -14,6 +14,7 @@ from transformers.models.radio.modeling_radio import RadioLayer
 from hyperflare_recipes.components.linear import UnquantizedProjection
 from hyperflare_recipes.components.varlen_attention import PreparedVarlenAttention
 from ignition.preparation.examples import declaration_tensor
+from ignition.preparation.tensor_metadata import record_numeric_tensor
 from hyperflare_recipes.components.weights import DirectWeightLoader
 from ignition.preparation.rebuild_manifest import weight_container
 
@@ -26,20 +27,28 @@ PIXEL_WIDTH = 3 * 16 * 16
 PREFIX = "vision_model.radio_model.model."
 
 
+FINAL_NORM_PREFIX = "vision_projector.vision_final_layernorm."
+
+
 @dataclass(frozen=True)
 class VisionConfig:
     radio: dict
     projector_hidden: int
     hidden: int
+    final_layernorm: bool = False
 
     @classmethod
     def from_dict(cls, raw):
         required = dict(downsample_ratio=0.5, patch_size=16, ps_version="v2",
-                        vit_hidden_size=1280,
-                        vision_final_layernorm=False)
+                        vit_hidden_size=1280)
         for key, expected in required.items():
             if raw.get(key) != expected:
                 raise ValueError(f"unsupported C-RADIO {key}: {raw.get(key)!r}")
+        final_norm = raw.get("vision_final_layernorm")
+        if final_norm is None:
+            final_norm = bool((raw["llm_config"].get("num_nextn_predict_layers") or 0) > 0)
+        elif type(final_norm) is not bool:
+            raise ValueError(f"unsupported C-RADIO vision_final_layernorm: {final_norm!r}")
         radio = raw["vision_config"]
         required = dict(hidden_size=1280, num_attention_heads=16, num_hidden_layers=32,
                         mlp_ratio=4.0, patch_size=16, num_channels=3, max_img_size=2048,
@@ -51,7 +60,7 @@ class VisionConfig:
                 raise ValueError(f"unsupported RADIO {key}: {radio.get(key)!r}")
         if raw.get("projector_hidden_size") != 20480 or raw["llm_config"]["hidden_size"] != HIDDEN:
             raise ValueError("C-RADIO projector requires widths 5120, 20480, and 4096")
-        return cls(radio, raw["projector_hidden_size"], HIDDEN)
+        return cls(radio, raw["projector_hidden_size"], HIDDEN, final_layernorm=final_norm)
 
 
 @weight_container(('tensors', 'patch'))
@@ -64,13 +73,19 @@ class VisionWeights:
     @classmethod
     def load(cls, manifest, device, progress=None):
         config = VisionConfig.from_dict(json.loads((manifest.snapshot / "config.json").read_text()))
-        with DirectWeightLoader(manifest, device, prefixes=(PREFIX, "mlp1."), progress=progress) as loader:
+        prefixes = (PREFIX, "mlp1.") + ((FINAL_NORM_PREFIX,) if config.final_layernorm else ())
+        with DirectWeightLoader(manifest, device, prefixes=prefixes, progress=progress) as loader:
             names = sorted(name for name in loader._selected_names() if not name.endswith("video_embedder.weight"))
             tensors = dict(zip(names, loader.load_tensors(names), strict=True))
         stem = PREFIX + "patch_generator."
         patch = tensors.pop(stem + "embedder.weight")
         if patch.shape != (VISION_HIDDEN, PIXEL_WIDTH):
             raise ValueError("RADIO image patch projection requires 16 by 16 RGB patches")
+        if config.final_layernorm:
+            for suffix in ("weight", "bias"):
+                tensor = tensors.get(FINAL_NORM_PREFIX + suffix)
+                if tensor is None or tensor.shape != (VISION_HIDDEN,):
+                    raise ValueError(f"C-RADIO vision_final_layernorm.{suffix} requires width {VISION_HIDDEN}")
         if any(t.dtype != torch.bfloat16 for t in (*tensors.values(), patch)):
             raise ValueError("RADIO projections and normalization parameters require BF16 storage")
         return cls(config, tensors, patch)
@@ -139,12 +154,18 @@ class VisionScratch:
 
 
 class _Projection(nn.Module):
-    def __init__(self, weight, source, output, *, session, name, bias=None):
+    def __init__(self, weight, source, output, *, session, name, bias=None, separate_bias=False):
         super().__init__()
+        self.post_bias = None
+        if separate_bias and bias is not None:
+            record_numeric_tensor(bias)
+            self.post_bias = bias
+            bias = None
         self.operation = UnquantizedProjection(source, weight, output, session=session, name=name, bias=bias)
 
     def forward(self, source):
-        return self.operation(source)
+        value = self.operation(source)
+        return value if self.post_bias is None else value + self.post_bias
 
     def functional(self, *, session):
         self.operation.functional(session=session)
@@ -157,8 +178,10 @@ class _Attention(nn.Module):
         s = scratch
         self.qkv = _Projection(weights["attn.qkv.weight"], s.hidden, s.qkv, session=session,
                                name=name + ".qkv", bias=weights["attn.qkv.bias"])
+        # Unbiased GEMM + residual-fused bias avoids cuBLASLt's fused-bias epilogue regression at 1024+10 rows.
         self.output = _Projection(weights["attn.proj.weight"], s.attended, s.projected, session=session,
-                                  name=name + ".output", bias=weights["attn.proj.bias"])
+                                  name=name + ".output", bias=weights["attn.proj.bias"],
+                                  separate_bias=s.patches.shape[0] <= 1024)
         self.attend = PreparedVarlenAttention(s.query, s.key, s.value, cu, s.attended.view_as(s.query),
                                              session=session, workspace=workspace, name=name + ".attention")
 
@@ -211,10 +234,15 @@ class PreparedVision:
             block.attention = _Attention(w, s, cu, session=session, workspace=workspace, name=f"{name}.{layer}")
             block.mlp.fc1 = _Projection(w["mlp.fc1.weight"], s.hidden, s.mlp_up,
                 session=session, name=f"{name}.{layer}.up", bias=w["mlp.fc1.bias"])
+            # Unbiased fc2 avoids cuBLASLt's 4-5x fused-bias epilogue slowdown on [M, 5120] -> 1280.
             block.mlp.fc2 = _Projection(w["mlp.fc2.weight"], s.mlp_up, s.projected,
-                session=session, name=f"{name}.{layer}.down", bias=w["mlp.fc2.bias"])
+                session=session, name=f"{name}.{layer}.down", bias=w["mlp.fc2.bias"], separate_bias=True)
             block.eval()
             self.blocks.append(block)
+        self.final_norm = (
+            _norm(tensors[FINAL_NORM_PREFIX + "weight"], tensors[FINAL_NORM_PREFIX + "bias"], config.layer_norm_eps)
+            if weights.config.final_layernorm else None
+        )
         self.projector_norm = tensors["mlp1.0.weight"]
         self.up = UnquantizedProjection(s.merged, tensors["mlp1.1.weight"], s.activated,
                                        session=session, name=name + ".projector_up")
@@ -240,7 +268,10 @@ class PreparedVision:
         hidden = torch.cat((self.registers, self.patch(patches) + positions), dim=0)
         for block in self.blocks:
             hidden = block(hidden, attention_mask=cu)
-        merged = hidden[REGISTER_TOKENS:][merge_indices].flatten(1).float()
+        features = hidden[REGISTER_TOKENS:]
+        if self.final_norm is not None:
+            features = self.final_norm(features)
+        merged = features[merge_indices].flatten(1).float()
         merged = merged * torch.rsqrt(merged.square().mean(-1, keepdim=True) + 1e-5)
         merged = (merged * self.projector_norm.float()).to(torch.bfloat16)
         activated = torch.relu(self.up(merged))

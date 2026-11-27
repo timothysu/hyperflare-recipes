@@ -57,7 +57,16 @@ def test_projection_scopes_separate_tuning_namespaces():
 
 @pytest.mark.parametrize("scope,online", [("unsupported", True), ("kda-input", False)])
 def test_preparation_rejects_inconsistent_conversion_scope(scope, online):
+    from dataclasses import replace
+    from hyperflare_recipes.parameters import OnlineMXFP8Parameters
     from hyperflare_recipes.recipes.kimi3.bootstrap import PreparationConfig
 
+    base = PreparationConfig().parameters
+    params = replace(
+        base,
+        online_mxfp8=OnlineMXFP8Parameters(
+            enabled=online, scope=scope, default_scope="all", supported_scopes=("all", "kda-input"),
+        ),
+    )
     with pytest.raises(ValueError, match="scope"):
-        PreparationConfig(online_mxfp8=online, online_mxfp8_scope=scope)
+        PreparationConfig(parameters=params)

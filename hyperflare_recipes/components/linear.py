@@ -20,17 +20,18 @@ from hyperflare_recipes.fixtures import blockscaled_gemm as gemm_fixtures
 from hyperflare_recipes.fixtures.projection import input_factory
 from ignition.preparation.scratch import ScratchArena, prime_owners, scratch_storage
 from ignition.preparation.tensor_metadata import record_numeric_tensor
-from ignition.preparation.tuning import benchmark_resource, declare, register_context_plan, register_finalizer
+from ignition.preparation.tuning import benchmark_resource, declare, register_finalizer
 
 
 def prepare_projection(source, weight, output, *, session, name, workspace, activation_mode="auto", staging=None,
                        bias=None):
     """Bind a projection without changing its checkpoint weight representation."""
     from .block_fp8 import BlockFP8Projection, BlockFP8Weight
+    from .tensor_fp8 import TensorFP8Projection, TensorFP8Weight
     from .weights import GroupedLinearWeights
 
-    if bias is not None and isinstance(weight, (GroupedLinearWeights, BlockFP8Weight)):
-        raise ValueError(f"{name}: bias is not supported for grouped or block-FP8 projections")
+    if bias is not None and isinstance(weight, (GroupedLinearWeights, BlockFP8Weight, TensorFP8Weight)):
+        raise ValueError(f"{name}: bias is not supported for grouped, block-FP8, or tensor-FP8 projections")
     if isinstance(weight, GroupedLinearWeights):
         return PreparedProjectionGroup(source, weight, output, session=session, name=name, workspace=workspace,
                                        activation_mode=activation_mode, staging=staging)
@@ -38,6 +39,8 @@ def prepare_projection(source, weight, output, *, session, name, workspace, acti
         return UnquantizedProjection(source, weight, output, session=session, name=name, bias=bias)
     if isinstance(weight, BlockFP8Weight):
         return BlockFP8Projection(source, weight, output, session=session, name=name)
+    if isinstance(weight, TensorFP8Weight):
+        return TensorFP8Projection(source, weight, output, session=session, name=name)
     return QuantizedProjection(source, weight, output, session=session, name=name,
                                workspace=workspace, activation_mode=activation_mode, bias=bias)
 
@@ -47,13 +50,14 @@ class PreparedProjectionGroup:
 
     def __init__(self, source, weight, output, *, session, name, workspace, activation_mode, staging):
         from .block_fp8 import BlockFP8Weight
+        from .tensor_fp8 import TensorFP8Weight
 
         self.output = output
         self.widths = weight.widths
         self.projections, self.copies = [], []
         for index, (part, target) in enumerate(zip(weight.parts, output.split(weight.widths, dim=-1), strict=True)):
             destination = target
-            if not isinstance(part, (torch.Tensor, BlockFP8Weight)) and not target.is_contiguous():
+            if not isinstance(part, (torch.Tensor, BlockFP8Weight, TensorFP8Weight)) and not target.is_contiguous():
                 if (staging is None or not staging.is_contiguous() or staging.numel() < target.numel()
                         or staging.dtype != target.dtype or staging.device != target.device):
                     raise ValueError("mixed packed projections require caller-owned contiguous staging")
@@ -364,7 +368,6 @@ class QuantizedProjection:
             requests.append(self.plan.request(name=name,
                 prepare_call=prepare_projection, benchmark_call=benchmark_projection))
             declare(session, tuple(requests))
-            register_context_plan(session, name, self)
             register_finalizer(session, lambda: setattr(self, "workspace", selected_workspace()), workspace=workspace)
             return
         if self.sm103:
@@ -622,6 +625,18 @@ def _fake_parallel_mx_projections(source, values, scales, outputs, workspaces, p
 class ParallelProjections:
     """Two prepared MX projections with explicit storage and a captured join."""
 
+    @staticmethod
+    def supports(*projections) -> bool:
+        from b12x.gemm.blockscaled._a16 import _weight_parts
+
+        for projection in projections:
+            if not isinstance(projection, QuantizedProjection) or projection.bias is not None:
+                return False
+            values, _, gain, fp4 = _weight_parts(projection.weight)
+            if values.dtype not in (torch.float8_e4m3fn, torch.uint8) or gain is not None or fp4:
+                return False
+        return bool(projections)
+
     def __init__(self, main: QuantizedProjection, auxiliary: QuantizedProjection, *, session,
                  workspace: ScratchArena):
         from b12x.gemm.blockscaled._a16 import _weight_parts
@@ -662,6 +677,16 @@ class ParallelProjections:
                                 workspaces, self.plans, self.stream_handle)
         if self.outputs is None:
             return tuple(outputs)
+
+    def allocate_runtime(self, source):
+        """Allocate disjoint output and workspace tensors for fused projection overlap."""
+        outputs, workspaces = self.outputs, self.workspaces
+        if outputs is None:
+            outputs = [torch.empty_strided(shape, stride, dtype=dtype, device=source.device)
+                       for shape, stride, dtype in self.output_layouts]
+            workspaces = [torch.empty(size, dtype=torch.uint8, device=source.device)
+                          for size in self.workspace_sizes]
+        return list(outputs), list(workspaces)
 
     def functional(self, *, session):
         """Allocate disjoint branch buffers while preserving the prepared fork and join."""

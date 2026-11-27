@@ -41,37 +41,72 @@ def test_dflash_rings_belong_to_complete_continuation_rows(world):
 
 
 def test_dflash_preparation_options_validate_before_weight_loading():
-    base = dict(mtp=True, speculative_method="dflash2", draft_snapshot=Path("draft"))
-    config = PreparationConfig(**base, online_mxfp8=True, draft_head_quantization="nvfp4",
-                               force_moe_decode_a16=True)
+    from dataclasses import replace
+    from ignition.parameters import MixedPrefillParameters
+
+    base_params = PreparationConfig().parameters
+    dflash_params = replace(
+        base_params,
+        speculation=replace(RECIPE.speculation, method="dflash2"),
+    )
+    config = PreparationConfig(
+        parameters=replace(
+            dflash_params,
+            online_mxfp8=replace(dflash_params.online_mxfp8, enabled=True),
+            draft_quantization=replace(dflash_params.draft_quantization, draft_head_quantization="nvfp4"),
+            force_moe_decode_a16=True,
+        ),
+        draft_snapshot=Path("draft"),
+    )
     assert config.speculative_method == "dflash2" and config.online_mxfp8
     with pytest.raises(ValueError, match="at least one state row"):
-        PreparationConfig(**base, snapshot_budget_bytes=142_821_119)
+        PreparationConfig(parameters=dflash_params, draft_snapshot=Path("draft"), snapshot_budget_bytes=142_821_119)
     with pytest.raises(ValueError, match="separate prefill"):
-        PreparationConfig(**base, mixed_prefill=True)
+        PreparationConfig(
+            parameters=replace(dflash_params, mixed_prefill=MixedPrefillParameters(enabled=True)),
+            draft_snapshot=Path("draft"),
+        )
+    mtp_params = replace(base_params, speculation=RECIPE.speculation)
     with pytest.raises(ValueError, match="require DFlash2"):
-        PreparationConfig(mtp=True, online_mxfp8=True)
+        PreparationConfig(parameters=replace(mtp_params, online_mxfp8=replace(mtp_params.online_mxfp8, enabled=True)))
     with pytest.raises(ValueError, match="require DFlash2"):
-        PreparationConfig(mtp=True, draft_head_quantization="mxfp8")
+        PreparationConfig(
+            parameters=replace(
+                mtp_params,
+                draft_quantization=replace(mtp_params.draft_quantization, draft_head_quantization="mxfp8"),
+            )
+        )
 
 
 def test_prefix_identity_separates_draft_context_and_target_arithmetic():
     from dataclasses import replace
+    from hyperflare_recipes.parameters import NativeDenseActivationsParameters
     from hyperflare_recipes.recipes.qwen38.bootstrap import _identity
 
     manifest = SimpleNamespace(headers_sha256={"model": "header"},
                                metadata_sha256={"config.json": "config"})
     draft = SimpleNamespace(text={"hidden_size": 2560, "sliding_window": 2048})
     ordinary = PreparationConfig()
-    mtp = replace(ordinary, mtp=True)
-    dflash = replace(mtp, speculative_method="dflash2", draft_snapshot=Path("draft"))
+    mtp = replace(ordinary, parameters=replace(ordinary.parameters, speculation=RECIPE.speculation))
+    dflash = replace(
+        mtp,
+        parameters=replace(mtp.parameters, speculation=replace(RECIPE.speculation, method="dflash2")),
+        draft_snapshot=Path("draft"),
+    )
     def identity(config, draft_config=None):
         return _identity(manifest, config=config, draft_config=draft_config)
     baseline = identity(dflash, draft)
-    variants = [identity(ordinary), identity(mtp), baseline,
-        identity(replace(dflash, online_mxfp8=True), draft),
-        identity(replace(dflash, force_moe_decode_a16=True), draft),
-        identity(replace(dflash, native_dense_activations=True), draft),
-        identity(dflash, SimpleNamespace(text={"hidden_size": 2560, "sliding_window": 1024}))]
+    variants = [
+        identity(ordinary),
+        identity(mtp),
+        baseline,
+        identity(replace(dflash, parameters=replace(dflash.parameters, online_mxfp8=replace(dflash.parameters.online_mxfp8, enabled=True))), draft),
+        identity(replace(dflash, parameters=replace(dflash.parameters, force_moe_decode_a16=True)), draft),
+        identity(replace(dflash, parameters=replace(dflash.parameters, native_dense_activations=NativeDenseActivationsParameters(enabled=True))), draft),
+        identity(dflash, SimpleNamespace(text={"hidden_size": 2560, "sliding_window": 1024})),
+    ]
     assert len(set(variants)) == len(variants)
-    assert identity(replace(dflash, speculative_widths=(1,)), draft) == baseline
+    assert identity(
+        replace(dflash, parameters=replace(dflash.parameters, speculation=replace(dflash.parameters.speculation, draft_tokens=0))),
+        draft,
+    ) == baseline

@@ -56,13 +56,26 @@ def test_windowed_draft_planner_and_state(config, snapshot):
 
 
 def test_recipe_selects_the_windowed_draft_and_records_its_precision(tmp_path, monkeypatch):
-    from ignition.preparation.rebuild_manifest import from_plan
+    from google.protobuf import json_format
+    from ignition import planning
+    from ignition.preparation import rebuild_manifest, runtime_core_pb2 as proto
     from hyperflare_recipes.recipes import resolve
-    from .test_declarations import fitted
 
     model = resolve("kimi-k3.1-pro")
-    spec = replace(RECIPE.speculation, method="dspark", draft_head_quantization="nvfp4", markov_head_quantization="fp8")
-    plan = fitted(model, 16, concurrency=1, speculation=spec, online_mxfp8=True, online_mxfp8_scope="all")
+    devices = tuple(planning.Gpu(index, "NVIDIA RTX PRO 6000 Blackwell", f"GPU-{index}", 96 << 30, 95 << 30, (12, 0))
+                    for index in range(16))
+    params = replace(
+        RECIPE.parameters,
+        max_concurrency=1,
+        speculation=replace(RECIPE.speculation, method="dspark"),
+        online_mxfp8=replace(RECIPE.parameters.online_mxfp8, enabled=True, scope="all"),
+        draft_quantization=replace(
+            RECIPE.parameters.draft_quantization,
+            draft_head_quantization="nvfp4",
+            markov_head_quantization="fp8",
+        ),
+    )
+    plan = planning.fit(model.recipe, model.checkpoint, devices, parameters=params, reserve_bytes=0)
     calls = []
     monkeypatch.setattr("huggingface_hub.snapshot_download",
                         lambda repository, **kw: calls.append((repository, kw["revision"])) or str(tmp_path / "draft"))
@@ -72,9 +85,14 @@ def test_recipe_selects_the_windowed_draft_and_records_its_precision(tmp_path, m
     assert prepared.speculative_method == "dspark"
     assert prepared.draft_head_quantization == "nvfp4" and prepared.markov_head_quantization == "fp8"
     assert prepared.snapshot_budget_bytes == plan.snapshots * 35_122_432
-    settings = from_plan(model, plan, compiled_forwards=True)["speculation"]
-    assert (settings["method"], settings["draft_head_quantization"], settings["markov_head_quantization"]) == (
-        "dspark", "nvfp4", "fp8")
+    encoded = proto.PreparationManifest()
+    json_format.ParseDict(rebuild_manifest.from_plan(model, plan, compiled_forwards=True), encoded)
+    values = {p.key: p.value for p in encoded.parameters}
+    assert (
+        values["speculation.method"].string_value,
+        values["speculation.draft_head_quantization"].string_value,
+        values["speculation.markov_head_quantization"].string_value,
+    ) == ("dspark", "nvfp4", "fp8")
 
 
 @pytest.mark.skipif(os.environ.get("FLARE_RUN_CUDA_TESTS") != "1", reason="requires an assigned CUDA device")

@@ -16,11 +16,11 @@ from hyperflare_recipes.components.gated_delta import GDNScratch, PreparedGDN
 from hyperflare_recipes.components.head_gate import PreparedHeadGate
 from hyperflare_recipes.components.linear import QuantizedProjection, prepare_projection
 from hyperflare_recipes.components.gdn_recovery import GDNLayerRecords, PreparedGDNCommit
-from hyperflare_recipes.components.paged_attention import PreparedPagedAttention, PreparedPagedKVWriter
+from hyperflare_recipes.components.paged_attention import PreparedPagedAttention
 from hyperflare_recipes.components.paged_batch import rotary_offset_region, rotary_positions
 from hyperflare_recipes.components.recurrent import DeltaMetadata, _commit_convolution
 from hyperflare_recipes.components.rms_norm import PreparedRMSNorm
-from hyperflare_recipes.components.head_norm_rope import head_norm_rope
+from hyperflare_recipes.components.head_norm_rope import qk_head_norm_rope_kv_write
 from hyperflare_recipes.components.tensor_fp8 import TensorFP8Projection, TensorFP8Weight
 from hyperflare_recipes.components.vocabulary import PreparedVocabularyProjection
 from ignition.preparation.quantization import linear_format
@@ -140,17 +140,24 @@ class RMSNorm(torch.nn.Module):
 class ResidualNormalizedLayer(torch.nn.Module):
     """Compute attention and MLP branches with prepared residual normalization."""
 
-    def __init__(self, layer):
+    def __init__(self, layer, *, cache_only=False):
         super().__init__()
         self.layer = layer
         self.next_input_layernorm = None
+        self.cache_only = bool(cache_only)
 
-    def forward(self, hidden_states, normalized, position_embeddings, records=None, *, metadata, delta):
+    def forward(self, hidden_states, normalized, position_embeddings, records=None, *, metadata, delta,
+                slots=None, lengths=None):
         layer = self.layer
+        if self.cache_only:
+            layer.self_attn.write_cache(normalized, position_embeddings=position_embeddings,
+                                        metadata=metadata, slots=slots, lengths=lengths)
+            return hidden_states, None
         if layer.block_type == "linear_attention":
             attended = layer.linear_attn(normalized, records=records, metadata=delta)
         else:
-            attended, _ = layer.self_attn(normalized, position_embeddings=position_embeddings, metadata=metadata)
+            attended, _ = layer.self_attn(normalized, position_embeddings=position_embeddings,
+                                          metadata=metadata, slots=slots, lengths=lengths)
         normalized = layer.post_attention_layernorm(attended, hidden_states)
         projected = layer.mlp(normalized)
         if self.next_input_layernorm is None:
@@ -183,12 +190,30 @@ def _attention_query_dtype(source, metadata, mode, head_dim):
 
 class FullAttention(torch.nn.Module):
     def __init__(self, module, weights, source, metadata, pool, layer, *, mode, session, workspace, name, buffers,
-                 projection_staging=None):
+                 projection_staging=None, cache_only=False):
         super().__init__()
+        from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5RMSNorm
+
         self.canonical = module
+        self.cache_only = bool(cache_only)
         config = weights.config
         self.heads, self.kv_heads = config.text["num_attention_heads"], config.text["num_key_value_heads"]
         self.dim = config.text["head_dim"]
+        q_norm, k_norm = module.q_norm, module.k_norm
+        if (not isinstance(q_norm, (Qwen3_5RMSNorm, torch.nn.RMSNorm))
+                or type(q_norm) is not type(k_norm)
+                or type(q_norm.eps) not in (int, float)
+                or not (q_norm.eps >= 0)
+                or q_norm.eps != k_norm.eps
+                or q_norm.weight.shape != (self.dim,)
+                or k_norm.weight.shape != (self.dim,)
+                or not q_norm.weight.is_contiguous()
+                or not k_norm.weight.is_contiguous()):
+            raise ValueError(
+                "FullAttention fused Q/K RMSNorm requires matching Qwen3_5RMSNorm or "
+                "torch.nn.RMSNorm modules with contiguous head_dim weights and nonnegative eps"
+            )
+        self._qk_norm_zero_centered = isinstance(q_norm, Qwen3_5RMSNorm)
         tokens, device = source.shape[0], source.device
         self.tokens = tokens
 
@@ -207,8 +232,9 @@ class FullAttention(torch.nn.Module):
             query, gate = (part.view(tokens, self.heads, self.dim) for part in (query, gate))
             inputs = (("qgkv_proj", source, qgkv),)
         else:
-            qg = empty("qg", 2 * self.heads * self.dim)
-            query, gate = qg.view(tokens, self.heads, 2 * self.dim).chunk(2, dim=-1)
+            if not self.cache_only:
+                qg = empty("qg", 2 * self.heads * self.dim)
+                query, gate = qg.view(tokens, self.heads, 2 * self.dim).chunk(2, dim=-1)
             if prefix + "kv_proj" in weights.projections:
                 kv = empty("kv", 2 * self.kv_heads * self.dim)
                 key, value = kv.chunk(2, dim=-1)
@@ -216,12 +242,10 @@ class FullAttention(torch.nn.Module):
             else:
                 key, value = (empty(field, self.kv_heads * self.dim) for field in ("k", "v"))
                 inputs = (("k_proj", source, key), ("v_proj", source, value))
-            inputs = (("q_proj", source, qg), *inputs)
+            if not self.cache_only:
+                inputs = (("q_proj", source, qg), *inputs)
         query_dtype = _attention_query_dtype(source, metadata, mode, self.dim)
         self.query_dtype = query_dtype
-        q = empty("q", self.heads * self.dim, query_dtype).view(tokens, self.heads, self.dim)
-        normalized_key = empty("key", self.kv_heads * self.dim).view(tokens, self.kv_heads, self.dim)
-        attended, output = empty("attended", self.heads * self.dim), empty("output", config.hidden)
         def projection(field, inputs, output):
             weight = weights.projections[prefix + field]
             if isinstance(weight, TensorFP8Weight):
@@ -229,17 +253,38 @@ class FullAttention(torch.nn.Module):
                                            staging=projection_staging).functional(session=session)
             return prepare_projection(inputs, weight, output, session=session, name=name + "." + field,
                                       workspace=workspace).functional(session=session)
+
+        key_cache, value_cache = pool.attention(layer, config)
+        if (key_cache.ndim != 4 or value_cache.shape != key_cache.shape
+                or value_cache.stride() != key_cache.stride()
+                or value_cache.dtype != key_cache.dtype
+                or key_cache.shape[1] != PAGE_TOKENS
+                or key_cache.shape[2:] != (self.kv_heads, self.dim)
+                or key_cache.stride(3) != 1
+                or key_cache.dtype not in (torch.float8_e4m3fn, torch.bfloat16)):
+            raise ValueError("FullAttention requires matching 4D [pages, PAGE_TOKENS, kv_heads, head_dim] FP8/BF16 KV caches")
+        self.key_cache, self.value_cache = key_cache, value_cache
+
+        if self.cache_only:
+            self.input_projections = tuple(field for field, _, _ in inputs)
+            self.projections = {
+                field: projection(field, proj_in, proj_out)
+                for field, proj_in, proj_out in inputs
+            }
+            self.lengths = None
+            self.attention = None
+            self.output_gate = None
+            return
+
+        q = empty("q", self.heads * self.dim, query_dtype).view(tokens, self.heads, self.dim)
+        attended, output = empty("attended", self.heads * self.dim), empty("output", config.hidden)
         operands = (*inputs, ("o_proj", attended, output))
         self.input_projections = tuple(field for field, _, _ in operands[:-1])
         self.projections = {
-            field: projection(field, inputs, output)
-            for field, inputs, output in operands
+            field: projection(field, proj_in, proj_out)
+            for field, proj_in, proj_out in operands
         }
-        slots = torch.full((tokens,), -1, dtype=torch.int64, device=device)
         self.lengths = torch.zeros_like(metadata.lengths)
-        key_cache, value_cache = pool.attention(layer, config)
-        self.writer = PreparedPagedKVWriter(normalized_key, value.view(tokens, self.kv_heads, self.dim),
-            key_cache, value_cache, slots, session=session, name=name + ".write", caller_owned_placeholders=True).functional()
         self.attention = PreparedPagedAttention(q, key_cache, value_cache, metadata.page_table,
             self.lengths, metadata.query_start_loc, attended.view(tokens, self.heads, self.dim),
             output_gate=gate if mode == "prefill" else None,
@@ -259,43 +304,69 @@ class FullAttention(torch.nn.Module):
                      else gate.view(tokens * self.heads, self.dim))
             self.output_gate = PreparedHeadGate(values, gates, session=session, name=name + ".output_gate").functional(session=session)
 
-    def write_cache(self, hidden_states, position_embeddings, metadata):
-        from transformers.models.qwen3_5.modeling_qwen3_5 import apply_rotary_pos_emb
-
+    def write_cache(self, hidden_states, position_embeddings, metadata, *, slots=None, lengths=None):
         projected = {field: self.projections[field](hidden_states) for field in self.input_projections}
         tokens, heads, kv_heads, dim = self.tokens, self.heads, self.kv_heads, self.dim
         if self.packed:
             query, gate, key, value = projected["qgkv_proj"].split(
                 (heads * dim, heads * dim, kv_heads * dim, kv_heads * dim), dim=-1)
-            query, gate = (part.view(tokens, heads, dim) for part in (query, gate))
+            if not self.cache_only:
+                query, gate = (part.view(tokens, heads, dim) for part in (query, gate))
         else:
-            query, gate = projected["q_proj"].view(tokens, heads, 2 * dim).chunk(2, dim=-1)
+            if not self.cache_only:
+                query, gate = projected["q_proj"].view(tokens, heads, 2 * dim).chunk(2, dim=-1)
             if "kv_proj" in projected:
                 key, value = projected["kv_proj"].chunk(2, dim=-1)
             else:
                 key, value = projected["k_proj"], projected["v_proj"]
-        q = torch.empty((tokens, heads, dim), dtype=self.query_dtype, device=hidden_states.device)
-        normalized_key = torch.empty((tokens, kv_heads, dim), dtype=hidden_states.dtype, device=hidden_states.device)
-        if self.query_dtype == torch.float8_e4m3fn:
-            cosine, sine = position_embeddings
-            head_norm_rope(query, self.canonical.q_norm.weight, cosine, sine, q,
-                           eps=self.canonical.q_norm.eps)
-            head_norm_rope(key.view(-1, kv_heads, dim), self.canonical.k_norm.weight,
-                           cosine, sine, normalized_key, eps=self.canonical.k_norm.eps)
-        else:
-            rotated_query, rotated_key = apply_rotary_pos_emb(self.canonical.q_norm(query),
-                self.canonical.k_norm(key.view(-1, kv_heads, dim)), *position_embeddings)
-            q.copy_(rotated_query)
-            normalized_key.copy_(rotated_key)
         m = metadata
-        page = m.token_page_table.gather(1, (m.positions.clamp(min=0) // PAGE_TOKENS)[:, None]).squeeze(1)
-        slots = torch.where(m.positions >= 0, page.long() * PAGE_TOKENS + m.positions % PAGE_TOKENS, -1)
-        lengths = torch.where(m.lengths > 0, m.starts + m.lengths, 0).to(m.lengths.dtype)
-        self.writer(normalized_key, value.view(tokens, kv_heads, dim), slots)
+        if slots is None:
+            page = m.token_page_table.gather(1, (m.positions.clamp(min=0) // PAGE_TOKENS)[:, None]).squeeze(1)
+            slots = torch.where(m.positions >= 0, page.long() * PAGE_TOKENS + m.positions % PAGE_TOKENS, -1)
+        cosine, sine = position_embeddings
+        if self.cache_only:
+            qk_head_norm_rope_kv_write(
+                None,
+                key.view(tokens, kv_heads, dim),
+                value.view(tokens, kv_heads, dim),
+                None,
+                self.canonical.k_norm.weight,
+                cosine,
+                sine,
+                slots,
+                None,
+                self.key_cache,
+                self.value_cache,
+                eps=self.canonical.k_norm.eps,
+                zero_centered=self._qk_norm_zero_centered,
+            )
+            return None, None, None
+        q = torch.empty((tokens, heads, dim), dtype=self.query_dtype, device=hidden_states.device)
+        qk_head_norm_rope_kv_write(
+            query,
+            key.view(tokens, kv_heads, dim),
+            value.view(tokens, kv_heads, dim),
+            self.canonical.q_norm.weight,
+            self.canonical.k_norm.weight,
+            cosine,
+            sine,
+            slots,
+            q,
+            self.key_cache,
+            self.value_cache,
+            eps=self.canonical.q_norm.eps,
+            zero_centered=self._qk_norm_zero_centered,
+        )
+        if lengths is None:
+            lengths = torch.where(m.lengths > 0, m.starts + m.lengths, 0).to(m.lengths.dtype)
         return q, gate, lengths
 
-    def forward(self, hidden_states, position_embeddings, *, metadata, **kwargs):
-        query, gate, lengths = self.write_cache(hidden_states, position_embeddings, metadata)
+    def forward(self, hidden_states, position_embeddings, *, metadata, slots=None, lengths=None, **kwargs):
+        if self.cache_only:
+            self.write_cache(hidden_states, position_embeddings, metadata, slots=slots, lengths=lengths)
+            return None, None
+        query, gate, lengths = self.write_cache(hidden_states, position_embeddings, metadata,
+                                                slots=slots, lengths=lengths)
         attended = self.attention(query, output_gate=gate if self.attention.gated else None,
                                   page_table=metadata.page_table, cu_seqlens_q=metadata.query_start_loc,
                                   cache_seqlens=lengths)
@@ -314,7 +385,10 @@ class FullAttention(torch.nn.Module):
 class PreparedDecoder:
     def __init__(self, weights, scratch, metadata, pool, *, mode, vocabulary_runtime,
                  coordinator, session, name, workspace, scoring=None, records=None,
-                 vision_state=None):
+                 vision_state=None, sample=True):
+        if not sample and (mode != "prefill" or scoring is not None):
+            raise ValueError("non-sampling decoders require unscored prefill mode")
+        self.sample = bool(sample)
         self.weights, self.scratch, self.metadata, self.pool = weights, scratch, metadata, pool
         self.vision_state = vision_state if mode == "prefill" else None
         self.embedding = PreparedEmbedding(weights.tree.embed_tokens.weight, metadata.token_ids,
@@ -330,7 +404,7 @@ class PreparedDecoder:
                              for field, width in (
             ("q", config.text["num_attention_heads"] * config.text["head_dim"]),
             ("attended", config.text["num_attention_heads"] * config.text["head_dim"]),
-            ("key", config.text["num_key_value_heads"] * config.text["head_dim"]), ("output", config.hidden))}
+            ("output", config.hidden))}
         attention_prefixes = tuple(f"layers.{i}.self_attn." for i, kind in enumerate(config.layers)
                                    if kind == "full_attention")
         packed = tuple(prefix + "qgkv_proj" in weights.projections for prefix in attention_prefixes)
@@ -358,11 +432,23 @@ class PreparedDecoder:
                 mlp_buffers[field] = mlp_candidate(intermediate)
         mlp_input = _allocate_mlp_intermediate(weights, source)
         normalized = mlp_candidate(config.hidden)
+        taps = () if weights.draft is None else tuple(config.draft.target_layers)
+        last_index = len(weights.tree.layers) - 1
+        # A non-terminal chunk never samples or saves last_hidden. When the final layer
+        # is a full-attention layer outside the DFlash2 tap set, only its KV cache update
+        # persists; its attention read, o_proj, post-attention norm, and MLP are unused.
+        cache_only_last = (
+            not self.sample
+            and last_index >= 0
+            and weights.tree.layers[last_index].block_type == "full_attention"
+            and last_index not in taps
+        )
         self.layers = []
         previous_attended = None
         for index, original in enumerate(weights.tree.layers):
             layer = module_copy(original)
             prefix = f"layers.{index}."
+            is_cache_only = cache_only_last and index == last_index
             layer.input_layernorm = RMSNorm(original.input_layernorm,
                 mlp_buffers["down_proj"] if index else source, normalized,
                 session=session, name=name + "." + prefix + "input_layernorm",
@@ -383,7 +469,11 @@ class PreparedDecoder:
             else:
                 layer.self_attn = FullAttention(original.self_attn, weights, source, metadata, pool, index,
                     mode=mode, session=session, workspace=workspace, name=name + "." + prefix + "attention",
-                    buffers=attention_buffers, projection_staging=scratch.quantized)
+                    buffers=attention_buffers, projection_staging=scratch.quantized,
+                    cache_only=is_cache_only)
+            if is_cache_only:
+                self.layers.append(ResidualNormalizedLayer(layer, cache_only=True))
+                continue
             attended = (scratch.gdn.output if original.block_type == "linear_attention"
                         else attention_buffers["output"])
             layer.post_attention_layernorm = RMSNorm(original.post_attention_layernorm,
@@ -423,8 +513,12 @@ class PreparedDecoder:
         self.scoring = None if scoring is None else scoring.prepare(scratch.activations, weights.head,
             vocabulary=weights.config.text["vocab_size"], session=session, coordinator=coordinator,
             name=name + ".prompt")
-        self.head = PreparedVocabularyProjection(scratch.hidden, weights.head, scratch.logits, scratch.logits,
-            runtime=vocabulary_runtime, coordinator=coordinator, session=session, name=name + ".head", activation_mode="auto", workspace=workspace).functional(session=session)
+        self.head = (
+            PreparedVocabularyProjection(scratch.hidden, weights.head, scratch.logits, scratch.logits,
+                runtime=vocabulary_runtime, coordinator=coordinator, session=session, name=name + ".head",
+                activation_mode="auto", workspace=workspace).functional(session=session)
+            if self.sample else None
+        )
         self.context_capture = (PreparedContextCapture(metadata,
             config.hidden * len(config.draft.target_layers), config.draft.attention.window,
             compact_prefill=mode == "prefill").functional() if weights.draft is not None else None)
@@ -486,6 +580,9 @@ class PreparedDecoder:
         m, d = metadata, self._delta_metadata(metadata)
         position_embeddings = rotary_embeddings(rotary_positions(m), self.inverse_frequency,
             self.rope_axes, self.position_axes)
+        page = m.token_page_table.gather(1, (m.positions.clamp(min=0) // PAGE_TOKENS)[:, None]).squeeze(1)
+        slots = torch.where(m.positions >= 0, page.long() * PAGE_TOKENS + m.positions % PAGE_TOKENS, -1)
+        lengths = torch.where(m.lengths > 0, m.starts + m.lengths, 0).to(m.lengths.dtype)
         hidden = self.embedding(token_ids=m.token_ids, num_rows=m.live_counts[:1])
         if self.vision_state is not None:
             self.vision_state.inject(m, hidden)
@@ -498,10 +595,12 @@ class PreparedDecoder:
         for index, layer in enumerate(self.layers):
             layer_records = None if records is None or index not in records.layers else records[index]
             hidden, normalized = layer(hidden, normalized, position_embeddings=position_embeddings, records=layer_records,
-                                       metadata=m, delta=d)
+                                       metadata=m, delta=d, slots=slots, lengths=lengths)
             if index in taps:
                 column = taps.index(index) * hidden.shape[-1]
                 self.context_capture(capture, hidden, column)
+        if not self.sample:
+            return None, None, None if self.context_capture is None else capture[0], records
         if self.scoring is not None:
             normalized_hidden = self.weights.tree.norm(hidden)
             self.scoring(normalized_hidden)

@@ -25,9 +25,11 @@ class PreparedGeneration:
         workspace,
         context_factory=None,
         sample=True,
+        absorb_context=None,
     ):
         self.decoder, self.batch = decoder, batch
         self.sample = bool(sample)
+        self.absorb_context = self.sample if absorb_context is None else bool(absorb_context)
         self.validation = PreparedAllReduce(
             batch.validation_input,
             batch.validation_sum,
@@ -52,9 +54,8 @@ class PreparedGeneration:
             self.completion.prepare_broadcast(runtime=decoder.head.gather.runtime, session=session,
                 coordinator=coordinator, name=name + ".sampling")
         self.completion.functional(session=session)
-        self.compilation_variant = "sample" if self.sample else "record"
         self.context = None
-        if self.sample and decoder.weights.draft is not None:
+        if self.absorb_context and decoder.weights.draft is not None:
             if context_factory is None:
                 raise ValueError("speculative generation requires a draft context factory")
             self.context = context_factory(
@@ -66,6 +67,9 @@ class PreparedGeneration:
                 name=name + ".context",
                 workspace=workspace,
             )
+        self.compilation_variant = (
+            "sample" if self.sample else ("record_context" if self.context is not None else "record")
+        )
         decoder.release_outputs()
         self.validation.functional(session=session)
         if self.context is not None:
@@ -92,11 +96,11 @@ class PreparedGeneration:
             )
             self.batch.finish(metadata)
             self.completion.run(logits)
-            if self.context is not None:
-                self.context(auxiliary, metadata.lengths, metadata)
         else:
             self.batch.finish(metadata)
             self.completion.record_completion()
+        if self.context is not None:
+            self.context(auxiliary, metadata.lengths, metadata)
         if observe:
             observed = {"target." + name: getattr(metadata, name) for name in
                         ("live_counts", "starts", "lengths", "query_start_loc", "token_ids", "positions")}

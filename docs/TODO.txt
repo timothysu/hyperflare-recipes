@@ -377,3 +377,11 @@
     end-to-end on CUDA hardware and verify the resulting checkpoint loads and
     passes parity (only CPU safety and atomicity checks in
     `tests/scripts/test_quantize_hy4_flash.py` have run).
+
+[ ] Qualify DeepSeek V4.1 --row-shard-prefill and --row-shard-attention on
+    SM103, SM121, TP3, TP6, multi-host RoCE, vision-enabled prefill, and scored
+    prefill (--prompt-logprobs), and evaluate equivalent encoder row sharding
+    for deepseek4; only DeepSeek V4.1 text serving at TP4 on single-host SM120
+    PCIe has been exported and served. Close when each supported configuration
+    exports and passes native serving validation or remains explicitly rejected
+    by planning.
