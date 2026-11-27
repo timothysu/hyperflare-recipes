@@ -304,7 +304,8 @@ class QuantizedProjection:
             packed = weight.weight
             self.parts = packed.values, mxfp8.dense_scale_storage(packed.scale_mma), None
             for tensor in (packed.values, packed.scale_rows, packed.scale_mma):
-                record_numeric_tensor(tensor)
+                if tensor is not None:
+                    record_numeric_tensor(tensor)
             raw_source = encoded.values.view(rows, columns, 1), encoded.scale_mma
             raw_weight = packed.values.view(weight.out_features, columns, 1), packed.scale_mma
             raw_output = output.view(rows, weight.out_features, 1)
