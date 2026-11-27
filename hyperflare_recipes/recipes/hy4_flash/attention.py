@@ -20,7 +20,8 @@ from hyperflare_recipes.components.linear import (
 from hyperflare_recipes.components.paged_batch import rotary_positions
 from hyperflare_recipes.components.rms_norm import PreparedRMSNorm
 from hyperflare_recipes.components.sparse_mla import PreparedSparseMLA
-from ignition.components.state import gather_rows, scatter_rows
+from hyperflare_recipes.components.swa_mla_prefill import PreparedSwaMlaPrefill, commit_swa_ring
+from ignition.components.state import scatter_rows
 from ignition.preparation.persistent import persistent_copy
 
 from .config import (
@@ -268,6 +269,7 @@ class PreparedSparseAttention:
         workspace,
         max_cache_pages: int | None = None,
         examples: dict | None = None,
+        apply_post_norm: bool = True,
     ):
         self.layer = layer
         self.pool = pool
@@ -291,7 +293,7 @@ class PreparedSparseAttention:
             activation_mode="auto",
         ).functional(session=session)
         self.q_norm = PreparedRMSNorm(
-            scratch.projected[:, :Q_LORA_RANK],
+            proj_buf[:, :Q_LORA_RANK],
             weights["q_norm"],
             scratch.q_resid,
             eps=eps,
@@ -299,7 +301,7 @@ class PreparedSparseAttention:
             name=f"{name}.q_norm",
         ).functional()
         self.kv_norm = PreparedRMSNorm(
-            scratch.projected[:, Q_LORA_RANK : Q_LORA_RANK + KV_LORA_RANK],
+            proj_buf[:, Q_LORA_RANK : Q_LORA_RANK + KV_LORA_RANK],
             weights["kv_norm"],
             scratch.kv_nope,
             eps=eps,
@@ -317,6 +319,7 @@ class PreparedSparseAttention:
         ).functional(session=session)
 
         absorb_w, expand_w, batched_cls = split_kv_b_weights(weights["kv_b"], SPARSE_HEADS)
+        self.quantized_kv_b = batched_cls is BatchedQuantizedProjection
         self.query_absorption = batched_cls(
             scratch.q_sparse[:, :, :QK_NOPE_HEAD_DIM].transpose(0, 1),
             absorb_w,
@@ -356,14 +359,18 @@ class PreparedSparseAttention:
             workspace=workspace,
             activation_mode="auto",
         ).functional(session=session)
-        self.post_proj_norm = PreparedRMSNorm(
-            scratch.o_proj_out,
-            weights["post_proj_norm"],
-            scratch.output,
-            eps=eps,
-            session=session,
-            name=f"{name}.post_proj_norm",
-        ).functional()
+        self.post_proj_norm = (
+            PreparedRMSNorm(
+                scratch.o_proj_out,
+                weights["post_proj_norm"],
+                scratch.output,
+                eps=eps,
+                session=session,
+                name=f"{name}.post_proj_norm",
+            ).functional()
+            if apply_post_norm
+            else None
+        )
 
         self.indexer = PreparedCompressedIndexer(
             layer,
@@ -440,9 +447,9 @@ class PreparedSparseAttention:
         dtype = source.dtype
 
         projected = self.qkv_a(source)
-        q_resid = self.q_norm(projected[:, :Q_LORA_RANK].contiguous())
-        kv_nope = self.kv_norm(projected[:, Q_LORA_RANK : Q_LORA_RANK + KV_LORA_RANK].contiguous())
-        k_rope = projected[:, Q_LORA_RANK + KV_LORA_RANK : _QKV_BASE_WIDTH].contiguous()
+        q_resid = self.q_norm(projected[:, :Q_LORA_RANK])
+        kv_nope = self.kv_norm(projected[:, Q_LORA_RANK : Q_LORA_RANK + KV_LORA_RANK])
+        k_rope_raw = projected[:, Q_LORA_RANK + KV_LORA_RANK : _QKV_BASE_WIDTH]
         col = _QKV_BASE_WIDTH
         if self.fused_gate:
             gate_w = SPARSE_HEADS * V_HEAD_DIM
@@ -458,26 +465,38 @@ class PreparedSparseAttention:
             token_keys_raw = None
             head_weights_raw = None
 
-        q_raw = self.q_b(q_resid).view(tokens, SPARSE_HEADS, QK_HEAD_DIM)
-        q_nope, q_rope = q_raw.split((QK_NOPE_HEAD_DIM, QK_ROPE_HEAD_DIM), dim=-1)
-
         if cos_sin is None:
             cos, sin = self.rotary.cos_sin(rotary_positions(m), indexed=True, dtype=dtype)
         else:
             cos, sin = cos_sin
-        q_rope = self.rotary.apply(q_rope, cos, sin)
-        k_rope = self.rotary.apply(k_rope, cos, sin)
+        k_rope = self.rotary.apply(k_rope_raw, cos, sin)
 
-        q_abs_nope = self.query_absorption(q_nope.transpose(0, 1).contiguous()).transpose(0, 1)
-        q_absorbed = torch.cat((q_abs_nope, q_rope), dim=-1).contiguous()
-
-        # Pack and scatter 656-byte GLM_NSA records into paged latent storage.
+        # Pack and scatter 656-byte GLM_NSA records into paged latent storage before allocating Q.
         if sparse_slots is None:
             live, token_slots, visible = prepare_sparse_slots(m)
         else:
             live, token_slots, visible = sparse_slots
         packed = pack_glm_nsa_records(kv_nope, k_rope)
+        del kv_nope, k_rope
         scatter_rows(packed, token_slots, self.cache.view(-1, SPARSE_RECORD_BYTES), token_slots >= 0)
+        del packed
+
+        q_raw = self.q_b(q_resid).view(tokens, SPARSE_HEADS, QK_HEAD_DIM)
+        q_nope, q_rope = q_raw.split((QK_NOPE_HEAD_DIM, QK_ROPE_HEAD_DIM), dim=-1)
+        q_rope_rot = self.rotary.apply(q_rope, cos, sin)
+        if self.quantized_kv_b:
+            q_abs_nope = self.query_absorption(q_nope.transpose(0, 1).contiguous()).transpose(0, 1)
+            q_absorbed = torch.cat((q_abs_nope, q_rope_rot), dim=-1).contiguous()
+            del q_abs_nope, q_rope_rot, q_raw, q_nope, q_rope
+        else:
+            q_absorbed = torch.empty((tokens, SPARSE_HEADS, SWA_RECORD_WIDTH), dtype=dtype, device=source.device)
+            q_absorbed[:, :, KV_LORA_RANK:].copy_(q_rope_rot)
+            del q_rope_rot
+            self.query_absorption(
+                q_nope.transpose(0, 1),
+                output=q_absorbed[:, :, :KV_LORA_RANK].transpose(0, 1),
+            )
+            del q_raw, q_nope, q_rope
 
         physical, selected_lengths, pending_record, pools = self.indexer(
             source,
@@ -487,6 +506,7 @@ class PreparedSparseAttention:
             token_keys_raw=token_keys_raw,
             head_weights_raw=head_weights_raw,
         )
+        del q_resid
         if self.fused_sink:
             attended = self.attention(q_absorbed, physical, visible, selected_lengths, cache=self.cache)
         else:
@@ -495,12 +515,22 @@ class PreparedSparseAttention:
             sink_scale = torch.sigmoid(lse * math.log(2.0) - self.sink[None, :]).unsqueeze(-1)
             attended = (attended.float() * sink_scale).to(dtype)
             attended = torch.where(live[:, None, None], attended, 0)
+        del q_absorbed
 
-        expanded = self.value_expansion(attended.transpose(0, 1).contiguous()).transpose(0, 1).reshape(tokens, -1)
+        if self.quantized_kv_b:
+            expanded = self.value_expansion(attended.transpose(0, 1).contiguous()).transpose(0, 1).reshape(tokens, -1)
+            del attended
+        else:
+            expanded_buf = torch.empty((tokens, SPARSE_HEADS, V_HEAD_DIM), dtype=dtype, device=source.device)
+            self.value_expansion(attended.transpose(0, 1), output=expanded_buf.transpose(0, 1))
+            del attended
+            expanded = expanded_buf.view(tokens, -1)
+
         if gate is None:
             gate = self.gate_proj(source)
         gated = (expanded * torch.sigmoid(gate)).contiguous()
-        output = self.post_proj_norm(self.o_proj(gated))
+        projected_out = self.o_proj(gated)
+        output = projected_out if self.post_proj_norm is None else self.post_proj_norm(projected_out)
         return output, pending_record, pools
 
     def commit(self, counts: torch.Tensor, record, metadata) -> None:
@@ -520,7 +550,7 @@ def apply_attention_sink(
 
 
 class PreparedSlidingAttention:
-    """64-head BF16 sliding-window-512 MLA with unwrapped linear staging and exact FP32 sink."""
+    """64-head BF16 sliding-window-512 MLA with direct-ring prefill and exact FP32 sink."""
 
     def __init__(
         self,
@@ -537,6 +567,7 @@ class PreparedSlidingAttention:
         session,
         name: str,
         workspace,
+        apply_post_norm: bool = True,
     ):
         self.layer = layer
         self.pool = pool
@@ -548,12 +579,17 @@ class PreparedSlidingAttention:
         tokens = source.shape[0]
         rows = metadata.starts.numel()
         device = source.device
-        self.stage_len = swa_stage_tokens(metadata.max_query_tokens)
         self.max_query_tokens = metadata.max_query_tokens
-        self.pages_per_row = self.stage_len // SWA_PAGE_SIZE
-        self.page_table = persistent_copy(
-            torch.arange(rows * self.pages_per_row, dtype=torch.int32, device=device).view(rows, self.pages_per_row)
-        )
+        if mode == "prefill":
+            self.stage_len = 0
+            self.pages_per_row = 0
+            self.page_table = None
+        else:
+            self.stage_len = swa_stage_tokens(metadata.max_query_tokens)
+            self.pages_per_row = self.stage_len // SWA_PAGE_SIZE
+            self.page_table = persistent_copy(
+                torch.arange(rows * self.pages_per_row, dtype=torch.int32, device=device).view(rows, self.pages_per_row)
+            )
 
         self.fused_gate = bool(weights.get("fused_gate", False))
         qkv_out_dim = _projection_out_features(weights["qkv_a"])
@@ -568,7 +604,7 @@ class PreparedSlidingAttention:
             activation_mode="auto",
         ).functional(session=session)
         self.q_norm = PreparedRMSNorm(
-            scratch.projected[:, :Q_LORA_RANK],
+            proj_buf[:, :Q_LORA_RANK],
             weights["q_norm"],
             scratch.q_resid,
             eps=eps,
@@ -576,7 +612,7 @@ class PreparedSlidingAttention:
             name=f"{name}.q_norm",
         ).functional()
         self.kv_norm = PreparedRMSNorm(
-            scratch.projected[:, Q_LORA_RANK : Q_LORA_RANK + KV_LORA_RANK],
+            proj_buf[:, Q_LORA_RANK : Q_LORA_RANK + KV_LORA_RANK],
             weights["kv_norm"],
             scratch.kv_nope,
             eps=eps,
@@ -594,9 +630,10 @@ class PreparedSlidingAttention:
         ).functional(session=session)
 
         absorb_w, expand_w, batched_cls = split_kv_b_weights(weights["kv_b"], SWA_HEADS)
+        self.quantized_kv_b = batched_cls is BatchedQuantizedProjection
         # b12x MXFP8 batched GEMM qualifies batch sizes {8, 16, 32}; partition 64 SWA
         # heads into two 32-head groups sharing the same packed MXFP8 weight storage.
-        if batched_cls is BatchedQuantizedProjection:
+        if self.quantized_kv_b:
             half = SWA_HEADS // 2
             self.query_absorption = tuple(
                 batched_cls(
@@ -664,48 +701,67 @@ class PreparedSlidingAttention:
             workspace=workspace,
             activation_mode="auto",
         ).functional(session=session)
-        self.post_proj_norm = PreparedRMSNorm(
-            scratch.o_proj_out,
-            weights["post_proj_norm"],
-            scratch.output,
-            eps=eps,
-            session=session,
-            name=f"{name}.post_proj_norm",
-        ).functional()
-
-        staged_pages = scratch.swa_staged.view(rows * self.pages_per_row, SWA_PAGE_SIZE, SWA_RECORD_WIDTH)
-        caps = dense_mla.Caps(
-            device=device,
-            mode="decode" if mode == "decode" else "extend",
-            kv_dtype=torch.bfloat16,
-            q_dtype=torch.bfloat16,
-            num_q_heads=SWA_HEADS,
-            page_size=SWA_PAGE_SIZE,
-            max_total_q=tokens,
-            max_batch=rows,
-            max_cache_tokens=self.stage_len,
-            max_page_table_width=self.pages_per_row,
-            num_cache_pages=rows * self.pages_per_row,
-            head_dim=SWA_RECORD_WIDTH,
-            v_head_dim=KV_LORA_RANK,
-            window_size=SWA_WINDOW,
-            causal=True,
-            partial_dtype=torch.float32,
+        self.post_proj_norm = (
+            PreparedRMSNorm(
+                scratch.o_proj_out,
+                weights["post_proj_norm"],
+                scratch.output,
+                eps=eps,
+                session=session,
+                name=f"{name}.post_proj_norm",
+            ).functional()
+            if apply_post_norm
+            else None
         )
-        self.attention = PreparedDenseMLA(
-            scratch.q_abs_swa,
-            staged_pages,
-            scratch.attended_swa,
-            self.page_table,
-            scratch.swa_lengths,
-            metadata.query_start_loc,
-            caps=caps,
-            scale=MLA_SCALE,
-            session=session,
-            name=f"{name}.attention",
-            workspace=workspace,
-            lse=scratch.lse_swa,
-        ).functional(session=session, cache=None)
+
+        if mode == "prefill":
+            kv_decl = scratch.projected_fused[: tokens * SWA_RECORD_WIDTH].view(tokens, SWA_RECORD_WIDTH)
+            self.attention = PreparedSwaMlaPrefill(
+                scratch.q_abs_swa,
+                self.window,
+                kv_decl,
+                self.sink,
+                scratch.attended_swa,
+                metadata,
+                scale=MLA_SCALE,
+                window_size=SWA_WINDOW,
+                session=session,
+                name=f"{name}.attention",
+            ).functional(session=session)
+        else:
+            staged_pages = scratch.swa_staged.view(rows * self.pages_per_row, SWA_PAGE_SIZE, SWA_RECORD_WIDTH)
+            caps = dense_mla.Caps(
+                device=device,
+                mode="decode" if mode == "decode" else "extend",
+                kv_dtype=torch.bfloat16,
+                q_dtype=torch.bfloat16,
+                num_q_heads=SWA_HEADS,
+                page_size=SWA_PAGE_SIZE,
+                max_total_q=tokens,
+                max_batch=rows,
+                max_cache_tokens=self.stage_len,
+                max_page_table_width=self.pages_per_row,
+                num_cache_pages=rows * self.pages_per_row,
+                head_dim=SWA_RECORD_WIDTH,
+                v_head_dim=KV_LORA_RANK,
+                window_size=SWA_WINDOW,
+                causal=True,
+                partial_dtype=torch.float32,
+            )
+            self.attention = PreparedDenseMLA(
+                scratch.q_abs_swa,
+                staged_pages,
+                scratch.attended_swa,
+                self.page_table,
+                scratch.swa_lengths,
+                metadata.query_start_loc,
+                caps=caps,
+                scale=MLA_SCALE,
+                session=session,
+                name=f"{name}.attention",
+                workspace=workspace,
+                lse=scratch.lse_swa,
+            ).functional(session=session, cache=None)
 
     def __call__(
         self,
@@ -722,108 +778,123 @@ class PreparedSlidingAttention:
         dtype = source.dtype
 
         projected = self.qkv_a(source)
-        q_resid = self.q_norm(projected[:, :Q_LORA_RANK].contiguous())
-        kv_nope = self.kv_norm(projected[:, Q_LORA_RANK : Q_LORA_RANK + KV_LORA_RANK].contiguous())
-        k_rope = projected[:, Q_LORA_RANK + KV_LORA_RANK : _QKV_BASE_WIDTH].contiguous()
+        q_resid = self.q_norm(projected[:, :Q_LORA_RANK])
+        kv_nope = self.kv_norm(projected[:, Q_LORA_RANK : Q_LORA_RANK + KV_LORA_RANK])
+        k_rope_raw = projected[:, Q_LORA_RANK + KV_LORA_RANK : _QKV_BASE_WIDTH]
         gate = projected[:, _QKV_BASE_WIDTH : _QKV_BASE_WIDTH + SWA_HEADS * V_HEAD_DIM] if self.fused_gate else None
-
-        q_raw = self.q_b(q_resid).view(tokens, SWA_HEADS, QK_HEAD_DIM)
-        q_nope, q_rope = q_raw.split((QK_NOPE_HEAD_DIM, QK_ROPE_HEAD_DIM), dim=-1)
 
         if cos_sin is None:
             cos, sin = self.rotary.cos_sin(rotary_positions(m), indexed=False, dtype=dtype)
         else:
             cos, sin = cos_sin
-        q_rope = self.rotary.apply(q_rope, cos, sin)
-        k_rope = self.rotary.apply(k_rope, cos, sin)
+        k_rope = self.rotary.apply(k_rope_raw, cos, sin)
+        kv_record = torch.cat((kv_nope, k_rope), dim=-1).contiguous()  # [T, 576] BF16
+        del kv_nope, k_rope
 
-        if len(self.query_absorption) == 1:
-            q_abs_nope = self.query_absorption[0](q_nope.transpose(0, 1).contiguous()).transpose(0, 1)
-        else:
+        q_raw = self.q_b(q_resid).view(tokens, SWA_HEADS, QK_HEAD_DIM)
+        del q_resid
+        q_nope, q_rope = q_raw.split((QK_NOPE_HEAD_DIM, QK_ROPE_HEAD_DIM), dim=-1)
+        q_rope_rot = self.rotary.apply(q_rope, cos, sin)
+
+        if self.quantized_kv_b:
             half = SWA_HEADS // 2
             q_lo = self.query_absorption[0](q_nope[:, :half].transpose(0, 1).contiguous()).transpose(0, 1)
             q_hi = self.query_absorption[1](q_nope[:, half:].transpose(0, 1).contiguous()).transpose(0, 1)
             q_abs_nope = torch.cat((q_lo, q_hi), dim=1)
-        q_absorbed = torch.cat((q_abs_nope, q_rope), dim=-1).contiguous()
-        kv_record = torch.cat((kv_nope, k_rope), dim=-1).contiguous()  # [T, 576] BF16
-
-        # Stage up to 511 prior ring tokens plus this step's KV records directly into
-        # chronological order in one fused pass without full-ring scratch copies.
-        if swa_plan is None:
-            ring_idx, is_hist, src_idx, valid_stage, cache_seqlens, live, ring_write_slots = prepare_swa_plan(
-                m, self.stage_len, self.max_query_tokens
-            )
+            q_absorbed = torch.cat((q_abs_nope, q_rope_rot), dim=-1).contiguous()
+            del q_lo, q_hi, q_abs_nope, q_rope_rot, q_raw, q_nope, q_rope
         else:
-            ring_idx, is_hist, src_idx, valid_stage, cache_seqlens, live, ring_write_slots = swa_plan
+            q_absorbed = torch.empty((tokens, SWA_HEADS, SWA_RECORD_WIDTH), dtype=dtype, device=source.device)
+            q_absorbed[:, :, KV_LORA_RANK:].copy_(q_rope_rot)
+            del q_rope_rot
+            self.query_absorption[0](
+                q_nope.transpose(0, 1),
+                output=q_absorbed[:, :, :KV_LORA_RANK].transpose(0, 1),
+            )
+            del q_raw, q_nope, q_rope
 
-        previous = self.window[m.state_rows[:, None], ring_idx]
-        staged = torch.where(
-            valid_stage.unsqueeze(-1),
-            torch.where(is_hist.unsqueeze(-1), previous, kv_record[src_idx]),
-            0,
-        ).contiguous()
-        staged_pages = staged.view(rows * self.pages_per_row, SWA_PAGE_SIZE, SWA_RECORD_WIDTH)
-        attended, lse = self.attention(
-            q_absorbed,
-            page_table=self.page_table,
-            lengths=cache_seqlens,
-            starts=m.query_start_loc,
-            cache=staged_pages,
-        )
+        if self.mode == "prefill":
+            attended = self.attention(q_absorbed, kv_record, m, window=self.window)
+            live = ring_write_slots = None
+        else:
+            # Stage up to 511 prior ring tokens plus this step's KV records directly into
+            # chronological order in one fused pass without full-ring scratch copies.
+            if swa_plan is None:
+                ring_idx, is_hist, src_idx, valid_stage, cache_seqlens, live, ring_write_slots = prepare_swa_plan(
+                    m, self.stage_len, self.max_query_tokens
+                )
+            else:
+                ring_idx, is_hist, src_idx, valid_stage, cache_seqlens, live, ring_write_slots = swa_plan
 
-        # Exact post-hoc learnable attention sink using FP32 natural-log LSE.
-        attended = apply_attention_sink(attended, lse, self.sink, live)
+            previous = self.window[m.state_rows[:, None], ring_idx]
+            staged = torch.where(
+                valid_stage.unsqueeze(-1),
+                torch.where(is_hist.unsqueeze(-1), previous, kv_record[src_idx]),
+                0,
+            ).contiguous()
+            staged_pages = staged.view(rows * self.pages_per_row, SWA_PAGE_SIZE, SWA_RECORD_WIDTH)
+            attended, lse = self.attention(
+                q_absorbed,
+                page_table=self.page_table,
+                lengths=cache_seqlens,
+                starts=m.query_start_loc,
+                cache=staged_pages,
+            )
+
+            # Exact post-hoc learnable attention sink using FP32 natural-log LSE.
+            attended = apply_attention_sink(attended, lse, self.sink, live)
+        del q_absorbed
 
         if window_cache is not None:
             # Stage only this step's new records for batched PreparedRingCommit across all 30 SWA layers.
             # Active tokens are packed contiguously at the front of kv_record, so decode and verify must
             # both scatter by request-indexed ring_write_slots rather than copying by row index.
+            if ring_write_slots is None:
+                _, _, _, _, _, live, ring_write_slots = prepare_swa_plan(
+                    m, swa_stage_tokens(self.max_query_tokens), self.max_query_tokens
+                )
             wc_bf16 = window_cache.view(torch.bfloat16).view(
                 rows, SWA_WINDOW + self.max_query_tokens, SWA_RECORD_WIDTH
             )
             scatter_rows(kv_record, ring_write_slots, wc_bf16.view(-1, SWA_RECORD_WIDTH), live)
             commit_record = None
-        else:
+        elif self.deferred:
             commit_record = kv_record
-            if not self.deferred:
-                self.commit(m.lengths, commit_record, m)
-
-        if len(self.value_expansion) == 1:
-            expanded = self.value_expansion[0](attended.transpose(0, 1).contiguous()).transpose(0, 1).reshape(tokens, -1)
         else:
+            self.commit(m.lengths, kv_record, m)
+            commit_record = None
+        del kv_record
+
+        if self.quantized_kv_b:
             half = SWA_HEADS // 2
             e_lo = self.value_expansion[0](attended[:, :half].transpose(0, 1).contiguous()).transpose(0, 1)
             e_hi = self.value_expansion[1](attended[:, half:].transpose(0, 1).contiguous()).transpose(0, 1)
             expanded = torch.cat((e_lo, e_hi), dim=1).reshape(tokens, -1)
+            del e_lo, e_hi, attended
+        else:
+            expanded_buf = torch.empty((tokens, SWA_HEADS, V_HEAD_DIM), dtype=dtype, device=source.device)
+            self.value_expansion[0](attended.transpose(0, 1), output=expanded_buf.transpose(0, 1))
+            del attended
+            expanded = expanded_buf.view(tokens, -1)
+
         if gate is None:
             gate = self.gate_proj(source)
         gated = (expanded * torch.sigmoid(gate)).contiguous()
-        output = self.post_proj_norm(self.o_proj(gated))
+        projected_out = self.o_proj(gated)
+        output = projected_out if self.post_proj_norm is None else self.post_proj_norm(projected_out)
         return output, commit_record, None
 
     def commit(self, counts: torch.Tensor, record: torch.Tensor | None, metadata) -> None:
         """Write only the last min(count, 512) accepted tokens per request into the circular ring."""
         if record is None:
             return
-        kv_record = record
-        m = metadata
-        rows = m.starts.numel()
-        tokens = kv_record.shape[0]
-        device = kv_record.device
-        ring = torch.zeros((rows, SWA_WINDOW, SWA_RECORD_WIDTH), dtype=kv_record.dtype, device=device)
-        gather_rows(self.window, m.state_rows, ring)
-        t_idx = torch.arange(tokens, dtype=torch.int64, device=device)
-        req = m.requests.long()
-        local_off = t_idx - m.query_start_loc[:-1].long()[req]
-        pos = m.positions
-        state_row = m.state_rows[req]
-        end_pos = m.starts[req] + counts.long()[req]
-        keep = (
-            (pos >= 0)
-            & (state_row > 0)
-            & (local_off < counts.long()[req])
-            & (pos >= end_pos - SWA_WINDOW)
+        commit_swa_ring(
+            record,
+            self.window,
+            metadata.state_rows,
+            metadata.starts,
+            metadata.query_start_loc,
+            metadata.positions,
+            counts,
+            SWA_WINDOW,
         )
-        local_slots = req * SWA_WINDOW + (pos.clamp_min(0) % SWA_WINDOW)
-        scatter_rows(kv_record, local_slots, ring.view(-1, SWA_RECORD_WIDTH), keep)
-        scatter_rows(ring, m.state_rows, self.window, (counts > 0) & (m.state_rows > 0))
