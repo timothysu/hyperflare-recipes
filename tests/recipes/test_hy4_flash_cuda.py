@@ -526,6 +526,125 @@ def test_sparse_attention_c4_indexer_and_dfly_zero_target_mutation_cuda(tmp_path
         assert torch.equal(pool.latent_cache(25), target_kv_before), "DFly2 mutated target KV cache!"
 
 
+def _row_newline_interp_axis(size: int, side: int = 128) -> tuple[list[tuple[int, int]], list[tuple[float, float]]]:
+    """Match Helios RowNewlineProcessor::interpolation_axis bilinear sampling coordinates."""
+    indices: list[tuple[int, int]] = []
+    weights: list[tuple[float, float]] = []
+    scale = float(side / (size + 0.1))
+    for index in range(size):
+        if size == side:
+            indices.append((index, index))
+            weights.append((1.0, 0.0))
+            continue
+        source = max(0.0, scale * (index + 0.5) - 0.5)
+        lo = min(int(source), side - 1)
+        if lo >= side - 1:
+            indices.append((side - 1, side - 1))
+            weights.append((1.0, 0.0))
+        else:
+            frac = source - lo
+            indices.append((lo, lo + 1))
+            weights.append((1.0 - frac, frac))
+    return indices, weights
+
+
+def _row_newline_interp_grid(grid_h: int, grid_w: int, *, side: int = 128, device: torch.device):
+    """Build RowNewline bilinear position indices [P, 4] and weights [P, 4] for a patch grid."""
+    y_idx, y_w = _row_newline_interp_axis(grid_h, side)
+    x_idx, x_w = _row_newline_interp_axis(grid_w, side)
+    interp_idx = []
+    interp_w = []
+    for (y0, y1), (wy0, wy1) in zip(y_idx, y_w, strict=True):
+        for (x0, x1), (wx0, wx1) in zip(x_idx, x_w, strict=True):
+            interp_idx.append([y0 * side + x0, y0 * side + x1, y1 * side + x0, y1 * side + x1])
+            interp_w.append([wy0 * wx0, wy0 * wx1, wy1 * wx0, wy1 * wx1])
+    return (
+        torch.tensor(interp_idx, dtype=torch.int64, device=device),
+        torch.tensor(interp_w, dtype=torch.float32, device=device),
+    )
+
+
+def _reference_siglip2_vision(
+    pixels: torch.Tensor,
+    grid_h: int,
+    grid_w: int,
+    vit_w: dict[str, torch.Tensor],
+    cfg: ModelConfig,
+    *,
+    uniform_pos0: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Exact PyTorch Conv2d + 27-layer SigLIP2 + Conv2d vit.perceive reference."""
+    v_patches = grid_h * grid_w
+    pix_4d = pixels.to(torch.bfloat16).view(v_patches, 3, 16, 16)
+    ref_h = F.conv2d(
+        pix_4d,
+        vit_w["vit.embeddings.patch_embedding.weight"],
+        vit_w["vit.embeddings.patch_embedding.bias"],
+        stride=16,
+    ).flatten(1)
+    if uniform_pos0:
+        pos = vit_w["vit.embeddings.position_embedding.weight"][1:2]
+    else:
+        pos_grid = (
+            vit_w["vit.embeddings.position_embedding.weight"][1:]
+            .reshape(1, 128, 128, VISION_HIDDEN)
+            .permute(0, 3, 1, 2)
+            .float()
+        )
+        pos = (
+            F.interpolate(
+                pos_grid,
+                scale_factor=((grid_h + 0.1) / 128.0, (grid_w + 0.1) / 128.0),
+                mode="bilinear",
+                align_corners=False,
+            )
+            .permute(0, 2, 3, 1)
+            .reshape(v_patches, VISION_HIDDEN)
+            .to(ref_h.dtype)
+        )
+    ref_h = ref_h + pos
+    for i in range(VISION_LAYERS):
+        p = f"vit.layers.{i}"
+        n1 = F.layer_norm(
+            ref_h,
+            (VISION_HIDDEN,),
+            vit_w[f"{p}.input_layernorm.weight"],
+            vit_w[f"{p}.input_layernorm.bias"],
+            eps=cfg.vision.layer_norm_eps,
+        )
+        q = F.linear(n1, vit_w[f"{p}.self_attn.q_proj.weight"], vit_w[f"{p}.self_attn.q_proj.bias"]).view(v_patches, 16, 72).transpose(0, 1)
+        k = F.linear(n1, vit_w[f"{p}.self_attn.k_proj.weight"], vit_w[f"{p}.self_attn.k_proj.bias"]).view(v_patches, 16, 72).transpose(0, 1)
+        v = F.linear(n1, vit_w[f"{p}.self_attn.v_proj.weight"], vit_w[f"{p}.self_attn.v_proj.bias"]).view(v_patches, 16, 72).transpose(0, 1)
+        a = (
+            F.scaled_dot_product_attention(q.unsqueeze(0), k.unsqueeze(0), v.unsqueeze(0), is_causal=False)
+            .squeeze(0)
+            .transpose(0, 1)
+            .reshape(v_patches, VISION_HIDDEN)
+        )
+        o_w = vit_w[f"{p}.self_attn.o_proj.weight"]
+        if o_w.dtype == torch.float8_e4m3fn:
+            o_s = vit_w[f"{p}.self_attn.o_proj.weight_scale"].view(torch.uint8).to(torch.float32) - 127.0
+            o_w = (o_w.float().view(VISION_HIDDEN, -1, 32) * torch.exp2(o_s).unsqueeze(-1)).reshape(VISION_HIDDEN, VISION_HIDDEN).to(torch.bfloat16)
+        ref_h = ref_h + F.linear(a, o_w, vit_w[f"{p}.self_attn.o_proj.bias"])
+        n2 = F.layer_norm(
+            ref_h,
+            (VISION_HIDDEN,),
+            vit_w[f"{p}.post_attention_layernorm.weight"],
+            vit_w[f"{p}.post_attention_layernorm.bias"],
+            eps=cfg.vision.layer_norm_eps,
+        )
+        ff = F.gelu(F.linear(n2, vit_w[f"{p}.mlp.dense_h_to_4h.weight"], vit_w[f"{p}.mlp.dense_h_to_4h.bias"]))
+        ref_h = ref_h + F.linear(ff, vit_w[f"{p}.mlp.dense_4h_to_h.weight"], vit_w[f"{p}.mlp.dense_4h_to_h.bias"])
+    rf = ref_h.float()
+    ref_n = (rf * torch.rsqrt(rf.square().mean(-1, keepdim=True) + cfg.vision.rms_norm_eps)).to(ref_h.dtype) * vit_w["vit.perceive.norm.weight"]
+    ref_4d = ref_n.view(1, grid_h, grid_w, VISION_HIDDEN).permute(0, 3, 1, 2).contiguous()
+    ref_p = F.conv2d(ref_4d, vit_w["vit.perceive.proj.0.weight"], vit_w["vit.perceive.proj.0.bias"], stride=2)
+    ref_p = F.gelu(ref_p)
+    ref_p = F.conv2d(ref_p, vit_w["vit.perceive.proj.2.weight"], vit_w["vit.perceive.proj.2.bias"], stride=1)
+    ref_out = ref_p.permute(0, 2, 3, 1).reshape(v_patches // 4, HIDDEN_SIZE)
+    return ref_n, ref_out
+
+
 @torch.no_grad()
 def test_real_checkpoint_layers_and_vision_cuda():
     """Verify real Hy4-flash-NVFP4 layers (0 dense, 1 sparse LatentMoE+CSF, 2 SWA, ViT) on SM120."""
@@ -681,48 +800,18 @@ def test_real_checkpoint_layers_and_vision_cuda():
         assert vis_out.abs().mean().item() > 0.01
 
         # Exact PyTorch Conv2d + 27-layer SigLIP2 + Conv2d vit.perceive reference.
-        pix_4d = pixels.to(torch.bfloat16).view(v_patches, 3, 16, 16)
-        ref_h = F.conv2d(
-            pix_4d,
-            vit_w["vit.embeddings.patch_embedding.weight"],
-            vit_w["vit.embeddings.patch_embedding.bias"],
-            stride=16,
-        ).flatten(1)
-        ref_h = ref_h + vit_w["vit.embeddings.position_embedding.weight"][1:2]
-        for i in range(VISION_LAYERS):
-            p = f"vit.layers.{i}"
-            n1 = F.layer_norm(
-                ref_h, (VISION_HIDDEN,), vit_w[f"{p}.input_layernorm.weight"], vit_w[f"{p}.input_layernorm.bias"], eps=cfg.vision.layer_norm_eps
-            )
-            q = F.linear(n1, vit_w[f"{p}.self_attn.q_proj.weight"], vit_w[f"{p}.self_attn.q_proj.bias"]).view(v_patches, 16, 72).transpose(0, 1)
-            k = F.linear(n1, vit_w[f"{p}.self_attn.k_proj.weight"], vit_w[f"{p}.self_attn.k_proj.bias"]).view(v_patches, 16, 72).transpose(0, 1)
-            v = F.linear(n1, vit_w[f"{p}.self_attn.v_proj.weight"], vit_w[f"{p}.self_attn.v_proj.bias"]).view(v_patches, 16, 72).transpose(0, 1)
-            a = F.scaled_dot_product_attention(q.unsqueeze(0), k.unsqueeze(0), v.unsqueeze(0), is_causal=False).squeeze(0).transpose(0, 1).reshape(v_patches, VISION_HIDDEN)
-            o_w = vit_w[f"{p}.self_attn.o_proj.weight"]
-            if o_w.dtype == torch.float8_e4m3fn:
-                o_s = vit_w[f"{p}.self_attn.o_proj.weight_scale"].view(torch.uint8).to(torch.float32) - 127.0
-                o_w = (o_w.float().view(VISION_HIDDEN, -1, 32) * torch.exp2(o_s).unsqueeze(-1)).reshape(VISION_HIDDEN, VISION_HIDDEN).to(torch.bfloat16)
-            ref_h = ref_h + F.linear(a, o_w, vit_w[f"{p}.self_attn.o_proj.bias"])
-            n2 = F.layer_norm(
-                ref_h, (VISION_HIDDEN,), vit_w[f"{p}.post_attention_layernorm.weight"], vit_w[f"{p}.post_attention_layernorm.bias"], eps=cfg.vision.layer_norm_eps
-            )
-            ff = F.gelu(F.linear(n2, vit_w[f"{p}.mlp.dense_h_to_4h.weight"], vit_w[f"{p}.mlp.dense_h_to_4h.bias"]))
-            ref_h = ref_h + F.linear(ff, vit_w[f"{p}.mlp.dense_4h_to_h.weight"], vit_w[f"{p}.mlp.dense_4h_to_h.bias"])
-        rf = ref_h.float()
-        ref_n = (rf * torch.rsqrt(rf.square().mean(-1, keepdim=True) + cfg.vision.rms_norm_eps)).to(ref_h.dtype) * vit_w["vit.perceive.norm.weight"]
-        ref_4d = ref_n.view(1, 8, 8, VISION_HIDDEN).permute(0, 3, 1, 2).contiguous()
-        ref_p = F.conv2d(ref_4d, vit_w["vit.perceive.proj.0.weight"], vit_w["vit.perceive.proj.0.bias"], stride=2)
-        ref_p = F.gelu(ref_p)
-        ref_p = F.conv2d(ref_p, vit_w["vit.perceive.proj.2.weight"], vit_w["vit.perceive.proj.2.bias"], stride=1)
-        ref_out = ref_p.permute(0, 2, 3, 1).reshape(16, HIDDEN_SIZE)
+        ref_n, ref_out = _reference_siglip2_vision(pixels, 8, 8, vit_w, cfg, uniform_pos0=True)
         # Isolated vit.perceive Linear equivalence to Conv2d(k=2, s=2) -> GELU -> Conv2d(k=1).
         iso_merged = ref_n[v_inputs.vision_merge_indices.long()].transpose(1, 2).reshape(16, 4 * VISION_HIDDEN).contiguous()
         iso_out = vis.perceive_conv2(F.gelu(vis.perceive_conv0(iso_merged)))
         assert _relative_error(iso_out, ref_out) < 0.01
-        # End-to-end 27-layer SigLIP2 + perceive parity (o_proj is MXFP8 in the quantized checkpoint).
+        # End-to-end 27-layer SigLIP2 + perceive parity against BF16 Conv2d reference.
+        # Over 27 BF16 blocks on low-variance uniform-pos0 noise, BF16 vs FP32 itself is ~0.016-0.019;
+        # allow 0.03 for BF16 kernel rounding while staying well below online-MXFP8 drift (~0.08).
+        has_fp8_vit = any(t.dtype == torch.float8_e4m3fn for t in vit_w.values())
         cos_sim = float(F.cosine_similarity(vis_out.flatten().float(), ref_out.flatten().float(), dim=0))
-        assert cos_sim > 0.995
-        assert _relative_error(vis_out, ref_out) < 0.08
+        assert cos_sim > (0.995 if has_fp8_vit else 0.999)
+        assert _relative_error(vis_out, ref_out) < (0.08 if has_fp8_vit else 0.03)
 
 
 @torch.no_grad()
@@ -760,8 +849,8 @@ def test_online_mxfp8_loader_scopes_and_vision_cuda():
     del l0_draft, dfly_draft
     torch.cuda.empty_cache()
 
-    # scope='all' converts eligible target, DFly2, and SigLIP2 dense weights while preserving
-    # kv_b_proj, sparse indexer projections, and vit.fc2 (4304 % 32 != 0) in BF16.
+    # scope='all' converts eligible target, Engram, and DFly2 dense weights while preserving
+    # kv_b_proj, sparse indexer projections, and all SigLIP2 vision blocks at checkpoint precision.
     with Hy4WeightLoader(
         manifest,
         device,
@@ -775,7 +864,8 @@ def test_online_mxfp8_loader_scopes_and_vision_cuda():
     ) as loader:
         l0 = loader.load_layer(0)
         l1 = loader.load_layer(1)
-        vis_mx = loader.load_vision()
+        vis_loaded = loader.load_vision()
+        vit_w = {name: loader.load_tensor(name) for name in sorted(loader._sources) if name.startswith("vit.")}
         assert isinstance(l0.attention["qkv_a"], MXFP8LinearWeight)
         assert l0.attention["fused_gate"] is True
         assert isinstance(l0.attention["kv_b"], torch.Tensor)
@@ -787,38 +877,65 @@ def test_online_mxfp8_loader_scopes_and_vision_cuda():
         assert isinstance(l1.mlp.shared.gate_up, MXFP8LinearWeight)
         assert l1.mlp.experts_a4_prefill is False
         assert isinstance(l1.engram["kv_proj"], MXFP8LinearWeight)
-        b0 = vis_mx["blocks"][0]
-        assert isinstance(b0["qkv_w"], MXFP8LinearWeight)
-        assert isinstance(b0["o_w"], MXFP8LinearWeight)
-        assert isinstance(b0["fc1_w"], MXFP8LinearWeight)
-        assert isinstance(b0["fc2_w"], torch.Tensor)
+        for i, block in enumerate(vis_loaded["blocks"]):
+            p = f"vit.layers.{i}"
+            assert isinstance(block["qkv_w"], torch.Tensor if vit_w[f"{p}.self_attn.q_proj.weight"].dtype == torch.bfloat16 else MXFP8LinearWeight)
+            assert isinstance(block["o_w"], torch.Tensor if vit_w[f"{p}.self_attn.o_proj.weight"].dtype == torch.bfloat16 else MXFP8LinearWeight)
+            assert isinstance(block["fc1_w"], torch.Tensor if vit_w[f"{p}.mlp.dense_h_to_4h.weight"].dtype == torch.bfloat16 else MXFP8LinearWeight)
+            assert isinstance(block["fc2_w"], torch.Tensor if vit_w[f"{p}.mlp.dense_4h_to_h.weight"].dtype == torch.bfloat16 else MXFP8LinearWeight)
     del l0, l1
 
-    # Execute PreparedVision end-to-end with online-MXFP8 SigLIP2 weights.
-    v_patches = 64
-    v_inputs = VisionInputs.allocate(device, patches=v_patches)
-    v_scratch = VisionScratch.allocate(v_patches, device)
+    # Verify PreparedVision parity on a rectangular, non-tile-aligned padded grid (18x22 = 396 live
+    # patches inside a 512-patch graph) with RowNewline bilinear position interpolation and structured
+    # [-1, 1] pixel inputs that exercise deep SigLIP2 activation outliers and b12x varlen partial tiles.
+    grid_h, grid_w = 18, 22
+    v_patches = grid_h * grid_w  # 396: not divisible by 64 or 128
+    v_features = v_patches // 4  # 99 merged features (9 x 11)
+    cap_patches = 512
+    v_inputs = VisionInputs.allocate(device, patches=cap_patches)
+    v_scratch = VisionScratch.allocate(cap_patches, device)
+
     torch.manual_seed(2026)
-    v_inputs.vision_pixel_values.copy_(torch.randn(v_patches, VISION_PIXEL_WIDTH, device=device) * 0.2)
-    v_inputs.vision_interpolation_indices.zero_()
-    v_inputs.vision_interpolation_weights[:, 0].fill_(1.0)
+    ys = torch.linspace(-1.0, 1.0, grid_h * 16, device=device)[:, None]
+    xs = torch.linspace(-1.0, 1.0, grid_w * 16, device=device)[None, :]
+    img = torch.stack(
+        (
+            ys.expand(grid_h * 16, grid_w * 16),
+            xs.expand(grid_h * 16, grid_w * 16),
+            torch.sin(ys * 6.0) * torch.cos(xs * 6.0),
+        ),
+        dim=0,
+    )
+    img = (img + torch.randn_like(img) * 0.15).clamp(-1.0, 1.0)
+    pixels = (
+        img.view(3, grid_h, 16, grid_w, 16)
+        .permute(1, 3, 0, 2, 4)
+        .reshape(v_patches, VISION_PIXEL_WIDTH)
+        .contiguous()
+    )
+    interp_idx, interp_w = _row_newline_interp_grid(grid_h, grid_w, device=device)
+    merge = [
+        [r * grid_w + c, r * grid_w + c + 1, (r + 1) * grid_w + c, (r + 1) * grid_w + c + 1]
+        for r in range(0, grid_h, 2)
+        for c in range(0, grid_w, 2)
+    ]
+
+    v_inputs.vision_pixel_values[:v_patches].copy_(pixels)
+    v_inputs.vision_interpolation_indices[:v_patches].copy_(interp_idx)
+    v_inputs.vision_interpolation_weights[:v_patches].copy_(interp_w)
     v_inputs.vision_cu_seqlens[0] = 0
     v_inputs.vision_cu_seqlens[1] = v_patches
     v_inputs.vision_num_patches.fill_(v_patches)
-    v_inputs.vision_num_features.fill_(v_patches // 4)
-    merge = [
-        [r * 8 + c, r * 8 + c + 1, (r + 1) * 8 + c, (r + 1) * 8 + c + 1]
-        for r in range(0, 8, 2)
-        for c in range(0, 8, 2)
-    ]
-    v_inputs.vision_merge_indices.copy_(torch.tensor(merge, dtype=torch.int32, device=device))
+    v_inputs.vision_num_features.fill_(v_features)
+    v_inputs.vision_merge_indices.fill_(-1)
+    v_inputs.vision_merge_indices[:v_features].copy_(torch.tensor(merge, dtype=torch.int32, device=device))
 
     arena_v = ScratchArena(device)
     with RecordedPreparationSession(
         device=device, checkpoint="hy4-online-mxfp8-vision", workload_schema="online-mxfp8-vision", numerical_policy="default"
     ) as session:
         session.register_scratch(arena_v)
-        vis = PreparedVision(vis_mx, v_scratch, v_inputs, config=cfg, session=session, workspace=arena_v, name="vis64_mx")
+        vis = PreparedVision(vis_loaded, v_scratch, v_inputs, config=cfg, session=session, workspace=arena_v, name="vis512_rect")
         session.tune()
         vis_out = vis(
             v_inputs.vision_pixel_values,
@@ -828,8 +945,16 @@ def test_online_mxfp8_loader_scopes_and_vision_cuda():
             v_inputs.vision_merge_indices,
             v_inputs.vision_num_features,
         )
-        assert vis_out.shape == (16, HIDDEN_SIZE) and torch.isfinite(vis_out).all()
-        assert vis_out.abs().mean().item() > 0.01
+        assert vis_out.shape == (cap_patches // 4, HIDDEN_SIZE) and torch.isfinite(vis_out).all()
+        assert torch.equal(vis_out[v_features:], torch.zeros_like(vis_out[v_features:]))
+        _, ref_out = _reference_siglip2_vision(pixels, grid_h, grid_w, vit_w, cfg, uniform_pos0=False)
+        live_out = vis_out[:v_features]
+        has_fp8_vit = any(t.dtype == torch.float8_e4m3fn for t in vit_w.values())
+        cos_sim = float(F.cosine_similarity(live_out.flatten().float(), ref_out.flatten().float(), dim=0))
+        min_tok_cos = float(F.cosine_similarity(live_out.float(), ref_out.float(), dim=-1).min())
+        assert cos_sim > (0.995 if has_fp8_vit else 0.999)
+        assert min_tok_cos > (0.98 if has_fp8_vit else 0.998)
+        assert _relative_error(live_out, ref_out) < (0.08 if has_fp8_vit else 0.02)
 
 
 @torch.no_grad()

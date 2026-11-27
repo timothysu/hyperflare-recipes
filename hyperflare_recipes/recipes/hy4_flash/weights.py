@@ -228,15 +228,6 @@ class Hy4WeightLoader(DirectWeightLoader):
     def _quantize_draft_dense(self) -> bool:
         return self.online_mxfp8
 
-    def _can_mxfp8_tensor(self, tensor: torch.Tensor) -> bool:
-        return (
-            isinstance(tensor, torch.Tensor)
-            and tensor.dtype == torch.bfloat16
-            and tensor.ndim == 2
-            and tensor.shape[1] % 32 == 0
-            and tensor.shape[0] % 8 == 0
-        )
-
     def _load_mxfp8_mixed_group(self, prefixes: Sequence[str]):
         """Pack BF16 (quantized online) and stored MXFP8 rows into one MXFP8 weight without requantizing stored MXFP8."""
         from b12x.gemm._shared.wo_mxfp8 import quantize_mxfp8_rows_torch
@@ -623,13 +614,16 @@ class Hy4WeightLoader(DirectWeightLoader):
         )
 
     def load_vision(self) -> dict[str, object]:
-        """Load and pack SigLIP2 + vit.perceive weights once so all vision graphs share them."""
+        """Load and pack SigLIP2 + vit.perceive weights once so all vision graphs share them.
+
+        SigLIP2 stays at its checkpoint precision regardless of ``online_mxfp8`` because deep
+        SigLIP2 blocks produce ~1e3 activation outliers that degrade sharply under online MXFP8.
+        """
         vcfg = self.config.vision
         assert vcfg is not None
         h = vcfg.hidden_size
         out_h = vcfg.out_hidden_size
         pixel_w = 3 * vcfg.patch_size * vcfg.patch_size
-        allow = self._quantize_target_dense
         packed: dict[str, object] = {
             "patch_w": self.load_tensor("vit.embeddings.patch_embedding.weight").reshape(h, pixel_w),
             "patch_b": self.load_tensor("vit.embeddings.patch_embedding.bias"),
@@ -646,33 +640,26 @@ class Hy4WeightLoader(DirectWeightLoader):
         blocks = []
         for i in range(vcfg.num_hidden_layers):
             p = f"vit.layers.{i}"
-            q_w, k_w, v_w = self.load_tensors(
-                (f"{p}.self_attn.q_proj.weight", f"{p}.self_attn.k_proj.weight", f"{p}.self_attn.v_proj.weight"),
-                temporary=True,
-            )
             q_b, k_b, v_b = self.load_tensors(
                 (f"{p}.self_attn.q_proj.bias", f"{p}.self_attn.k_proj.bias", f"{p}.self_attn.v_proj.bias"),
                 temporary=True,
-            )
-            qkv_cat = torch.cat((q_w, k_w, v_w), dim=0) if allow else persistent_cat((q_w, k_w, v_w), dim=0)
-            qkv_w = (
-                quantize_bf16_linear_as_mxfp8(qkv_cat, retain_scale_rows=False)
-                if allow and self._can_mxfp8_tensor(qkv_cat)
-                else (persistent_copy(qkv_cat) if allow else qkv_cat)
             )
             blocks.append(
                 {
                     "ln1_w": self.load_tensor(f"{p}.input_layernorm.weight"),
                     "ln1_b": self.load_tensor(f"{p}.input_layernorm.bias"),
-                    "qkv_w": qkv_w,
+                    "qkv_w": self._load_opt_mxfp8_group(
+                        (f"{p}.self_attn.q_proj", f"{p}.self_attn.k_proj", f"{p}.self_attn.v_proj"),
+                        allow=False,
+                    ),
                     "qkv_b": persistent_cat((q_b, k_b, v_b), dim=0),
-                    "o_w": self._load_opt_mxfp8(f"{p}.self_attn.o_proj", allow=allow),
+                    "o_w": self._load_opt_mxfp8(f"{p}.self_attn.o_proj", allow=False),
                     "o_b": self.load_tensor(f"{p}.self_attn.o_proj.bias"),
                     "ln2_w": self.load_tensor(f"{p}.post_attention_layernorm.weight"),
                     "ln2_b": self.load_tensor(f"{p}.post_attention_layernorm.bias"),
-                    "fc1_w": self._load_opt_mxfp8(f"{p}.mlp.dense_h_to_4h", allow=allow),
+                    "fc1_w": self._load_opt_mxfp8(f"{p}.mlp.dense_h_to_4h", allow=False),
                     "fc1_b": self.load_tensor(f"{p}.mlp.dense_h_to_4h.bias"),
-                    "fc2_w": self._load_opt_mxfp8(f"{p}.mlp.dense_4h_to_h", allow=allow),
+                    "fc2_w": self._load_opt_mxfp8(f"{p}.mlp.dense_4h_to_h", allow=False),
                     "fc2_b": self.load_tensor(f"{p}.mlp.dense_4h_to_h.bias"),
                 }
             )
