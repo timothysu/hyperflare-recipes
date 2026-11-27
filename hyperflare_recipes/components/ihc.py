@@ -9,6 +9,7 @@ import triton.language as tl
 from triton.language.extra.cuda import libdevice
 
 from hyperflare_recipes.components.linear import UnquantizedProjection
+from ignition.preparation.triton import warmup_triton
 from ignition.preparation.tuning import register_finalizer
 
 
@@ -196,7 +197,7 @@ def _collapse(S, Stats, Mix, Base, Scale, Gain, Posts, Out, D: tl.constexpr,
     tl.store(Out + t * D + col, normalized, col < D)
 
 
-@torch.library.triton_op("flare::ihc_update", mutates_args=("updated", "stats"))
+@torch.library.custom_op("flare::ihc_update", mutates_args=("updated", "stats"))
 def _update_out(streams: torch.Tensor, branch: torch.Tensor | None, shared: torch.Tensor | None,
                 post: torch.Tensor | None, gain: torch.Tensor | None, fn: torch.Tensor | None,
                 updated: torch.Tensor | None, stats: torch.Tensor | None,
@@ -215,30 +216,56 @@ def _update_out(streams: torch.Tensor, branch: torch.Tensor | None, shared: torc
             raise ValueError("both iHC entry branches must have matching BF16 rows")
     elif shared is not None:
         raise ValueError("a shared iHC branch requires its routed branch")
-    block = triton.next_power_of_2(d)
+    _dispatch_update(streams, branch, shared, post, gain, fn, updated, stats, eps, gates, threads, pack, batch)
+
+
+@_update_out.register_fake
+def _update_fake(streams, branch, shared, post, gain, fn, updated, stats, eps, gates, threads, pack, batch):
+    return None
+
+
+def _dispatch_update(streams, branch, shared, post, gain, fn, updated, stats,
+                     eps, gates, threads, pack, batch, *, warmup=False):
+    tokens, _, d = streams.shape
     bs = 0 if branch is None else branch.stride(0)
     ss = 0 if shared is None else shared.stride(0)
+    operands = (streams, branch, shared, post, gain, updated)
+    shape = (tokens, d, triton.next_power_of_2(d), eps, branch is not None, shared is not None)
     if gates:
-        torch.library.wrap_triton(_prefill)[(triton.cdiv(tokens, batch),)](
-            streams, branch, shared, post, gain, updated, fn, stats, tokens, d, block, eps,
-            branch is not None, shared is not None, gates, threads, pack, batch, bs, ss,
-            num_warps=8, enable_fp_fusion=False)
+        kernel, grid = _prefill, (triton.cdiv(tokens, batch), 1, 1)
+        args = (*operands, fn, stats, *shape, gates, threads, pack, batch, bs, ss)
     else:
-        torch.library.wrap_triton(_update)[(tokens,)](
-            streams, branch, shared, post, gain, updated, stats, tokens, d, block, eps,
-            branch is not None, shared is not None, stats is not None, bs, ss,
-            num_warps=8, enable_fp_fusion=False)
+        kernel, grid = _update, (tokens, 1, 1)
+        args = (*operands, stats, *shape, stats is not None, bs, ss)
+    compiled = warmup_triton(kernel, args, grid, num_warps=8, enable_fp_fusion=False)
+    if warmup:
+        compiled._init_handles()
+    else:
+        compiled[grid](*args)
 
 
-@torch.library.triton_op("flare::ihc_collapse", mutates_args=("posts", "out"))
+@torch.library.custom_op("flare::ihc_collapse", mutates_args=("posts", "out"))
 def _collapse_out(streams: torch.Tensor, stats: torch.Tensor, mixes: torch.Tensor | None,
                   base: torch.Tensor, scale: torch.Tensor, norm: torch.Tensor,
                   posts: torch.Tensor | None, out: torch.Tensor, parts: int,
                   eps: float, hc_eps: float, magnitude: float) -> None:
+    _dispatch_collapse(streams, stats, mixes, base, scale, norm, posts, out, parts, eps, hc_eps, magnitude)
+
+
+@_collapse_out.register_fake
+def _collapse_fake(streams, stats, mixes, base, scale, norm, posts, out, parts, eps, hc_eps, magnitude):
+    return None
+
+
+def _dispatch_collapse(streams, stats, mixes, base, scale, norm, posts, out, parts,
+                       eps, hc_eps, magnitude, *, warmup=False):
     tokens, _, d = streams.shape
-    torch.library.wrap_triton(_collapse)[(tokens,)](
-        streams, stats, mixes, base, scale, norm, posts, out, d, triton.next_power_of_2(d),
-        base.numel(), parts, eps, hc_eps, magnitude, enable_fp_fusion=False)
+    args = (streams, stats, mixes, base, scale, norm, posts, out, d, triton.next_power_of_2(d),
+            base.numel(), parts, eps, hc_eps, magnitude)
+    if warmup:
+        warmup_triton(_collapse, args, (tokens,), enable_fp_fusion=False)._init_handles()
+    else:
+        _collapse[(tokens,)](*args, enable_fp_fusion=False)
 
 
 def post_norm(streams, branch, shared, post, gain, eps):
@@ -272,14 +299,36 @@ class PreparedIHC:
             streams.view(t, -1), fn, mixes, session=session, name=name,
         ).functional(session=session)
         if self.prefill:
-            register_finalizer(session, self._bind_projection)
+            register_finalizer(session, lambda: self._bind_projection(streams))
+        else:
+            self._warm_kernels(streams)
 
-    def _bind_projection(self):
+    def _bind_projection(self, streams):
         config = self.projection.plan.selection.config
         if config.backend not in ("mixed_vector", "simt"):
             raise ValueError(f"unsupported FP32 iHC projection schedule {config.backend}")
         self.threads = config.block_threads
         self.pack = 4 if config.backend == "mixed_vector" else 1
+        self._warm_kernels(streams)
+
+    def _warm_kernels(self, streams):
+        if isinstance(streams, torch._subclasses.FakeTensor):
+            return
+        t, _, d = streams.shape
+        branch = streams.view(-1, d)[:t]
+        # Warmup specializes on pointer type and alignment without accessing the buffers.
+        stats = self.fn
+        gates = self.gates if self.prefill else 0
+        for first, second in ((None, None), (branch, None), (branch, branch)):
+            entry = first is not None
+            operands = (streams, first, second, stats if entry else None, self.norm if entry else None)
+            _dispatch_update(*operands, self.fn, streams if entry else None, stats, self.eps,
+                             gates, self.threads, self.pack, self.batch, warmup=True)
+            if entry and self.gates == 8:
+                _dispatch_update(*operands, None, streams, None, self.eps, 0, 32, 1, 1, warmup=True)
+        _dispatch_collapse(streams, stats, None if self.prefill else stats, self.base, self.scale, self.norm,
+                           stats if self.gates == 8 else None, branch, self.threads // 32 if self.prefill else 0,
+                           self.eps, self.hc_eps, self.magnitude, warmup=True)
 
     def __call__(self, streams, branch=None, shared=None, post=None, gain=None):
         if streams.shape != self.shape:

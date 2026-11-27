@@ -236,3 +236,117 @@ def test_checkpoint_boundary_against_fp32_linear():
     error = actual.float() - linear.float()
     assert error.abs().max() <= peak_ulp
     assert error.norm() / linear.float().norm() < 1e-4
+
+
+class _EngramBoundaryForward:
+    def __init__(self, tokens, nvfp4):
+        from types import SimpleNamespace
+        from b12x.preparation import PreparationSession
+        from ignition.components.engram import EngramInputs
+        from ignition.components.readiness import ReadinessTimings
+        from hyperflare_recipes.components.ihc import PreparedIHC
+        from hyperflare_recipes.recipes.hy4_flash.engram import EngramScratch, PreparedEngram
+
+        device = torch.device("cuda", 0)
+        def ones(*shape, dtype=torch.bfloat16):
+            return torch.ones(shape, device=device, dtype=dtype)
+
+        d, heads = 3072, 16
+        session = PreparationSession()
+        self.streams = ones(tokens, 4, d)
+        self.routed, self.shared = ones(tokens, d), ones(tokens, d)
+        self.post, self.gain = ones(tokens, 4, dtype=torch.float32), ones(d)
+        self.boundary = PreparedIHC(
+            self.streams, ones(tokens, 8, dtype=torch.float32), ones(8, 4*d, dtype=torch.float32),
+            ones(8, dtype=torch.float32), ones(2, dtype=torch.float32), self.gain,
+            eps=1e-5, hc_eps=1e-6, magnitude=2., session=session, name="boundary",
+        )
+        ids = torch.arange(tokens, device=device)
+        self.meta = SimpleNamespace(token_ids=ids, positions=ids.clone())
+        frame = torch.zeros(1, device=device, dtype=torch.int32)
+        delivery = EngramInputs.allocate(tokens, device, timings=ReadinessTimings.allocate(frame, 1),
+                                         heads=heads, row_bytes=48 if nvfp4 else 96, scale_bytes=6 if nvfp4 else 3)
+        self.event = delivery.ready
+        delivery.weights.fill_(17)
+        delivery.scales.fill_(56 if nvfp4 else 127)
+        delivery.hashes.zero_()
+        spec = SimpleNamespace(layer=1, encoding="NVFP4_E4M3_GLOBAL" if nvfp4 else "FP8_E4M3_E8M0", global_scale=1.)
+        tables = SimpleNamespace(pad_token_id=-1, specs=[spec], inputs={1: delivery}, readiness_runtime=None)
+        weights = {f"lookup_per_head_norms.{i}": ones(96) for i in range(heads)}
+        weights.update({f"{key}.{i}": ones(d) for i in range(4)
+                        for key in ("norm_key", "norm_query", "unified_per_hc_scales")})
+        weights.update(unified_pre_gamma=ones(d), kv_proj=ones(5*d, heads*96), kv_bias=ones(5*d))
+        self.engram = PreparedEngram(1, weights, tables, self.streams, self.meta,
+                                     scratch=EngramScratch.allocate(tokens, device),
+                                     session=session, name="engram", workspace=None)
+
+    def __call__(self):
+        from hyperflare_recipes.components.ihc import post_norm
+        streams = post_norm(self.streams, self.routed, self.shared, self.post, self.gain, 1e-5)
+        streams = self.engram(streams, self.meta)
+        return self.boundary(streams, self.routed, self.shared, self.post, self.gain)[2]
+
+
+def _export_boundaries(root):
+    from pathlib import Path
+    from ignition.preparation.aot import ForwardCache
+    from ignition.preparation.core_file import read_sources
+    from ignition.preparation.execution import GraphSignature
+    from ignition.preparation.module_images import ModuleImages
+    from ignition.preparation.runtime_core import Allocation, RuntimeCore, capture_graph, instantiate_graph
+    from ignition.progress import StartupProgress
+    from triton import knobs
+
+    root = Path(root)
+    symbols = {"_update", "_prefill", "_collapse", "_head_kernel", "_mix_kernel"}
+    loads = []
+    def loaded(module, function, name, metadata, kernel_hash):
+        if name in symbols:
+            loads.append(name)
+
+    with ModuleImages() as images, pytest.MonkeyPatch.context() as patch:
+        patch.setattr(knobs.runtime, "kernel_load_end_hook", loaded)
+        torch.cuda.set_device(0)
+        forwards = {"decode": _EngramBoundaryForward(4, False), "prefill": _EngramBoundaryForward(128, True)}
+        assert set(loads) == symbols
+        loads.clear()
+        signatures = {name: GraphSignature(name, fn.streams.shape[0], 1) for name, fn in forwards.items()}
+        cache = ForwardCache(namespace={"component": "engram-ihc"}, device="cuda:0", root=root, compile_workers=1)
+        compiled = cache.prepare_many(forwards, signatures, progress=StartupProgress())
+        graphs = {}
+        for name, bound in compiled.items():
+            graph = capture_graph(retain_graphs=True)
+            with torch.cuda.graph(graph):
+                output = bound()
+            instantiate_graph(graph)
+            graph.replay()
+            torch.testing.assert_close(output, forwards[name](), atol=0, rtol=0)
+            graphs[name] = graph
+
+        assert not loads, f"Triton modules first loaded after preparation: {loads}"
+        allocations = [Allocation(f"segment-{i}", seg["address"], seg["total_size"], initialize="zero")
+                       for i, seg in enumerate(torch.cuda.memory_snapshot())]
+        package = RuntimeCore(allocations=allocations, modules={}, kernels=(), recorder=images.native,
+                              owners=(forwards, compiled), events={name: f.event.cuda_event for name, f in forwards.items()})
+        path = root / "boundary-rank.json"
+        package.write(path, graphs, sources=True)
+        index, locate = read_sources(path)
+        rank, = index.ranks
+        files = {m.name: m.file for m in rank.modules}
+        for symbol in symbols:
+            modules = {f.module for f in rank.functions if f.symbol == symbol}
+            assert modules, (symbol, [f.symbol for f in rank.functions])
+            for module in modules:
+                span = rank.resources[files[module]]
+                (source, offset, _), *_ = locate(span)
+                with source.open("rb") as image:
+                    image.seek(offset)
+                    assert image.read(4) == b"\x7fELF"
+
+
+def test_export_compiled_engram_boundaries(tmp_path):
+    # CUPTI must subscribe before Triton loads these modules in the process.
+    import subprocess
+    import sys
+    subprocess.run([sys.executable, "-c", "from tests.components.test_ihc_cuda import _export_boundaries; "
+                    "import sys; _export_boundaries(sys.argv[1])", str(tmp_path)], check=True)

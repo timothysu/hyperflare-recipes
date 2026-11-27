@@ -28,6 +28,7 @@ from ignition.components.readiness import PreparedReadinessWait, ReadinessTiming
 from ignition.components.state import gather_rows, save_hidden
 from ignition.preparation.persistent import persistent_copy
 from ignition.preparation.runtime_core import FileSource
+from ignition.preparation.triton import warmup_triton
 from ignition.progress import phase
 
 from .config import (
@@ -527,16 +528,29 @@ def _head_kernel(W, Scale, Hash, Gain, Lut, Out, GLOBAL: tl.constexpr, NVFP4: tl
     tl.store(Out + row[:, None] * D + col[None, :], normalized * gain, valid)
 
 
-@torch.library.triton_op("flare::hy4_engram_heads", mutates_args=())
+@torch.library.custom_op("flare::hy4_engram_heads", mutates_args=())
 def _decode_heads_op(weights: torch.Tensor, scales: torch.Tensor, hashes: torch.Tensor,
                   gains: torch.Tensor, lut: torch.Tensor | None, global_scale: float, rows: int) -> torch.Tensor:
     tokens, heads = hashes.shape
     width = gains.shape[1]
     out = torch.empty((tokens, heads * width), dtype=torch.bfloat16, device=weights.device)
-    torch.library.wrap_triton(_head_kernel)[(tokens * heads // rows,)](
-        weights, scales, hashes, gains, lut, out, global_scale, lut is not None, width, heads,
-        rows, enable_fp_fusion=False)
+    _dispatch_heads(weights, scales, hashes, gains, lut, out, global_scale, rows)
     return out
+
+
+@_decode_heads_op.register_fake
+def _decode_heads_fake(weights, scales, hashes, gains, lut, global_scale, rows):
+    return weights.new_empty((hashes.shape[0], hashes.shape[1] * gains.shape[1]), dtype=torch.bfloat16)
+
+
+def _dispatch_heads(weights, scales, hashes, gains, lut, out, global_scale, rows, *, warmup=False):
+    tokens, heads = hashes.shape
+    grid = (tokens * heads // rows,)
+    args = (weights, scales, hashes, gains, lut, out, global_scale, lut is not None, gains.shape[1], heads, rows)
+    if warmup:
+        warmup_triton(_head_kernel, args, grid, enable_fp_fusion=False)._init_handles()
+    else:
+        _head_kernel[grid](*args, enable_fp_fusion=False)
 
 
 def _decode_heads(weights, scales, hashes, gains, lut, global_scale):
@@ -581,17 +595,29 @@ def _mix_kernel(S, K, V, KG, QG, Gamma, Scale, Pos, Id, Out, KS: tl.constexpr,
     tl.store(Out + t * 4 * D + offset, x + tl.where(live, delta, 0.), valid)
 
 
-@torch.library.triton_op("flare::hy4_engram_mix", mutates_args=())
+@torch.library.custom_op("flare::hy4_engram_mix", mutates_args=())
 def _mix_streams(streams: torch.Tensor, keys: torch.Tensor, values: torch.Tensor,
                  k_gain: torch.Tensor, q_gain: torch.Tensor, gamma: torch.Tensor, scales: torch.Tensor,
                  positions: torch.Tensor, tokens: torch.Tensor, pad: int) -> torch.Tensor:
-    rows, lanes, d = streams.shape
     out = torch.empty_like(streams)
-    torch.library.wrap_triton(_mix_kernel)[(rows, lanes)](
-        streams, keys, values, k_gain, q_gain, gamma, scales, positions, tokens, out, keys.stride(0),
-        values.stride(0), positions.stride(0), tokens.stride(0), d, triton.next_power_of_2(d),
-        pad, IMAGE_TOKEN, IMAGE_NEWLINE_TOKEN, VIDEO_TOKEN, rows, enable_fp_fusion=False)
+    _dispatch_mix(streams, keys, values, k_gain, q_gain, gamma, scales, positions, tokens, out, pad)
     return out
+
+
+@_mix_streams.register_fake
+def _mix_fake(streams, keys, values, k_gain, q_gain, gamma, scales, positions, tokens, pad):
+    return torch.empty_like(streams)
+
+
+def _dispatch_mix(streams, keys, values, k_gain, q_gain, gamma, scales, positions, tokens, out, pad, *, warmup=False):
+    rows, lanes, d = streams.shape
+    args = (streams, keys, values, k_gain, q_gain, gamma, scales, positions, tokens, out, keys.stride(0),
+            values.stride(0), positions.stride(0), tokens.stride(0), d, triton.next_power_of_2(d),
+            pad, IMAGE_TOKEN, IMAGE_NEWLINE_TOKEN, VIDEO_TOKEN, rows)
+    if warmup:
+        warmup_triton(_mix_kernel, args, (rows, lanes), enable_fp_fusion=False)._init_handles()
+    else:
+        _mix_kernel[(rows, lanes)](*args, enable_fp_fusion=False)
 
 
 class PreparedEngram:
@@ -674,6 +700,18 @@ class PreparedEngram:
         self.branch_scales = persistent_copy(
             torch.stack([weights[f"unified_per_hc_scales.{hc}"] for hc in range(HC_MULT)], dim=0)
         )  # [4, 3072]
+
+        if not isinstance(source, torch._subclasses.FakeTensor):
+            _dispatch_heads(self.weights_buf, self.scales_buf, self.hashes_buf, self.head_norms, self.fp4_lut,
+                            scratch.embeddings, self.global_scale or 1.0, ENGRAM_HEADS if tokens > 64 else 1,
+                            warmup=True)
+            if self.kv_proj is None:
+                keys, values = source, scratch.value_proj
+            else:
+                kv = scratch.kv_proj.view(tokens, HC_MULT + 1, HIDDEN_SIZE)
+                keys, values = kv[:, :HC_MULT], kv[:, HC_MULT]
+            _dispatch_mix(source, keys, values, self.norm_keys, self.norm_queries, self.unified_pre_gamma,
+                          self.branch_scales, metadata.positions, metadata.token_ids, source, self.pad_id, warmup=True)
 
     def __call__(self, streams: torch.Tensor, metadata) -> torch.Tensor:
         tokens = streams.shape[0]
