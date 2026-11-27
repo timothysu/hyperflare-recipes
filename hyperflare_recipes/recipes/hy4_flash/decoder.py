@@ -10,10 +10,9 @@ from dataclasses import dataclass
 import torch
 
 from hyperflare_recipes.components.embedding import PreparedEmbedding
-from hyperflare_recipes.components.linear import UnquantizedProjection
+from hyperflare_recipes.components.ihc import PreparedIHC, post_norm
 from hyperflare_recipes.components.paged_batch import rotary_positions
 from hyperflare_recipes.components.ring_commit import PreparedRingCommit
-from hyperflare_recipes.components.rms_norm import PreparedRMSNorm
 from ignition.components.state import save_hidden
 from hyperflare_recipes.components.vocabulary import PreparedVocabularyProjection
 from ignition.preparation.tuning import register_finalizer
@@ -28,7 +27,6 @@ from .attention import (
 )
 from .config import HC_MULT, HIDDEN_SIZE, INDEX_TOPK, SWA_WINDOW, VOCABULARY
 from .engram import EngramScratch, PreparedEngram, PreparedTableRequests
-from .ihc import ihc_head, ihc_post, ihc_pre
 from .indexer import expand_pooled_topk_to_logical_tokens
 from .moe import MoEScratch, PreparedDenseMLP, PreparedLatentMoE
 from .pool import SWA_RECORD_WIDTH
@@ -46,12 +44,10 @@ class Scratch:
     hc_mixes: torch.Tensor
     head_streams: torch.Tensor
     head_hc_mixes: torch.Tensor
-    branch_in: torch.Tensor
     normalized: torch.Tensor
     engram: EngramScratch
     attention: AttentionScratch
     moe: MoEScratch
-    collapsed: torch.Tensor
     hidden: torch.Tensor
     local_logits: torch.Tensor
     logits: torch.Tensor
@@ -91,12 +87,10 @@ class Scratch:
             hc_mixes=zeros(tokens, 2 * HC_MULT, dtype=torch.float32),
             head_streams=zeros(samples, HC_MULT, HIDDEN_SIZE),
             head_hc_mixes=zeros(samples, HC_MULT, dtype=torch.float32),
-            branch_in=zeros(tokens, HIDDEN_SIZE),
             normalized=zeros(tokens, HIDDEN_SIZE),
             engram=EngramScratch.allocate(tokens, device),
             attention=AttentionScratch.allocate(tokens, rows, max_query_tokens, device),
             moe=MoEScratch.allocate(tokens, device),
-            collapsed=zeros(samples, HIDDEN_SIZE),
             hidden=zeros(samples, HIDDEN_SIZE),
             local_logits=zeros(samples, local_vocab, dtype=resolved_logits_dtype),
             logits=zeros(samples, VOCABULARY, dtype=resolved_logits_dtype),
@@ -110,12 +104,10 @@ class Scratch:
             hc_mixes=self.hc_mixes[:tokens],
             head_streams=self.head_streams[:samples],
             head_hc_mixes=self.head_hc_mixes[:samples],
-            branch_in=self.branch_in[:tokens],
             normalized=self.normalized[:tokens],
             engram=self.engram.rows(tokens),
             attention=self.attention.rows(tokens, rows, max_query_tokens),
             moe=self.moe.rows(tokens),
-            collapsed=self.collapsed[:samples],
             hidden=self.hidden[:samples],
             local_logits=self.local_logits[:samples],
             logits=self.logits[:samples],
@@ -162,7 +154,6 @@ class PreparedLayer:
         self.eps = float(text["rms_norm_eps"])
         self.hc_eps = float(text["hc_eps"])
         self.hc_magnitude = float(text["hc_magnitude"])
-        self.residual = weights.residual
 
         self.engram = None
         if weights.engram is not None:
@@ -179,30 +170,17 @@ class PreparedLayer:
                 coordinator=coordinator,
             )
 
-        tokens = scratch.streams.shape[0]
-        self.attn_hc_proj = UnquantizedProjection(
-            scratch.streams.view(tokens, -1),
-            weights.residual["attn_fn"],
-            scratch.hc_mixes,
-            session=session,
-            name=f"{name}.hc_attn",
-        ).functional(session=session)
-        self.mlp_hc_proj = UnquantizedProjection(
-            scratch.streams.view(tokens, -1),
-            weights.residual["mlp_fn"],
-            scratch.hc_mixes,
-            session=session,
-            name=f"{name}.hc_mlp",
-        ).functional(session=session)
+        def boundary(prefix, norm):
+            return PreparedIHC(
+                scratch.streams, scratch.hc_mixes, weights.residual[f"{prefix}_fn"],
+                weights.residual[f"{prefix}_base"], weights.residual[f"{prefix}_scale"],
+                weights.residual[norm], eps=self.eps, hc_eps=self.hc_eps, magnitude=self.hc_magnitude,
+                session=session, name=f"{name}.hc_{prefix}",
+            )
 
-        self.input_norm = PreparedRMSNorm(
-            scratch.branch_in,
-            weights.residual["input_norm"],
-            scratch.normalized,
-            eps=self.eps,
-            session=session,
-            name=f"{name}.input_norm",
-        ).functional()
+        self.attn_ihc = boundary("attn", "input_norm")
+        self.mlp_ihc = boundary("mlp", "post_attn_norm")
+        self.attn_output_gain = weights.attention["post_proj_norm"]
         if config.is_indexed(index):
             self.attention = PreparedSparseAttention(
                 index,
@@ -214,6 +192,7 @@ class PreparedLayer:
                 pool,
                 rotary,
                 mode=mode,
+                apply_post_norm=False,
                 eps=self.eps,
                 session=session,
                 name=f"{name}.attention",
@@ -231,25 +210,20 @@ class PreparedLayer:
                 pool,
                 rotary,
                 mode=mode,
+                apply_post_norm=False,
                 eps=self.eps,
                 session=session,
                 name=f"{name}.attention",
                 workspace=workspace,
             )
 
-        self.post_attn_norm = PreparedRMSNorm(
-            scratch.branch_in,
-            weights.residual["post_attn_norm"],
-            scratch.normalized,
-            eps=self.eps,
-            session=session,
-            name=f"{name}.post_attn_norm",
-        ).functional()
         if config.is_sparse_mlp(index):
+            self.mlp_output_gain = weights.mlp.combine_norm
             self.mlp = PreparedLatentMoE(
                 weights.mlp,
                 scratch.normalized,
                 scratch.moe,
+                apply_combine_norm=False,
                 config=config,
                 mode=mode,
                 session=session,
@@ -257,10 +231,12 @@ class PreparedLayer:
                 workspace=workspace,
             )
         else:
+            self.mlp_output_gain = weights.mlp.post_fc2_norm
             self.mlp = PreparedDenseMLP(
                 weights.mlp,
                 scratch.normalized,
                 scratch.moe,
+                apply_post_norm=False,
                 eps=self.eps,
                 session=session,
                 name=f"{name}.mlp",
@@ -276,58 +252,37 @@ class PreparedLayer:
         streams: torch.Tensor,
         metadata,
         *,
+        previous,
         cos_sin: tuple[torch.Tensor, torch.Tensor] | None = None,
         sparse_slots: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
         swa_plan: tuple | None = None,
         window_cache: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, object, torch.Tensor | None]:
+    ):
         if self.engram is not None:
+            if previous:
+                streams = post_norm(streams, *previous, self.eps)
             streams = self.engram(streams, metadata)
-
-        r = self.residual
-        tokens = streams.shape[0]
-        attn_mixes = self.attn_hc_proj(streams.view(tokens, -1))
-        attn_post, attn_in = ihc_pre(
-            streams,
-            r["attn_fn"],
-            r["attn_base"],
-            r["attn_scale"],
-            rms_eps=self.eps,
-            hc_eps=self.hc_eps,
-            hc_magnitude=self.hc_magnitude,
-            mixes=attn_mixes,
-        )
+            previous = ()
+        streams, attn_post, attn_in = self.attn_ihc(streams, *previous)
         if isinstance(self.attention, PreparedSparseAttention):
             attn_out, attn_record, physical = self.attention(
-                self.input_norm(attn_in),
+                attn_in,
                 metadata,
                 cos_sin=cos_sin,
                 sparse_slots=sparse_slots,
             )
         else:
             attn_out, attn_record, physical = self.attention(
-                self.input_norm(attn_in),
+                attn_in,
                 metadata,
                 cos_sin=cos_sin,
                 swa_plan=swa_plan,
                 window_cache=window_cache,
             )
-        streams = ihc_post(streams, attn_out, attn_post)
-
-        mlp_mixes = self.mlp_hc_proj(streams.view(tokens, -1))
-        mlp_post, mlp_in = ihc_pre(
-            streams,
-            r["mlp_fn"],
-            r["mlp_base"],
-            r["mlp_scale"],
-            rms_eps=self.eps,
-            hc_eps=self.hc_eps,
-            hc_magnitude=self.hc_magnitude,
-            mixes=mlp_mixes,
-        )
-        mlp_out = self.mlp(self.post_attn_norm(mlp_in))
-        streams = ihc_post(streams, mlp_out, mlp_post)
-        return streams, attn_record, physical
+        streams, post, mlp_in = self.mlp_ihc(streams, attn_out, None, attn_post, self.attn_output_gain)
+        output = self.mlp(mlp_in)
+        branch, shared = output if isinstance(output, tuple) else (output, None)
+        return streams, (branch, shared, post, self.mlp_output_gain), attn_record, physical
 
 
 class PreparedDecoder:
@@ -431,39 +386,13 @@ class PreparedDecoder:
             for index, layer_weights in enumerate(weights.layers)
         )
 
-        if scoring is not None:
-            head_in = scratch.streams.view(scratch.streams.shape[0], -1)
-            head_out = torch.zeros((scratch.streams.shape[0], HC_MULT), dtype=torch.float32, device=head_in.device)
-        else:
-            head_in = scratch.head_streams.view(scratch.head_streams.shape[0], -1)
-            head_out = scratch.head_hc_mixes
-        self.head_hc_proj = UnquantizedProjection(
-            head_in,
-            weights.hc_head["fn"],
-            head_out,
-            session=session,
-            name=f"{name}.hc_head",
-        ).functional(session=session)
-
-        self.final_norm = PreparedRMSNorm(
-            scratch.collapsed,
-            weights.norm,
-            scratch.hidden,
-            eps=self.eps,
-            session=session,
-            name=f"{name}.final_norm",
-        ).functional()
-        self.scoring_norm = (
-            None
-            if scoring is None
-            else PreparedRMSNorm(
-                scratch.embedding,
-                weights.norm,
-                scratch.embedding,
-                eps=self.eps,
-                session=session,
-                name=f"{name}.scoring_norm",
-            ).functional()
+        head_streams = scratch.streams if scoring is not None else scratch.head_streams
+        head_out = (torch.empty((head_streams.shape[0], HC_MULT), dtype=torch.float32, device=head_streams.device)
+                    if scoring is not None else scratch.head_hc_mixes)
+        self.head_ihc = PreparedIHC(
+            head_streams, head_out, weights.hc_head["fn"], weights.hc_head["base"],
+            weights.hc_head["scale"], weights.norm, eps=self.eps, hc_eps=self.hc_eps,
+            magnitude=1., session=session, name=f"{name}.hc_head",
         )
         self.scoring = (
             None
@@ -499,23 +428,30 @@ class PreparedDecoder:
         for layer in self.layers:
             layer.rebind_pages()
 
+    @staticmethod
+    def _last_tokens(counts, metadata):
+        return (metadata.query_start_loc[:-1].long() + counts.long() - 1).clamp(0, metadata.positions.numel() - 1)
+
     def _save_dfly_indices(
         self,
         counts: torch.Tensor,
         dfly_pools: dict[int, torch.Tensor],
         metadata,
+        last_tok: torch.Tensor | None = None,
     ) -> None:
         if not self.dfly_index_layers or not dfly_pools:
             return
         m = metadata
         rows = m.starts.numel()
         active = counts > 0
-        last_tok = (m.query_start_loc[:-1].long() + counts.long() - 1).clamp(0, m.positions.numel() - 1)
+        if last_tok is None:
+            last_tok = self._last_tokens(counts, m)
+            dfly_pools = {layer: pools.index_select(0, last_tok) for layer, pools in dfly_pools.items()}
         last_pos = torch.where(active, m.positions[last_tok], -1)
         stacked = torch.stack(
             [
                 expand_pooled_topk_to_logical_tokens(
-                    dfly_pools[layer][last_tok],
+                    dfly_pools[layer],
                     last_pos,
                     width=self.dfly_topk,
                 )
@@ -554,63 +490,47 @@ class PreparedDecoder:
         streams = embedding[:, None, :].expand(-1, HC_MULT, -1).contiguous()
         layer_records = []
         dfly_pools: dict[int, torch.Tensor] = {}
+        last_tok = self._last_tokens(m.lengths, m) if self.mode != "verify" and self.dfly_index_layers else None
+        previous = ()
         for index, layer in enumerate(self.layers):
             swa_pos = self.swa_indices.get(index)
             if swa_pos is None:
-                streams, record, pools = layer(
+                streams, previous, record, pools = layer(
                     streams,
                     m,
+                    previous=previous,
                     cos_sin=cos_sin_idx,
                     sparse_slots=sparse_slots,
                 )
             else:
-                streams, record, pools = layer(
+                streams, previous, record, pools = layer(
                     streams,
                     m,
+                    previous=previous,
                     cos_sin=cos_sin_swa,
                     swa_plan=swa_plan,
                     window_cache=None if ring_staging is None else ring_staging[swa_pos],
                 )
             layer_records.append(record)
             if pools is not None and index in self.dfly_index_layers:
-                dfly_pools[index] = pools
+                dfly_pools[index] = pools if last_tok is None else pools.index_select(0, last_tok)
 
         samples = m.sample_indices
-        hc_head_w = self.weights.hc_head
         if self.scoring is not None:
-            all_mixes = self.head_hc_proj(streams.view(streams.shape[0], -1))
-            all_collapsed = ihc_head(
-                streams,
-                hc_head_w["fn"],
-                hc_head_w["base"],
-                hc_head_w["scale"],
-                rms_eps=self.eps,
-                hc_eps=self.hc_eps,
-                mixes=all_mixes,
-            )
-            all_normed = self.scoring_norm(all_collapsed)
+            _, _, all_normed = self.head_ihc(streams, *previous)
             self.scoring(all_normed)
             hidden = all_normed[samples].contiguous()
         else:
-            sampled_streams = streams[samples].contiguous()
-            head_mixes = self.head_hc_proj(sampled_streams.view(sampled_streams.shape[0], -1))
-            collapsed = ihc_head(
-                sampled_streams,
-                hc_head_w["fn"],
-                hc_head_w["base"],
-                hc_head_w["scale"],
-                rms_eps=self.eps,
-                hc_eps=self.hc_eps,
-                mixes=head_mixes,
-            )
-            hidden = self.final_norm(collapsed)
+            branch, shared, post, gain = previous
+            _, _, hidden = self.head_ihc(streams[samples], branch[samples], None if shared is None else shared[samples],
+                                        post[samples], gain)
 
         logits = self.head(hidden)
         if self.mode != "verify":
             if self.window_commit is not None and ring_staging is not None:
                 self.window_commit(m.lengths, staging=ring_staging, rows=m.state_rows, starts=m.starts)
             self.table_requests.commit(m.lengths, raw_history, m)
-            self._save_dfly_indices(m.lengths, dfly_pools, m)
+            self._save_dfly_indices(m.lengths, dfly_pools, m, last_tok)
         return hidden, logits, None, (ring_staging, tuple(layer_records), raw_history, dfly_pools)
 
     def commit(self, counts: torch.Tensor, records, metadata) -> None:

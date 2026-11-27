@@ -3,11 +3,7 @@
 
 """Host-backed FP8_E4M3_E8M0 / NVFP4_E4M3_GLOBAL n-gram tables, GPU hashing, and 4-stream Engram injection.
 
-Dequantization runs in PyTorch rather than ``flare::staged_engram``
-(``ignition/components/engram.py``, backed by ``b12x.sequence.engram._kernels.lookup_op``)
-because that fused lookup kernel supports only 24-head width-256 FP8 tables, whereas
-Hy4-flash uses 16-head width-96 tables in either FP8_E4M3_E8M0 or NVFP4_E4M3_GLOBAL format.
-N-gram hashing likewise runs in PyTorch (``PreparedTableRequests``) because
+Each delivered row contains one 96-element head. N-gram hashing runs in PyTorch (``PreparedTableRequests``) because
 ``ignition.components.engram.PreparedEngramRequests`` targets order-4 24-head hashing with a
 3-token history window, whereas Hy4-flash hashes order-3 (2-gram and 3-gram) 16-head tables
 over a 2-token continuation history.
@@ -20,9 +16,13 @@ from functools import cached_property
 
 import numpy as np
 import torch
+import triton
+import triton.language as tl
+from triton.language.extra.cuda import libdevice
 
-from ignition.components.engram import EngramInputs
+from hyperflare_recipes.components.ihc import row_sum_fp32
 from hyperflare_recipes.components.linear import prepare_projection
+from ignition.components.engram import EngramInputs
 from ignition.components.ngram_delivery import publish_requests
 from ignition.components.readiness import PreparedReadinessWait, ReadinessTimings, wait_for_readiness
 from ignition.components.state import gather_rows, save_hidden
@@ -495,6 +495,105 @@ def _wait_ready_fake(
     pass
 
 
+@triton.jit
+def _head_kernel(W, Scale, Hash, Gain, Lut, Out, GLOBAL: tl.constexpr, NVFP4: tl.constexpr,
+                 D: tl.constexpr, HEADS: tl.constexpr, ROWS: tl.constexpr):
+    row = tl.program_id(0) * ROWS + tl.arange(0, ROWS)
+    col = tl.arange(0, 128)
+    valid = col[None, :] < D
+    if NVFP4:
+        byte = tl.load(W + row[:, None] * (D // 2) + col[None, :] // 2, valid, 0)
+        idx = (byte >> ((col[None, :] % 2) * 4)) & 15
+        value = tl.load(Lut + idx)
+        block = tl.load(Scale + row[:, None] * (D // 16) + col[None, :] // 16, valid, 0)
+        scale = block.to(tl.float8e4nv, bitcast=True).to(tl.float32) * GLOBAL
+    else:
+        byte = tl.load(W + row[:, None] * D + col[None, :], valid, 0)
+        value = byte.to(tl.float8e4nv, bitcast=True).to(tl.float32)
+        exp = tl.load(Scale + row[:, None] * (D // 32) + col[None, :] // 32, valid, 127)
+        # The smallest stored exponent represents the FP32 subnormal 2**-127.
+        scale = tl.where(exp == 0, 1 << 22, exp.to(tl.int32) << 23).to(tl.float32, bitcast=True)
+    x = tl.where(valid & (tl.load(Hash + row) >= 0)[:, None], value * scale, 0.).to(tl.bfloat16).to(tl.float32)
+    lo, hi = tl.split(tl.permute(tl.reshape(x * x, (ROWS, 2, 64)), (0, 2, 1)))
+    first, second = tl.split(tl.permute(tl.reshape(lo, (ROWS, 2, 32)), (0, 2, 1)))
+    third, _ = tl.split(tl.permute(tl.reshape(hi, (ROWS, 2, 32)), (0, 2, 1)))
+    squares = (first + second) + third
+    for level in tl.static_range(5):
+        lo, hi = tl.split(tl.permute(tl.reshape(squares, (ROWS, 2, 16 >> level)), (0, 2, 1)))
+        squares = lo + hi
+    inv = tl.rsqrt(squares * (1. / D) + 0.0078125)
+    normalized = (x * inv).to(tl.bfloat16).to(tl.float32)
+    gain = tl.load(Gain + (row[:, None] % HEADS) * D + col[None, :], valid, 0).to(tl.float32)
+    tl.store(Out + row[:, None] * D + col[None, :], normalized * gain, valid)
+
+
+@torch.library.triton_op("flare::hy4_engram_heads", mutates_args=())
+def _decode_heads_op(weights: torch.Tensor, scales: torch.Tensor, hashes: torch.Tensor,
+                  gains: torch.Tensor, lut: torch.Tensor | None, global_scale: float, rows: int) -> torch.Tensor:
+    tokens, heads = hashes.shape
+    width = gains.shape[1]
+    out = torch.empty((tokens, heads * width), dtype=torch.bfloat16, device=weights.device)
+    torch.library.wrap_triton(_head_kernel)[(tokens * heads // rows,)](
+        weights, scales, hashes, gains, lut, out, global_scale, lut is not None, width, heads,
+        rows, enable_fp_fusion=False)
+    return out
+
+
+def _decode_heads(weights, scales, hashes, gains, lut, global_scale):
+    rows = ENGRAM_HEADS if hashes.shape[0] > 64 else 1
+    return _decode_heads_op(weights, scales, hashes, gains, lut, global_scale, rows)
+
+
+@triton.jit
+def _bf16(x):
+    return x.to(tl.bfloat16).to(tl.float32)
+
+
+@triton.jit
+def _unit(x, D: tl.constexpr, ROWS: tl.constexpr):
+    return _bf16(x * tl.rsqrt(row_sum_fp32(x * x, D, ROWS) * (1. / D) + 0.0078125))
+
+
+@triton.jit
+def _mix_kernel(S, K, V, KG, QG, Gamma, Scale, Pos, Id, Out, KS: tl.constexpr,
+                VS: tl.constexpr, PS: tl.constexpr, IDS: tl.constexpr, D: tl.constexpr,
+                BLOCK: tl.constexpr, PAD: tl.constexpr, IMAGE: tl.constexpr,
+                NEWLINE: tl.constexpr, VIDEO: tl.constexpr, ROWS: tl.constexpr):
+    t, lane = tl.program_id(0), tl.program_id(1)
+    col = tl.arange(0, BLOCK)
+    valid = col < D
+    offset = lane * D + col
+    x = tl.load(S + t * 4 * D + offset, valid, 0).to(tl.float32)
+    k = tl.load(K + t * KS + offset, valid, 0).to(tl.float32)
+    v = tl.load(V + t * VS + col, valid, 0).to(tl.float32)
+    kg = tl.load(KG + offset, valid, 0).to(tl.float32)
+    qg = tl.load(QG + offset, valid, 0).to(tl.float32)
+    key = _bf16(_unit(k, D, ROWS * 4) * kg)
+    query = _bf16(_unit(x, D, ROWS * 4) * qg)
+    dot = row_sum_fp32(key * query, D, ROWS * 4) * (D ** -0.5)
+    signed = tl.sqrt(tl.maximum(tl.abs(dot), 1.e-6)) * ((dot > 0).to(tl.int32) - (dot < 0).to(tl.int32))
+    gate = _bf16(tl.div_rn(1., 1. + libdevice.exp(-signed)))
+    main = _bf16(_unit(v, D, ROWS) * tl.load(Gamma + col, valid, 0).to(tl.float32))
+    branch = _bf16(main * tl.load(Scale + offset, valid, 0).to(tl.float32))
+    delta = _bf16(_bf16(gate * main) + branch)
+    token = tl.load(Id + t * IDS)
+    live = (tl.load(Pos + t * PS) >= 0) & (token != PAD) & (token != IMAGE) & (token != NEWLINE) & (token != VIDEO)
+    tl.store(Out + t * 4 * D + offset, x + tl.where(live, delta, 0.), valid)
+
+
+@torch.library.triton_op("flare::hy4_engram_mix", mutates_args=())
+def _mix_streams(streams: torch.Tensor, keys: torch.Tensor, values: torch.Tensor,
+                 k_gain: torch.Tensor, q_gain: torch.Tensor, gamma: torch.Tensor, scales: torch.Tensor,
+                 positions: torch.Tensor, tokens: torch.Tensor, pad: int) -> torch.Tensor:
+    rows, lanes, d = streams.shape
+    out = torch.empty_like(streams)
+    torch.library.wrap_triton(_mix_kernel)[(rows, lanes)](
+        streams, keys, values, k_gain, q_gain, gamma, scales, positions, tokens, out, keys.stride(0),
+        values.stride(0), positions.stride(0), tokens.stride(0), d, triton.next_power_of_2(d),
+        pad, IMAGE_TOKEN, IMAGE_NEWLINE_TOKEN, VIDEO_TOKEN, rows, enable_fp_fusion=False)
+    return out
+
+
 class PreparedEngram:
     """Wait for host-staged FP8_E4M3_E8M0 or NVFP4_E4M3_GLOBAL rows, dequantize, normalize, project, and gate."""
 
@@ -592,29 +691,8 @@ class PreparedEngram:
             self.event_handle,
         )
 
-        # Dequantize host-staged compact FP8_E4M3_E8M0 or NVFP4_E4M3_GLOBAL Engram rows.
-        if self.encoding == "NVFP4_E4M3_GLOBAL":
-            assert self.global_scale is not None and self.fp4_lut is not None
-            deq = dequantize_nvfp4_engram(
-                self.weights_buf.view(tokens, ENGRAM_HEADS, ENGRAM_NVFP4_ROW_BYTES),
-                self.scales_buf.view(tokens, ENGRAM_HEADS, ENGRAM_NVFP4_SCALE_BYTES),
-                self.global_scale,
-                self.fp4_lut,
-                dtype=streams.dtype,
-            )
-        else:
-            q = self.weights_buf.view(torch.float8_e4m3fn).view(
-                tokens, ENGRAM_HEADS, ENGRAM_FP8_SCALE_BYTES, ENGRAM_FP8_SCALE_BLOCK
-            )
-            exp = self.scales_buf.view(tokens, ENGRAM_HEADS, ENGRAM_FP8_SCALE_BYTES, 1).to(torch.float32) - 127.0
-            deq = (q.float() * torch.exp2(exp)).reshape(tokens, ENGRAM_HEADS, ENGRAM_HEAD_DIM).to(streams.dtype)
-        deq = torch.where(self.hashes_buf[:, :, None] >= 0, deq, 0)
-
-        # Per-head RMSNorm matching PyTorch nn.RMSNorm(96, eps=None).
-        eps_bf16 = torch.finfo(streams.dtype).eps
-        inv_rms = torch.rsqrt(deq.float().square().mean(dim=-1, keepdim=True) + eps_bf16)
-        normed = (deq.float() * inv_rms).to(streams.dtype) * self.head_norms[None, :, :]
-        flat_emb = normed.reshape(tokens, ENGRAM_WIDTH).contiguous()
+        flat_emb = _decode_heads(self.weights_buf, self.scales_buf, self.hashes_buf, self.head_norms,
+                                 self.fp4_lut, self.global_scale or 1.0)
 
         if self.kv_proj is not None:
             kv = self.kv_proj(flat_emb).view(tokens, HC_MULT + 1, HIDDEN_SIZE)
@@ -624,23 +702,6 @@ class PreparedEngram:
             keys_raw = torch.stack([proj(flat_emb) for proj in self.key_projs], dim=1)
             val_raw = self.value_proj(flat_emb)
 
-        # Vectorized 4-stream RMSNorm + dot-product gate retaining ATen rounding.
-        k_norm = _rmsnorm(keys_raw, self.norm_keys[None, :, :], eps_bf16)
-        q_norm = _rmsnorm(streams, self.norm_queries[None, :, :], eps_bf16)
-        dot = (k_norm.float() * q_norm.float()).sum(dim=-1) * (HIDDEN_SIZE ** -0.5)  # [T, 4]
-        g = dot.abs().clamp_min(1e-6).sqrt() * dot.sign()
-        gates_t = torch.sigmoid(g).to(streams.dtype).unsqueeze(-1)  # [T, 4, 1]
-
-        main_signal = self.unified_pre_gamma * _rmsnorm(val_raw, None, eps_bf16)  # [T, 3072]
-        branch = main_signal[:, None, :] * self.branch_scales[None, :, :]  # [T, 4, 3072]
-        delta = gates_t * main_signal[:, None, :] + branch
-
-        mask = (
-            (metadata.positions >= 0)
-            & (metadata.token_ids != IMAGE_TOKEN)
-            & (metadata.token_ids != IMAGE_NEWLINE_TOKEN)
-            & (metadata.token_ids != VIDEO_TOKEN)
-            & (metadata.token_ids != self.pad_id)
-        )
-        delta = torch.where(mask[:, None, None], delta, 0)
-        return streams + delta
+        return _mix_streams(streams, keys_raw, val_raw, self.norm_keys, self.norm_queries,
+                            self.unified_pre_gamma, self.branch_scales, metadata.positions,
+                            metadata.token_ids, self.pad_id)
